@@ -12,9 +12,13 @@ GMAIL_IMAP_HOST = os.getenv("GMAIL_IMAP_HOST", "imap.gmail.com")
 GMAIL_IMAP_USER = os.getenv("GMAIL_IMAP_USER")
 GMAIL_IMAP_PASSWORD = os.getenv("GMAIL_IMAP_PASSWORD")
 
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
+# MODE-based configuration
+MODE = os.getenv("MODE", "prod")  # "test" or "prod" (default: prod)
+SLACK_WEBHOOK_URL_TEST = os.getenv("SLACK_WEBHOOK_URL_TEST")
+SLACK_WEBHOOK_URL_PROD = os.getenv("SLACK_WEBHOOK_URL_PROD")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_TO_ID = os.getenv("LINE_TO_ID")
+LINE_TO_ID_TEST = os.getenv("LINE_TO_ID_TEST")
+LINE_TO_ID_PROD = os.getenv("LINE_TO_ID_PROD")
 
 LOG_DIR = os.getenv("LOG_DIR", "/tmp")
 
@@ -27,6 +31,48 @@ def log(msg):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(os.path.join(LOG_DIR, "recruit.log"), "a", encoding="utf-8") as f:
         f.write(f"{ts} {msg}\n")
+
+
+# --- MODE management ---
+def get_mode():
+    """Return current mode: 'test' or 'prod'"""
+    mode = MODE.lower() if MODE else "prod"
+    return "test" if mode == "test" else "prod"
+
+
+def get_slack_webhook_url(mode):
+    """Get Slack Webhook URL based on mode"""
+    if mode == "test":
+        url = SLACK_WEBHOOK_URL_TEST
+        if not url:
+            log("WARNING: SLACK_WEBHOOK_URL_TEST is not set")
+        return url
+    else:
+        url = SLACK_WEBHOOK_URL_PROD
+        if not url:
+            log("WARNING: SLACK_WEBHOOK_URL_PROD is not set")
+        return url
+
+
+def get_line_to_id(mode):
+    """Get LINE TO ID based on mode"""
+    if mode == "test":
+        to_id = LINE_TO_ID_TEST
+        if not to_id:
+            log("WARNING: LINE_TO_ID_TEST is not set")
+        return to_id
+    else:
+        to_id = LINE_TO_ID_PROD
+        if not to_id:
+            log("WARNING: LINE_TO_ID_PROD is not set")
+        return to_id
+
+
+def add_test_prefix(message, mode):
+    """Add test version prefix if in test mode"""
+    if mode == "test":
+        return f"【テストバージョン】\n{message}"
+    return message
 
 
 # --- Decode header ---
@@ -88,34 +134,44 @@ def extract_indeed_url(html):
 
 # --- Slack notify ---
 def notify_slack(source, name, url):
-    if not SLACK_WEBHOOK_URL:
+    mode = get_mode()
+    webhook_url = get_slack_webhook_url(mode)
+
+    if not webhook_url:
         log("No Slack Webhook URL")
         return
 
     title = "【Indeed応募】" if source == "indeed" else "【ジモティー】"
-
     lines = [f"{title} {name} さんから応募がありました。"]
     if url:
         lines += ["", "応募内容はこちら:", url]
 
-    requests.post(SLACK_WEBHOOK_URL, json={"text": "\n".join(lines)})
+    message = "\n".join(lines)
+    message = add_test_prefix(message, mode)
+
+    requests.post(webhook_url, json={"text": message})
 
 
 # --- LINE notify ---
 def notify_line(source, name, url):
-    if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_TO_ID:
+    mode = get_mode()
+    line_to_id = get_line_to_id(mode)
+
+    if not LINE_CHANNEL_ACCESS_TOKEN or not line_to_id:
         log("LINE Token or TO ID missing")
         return
 
     title = "Indeedに応募がありました。" if source == "indeed" else "ジモティーで新着があります。"
-
     lines = [f"{name} さんから{title}"]
     if url:
         lines += ["", "詳細はこちら:", url]
 
+    message = "\n".join(lines)
+    message = add_test_prefix(message, mode)
+
     body = {
-        "to": LINE_TO_ID,
-        "messages": [{"type": "text", "text": "\n".join(lines)}],
+        "to": line_to_id,
+        "messages": [{"type": "text", "text": message}],
     }
 
     headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}
