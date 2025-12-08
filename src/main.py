@@ -22,6 +22,12 @@ LINE_TO_ID_PROD = os.getenv("LINE_TO_ID_PROD")
 
 LOG_DIR = os.getenv("LOG_DIR", "/tmp")
 
+# --- Mention IDs ---
+SLACK_MENTION_INOUE_ID = os.getenv("SLACK_MENTION_INOUE_ID")
+SLACK_MENTION_KONDO_ID = os.getenv("SLACK_MENTION_KONDO_ID")
+LINE_MENTION_INOUE_ID = os.getenv("LINE_MENTION_INOUE_ID")
+LINE_MENTION_KONDO_ID = os.getenv("LINE_MENTION_KONDO_ID")
+
 # --- Polling Interval ---
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "15"))  # デフォルト15秒
 
@@ -142,11 +148,19 @@ def notify_slack(source, name, url):
         return
 
     title = "【Indeed応募】" if source == "indeed" else "【ジモティー】"
+
+    # メンション用プレフィックス
+    mention_prefix = ""
+    if SLACK_MENTION_INOUE_ID and SLACK_MENTION_KONDO_ID:
+        mention_prefix = f"<@{SLACK_MENTION_INOUE_ID}> <@{SLACK_MENTION_KONDO_ID}>\n"
+    else:
+        log("WARNING: Slack mention IDs not fully configured")
+
     lines = [f"{title} {name} さんから応募がありました。"]
     if url:
         lines += ["", "応募内容はこちら:", url]
 
-    message = "\n".join(lines)
+    message = mention_prefix + "\n".join(lines)
     message = add_test_prefix(message, mode)
 
     requests.post(webhook_url, json={"text": message})
@@ -162,17 +176,51 @@ def notify_line(source, name, url):
         return
 
     title = "Indeedに応募がありました。" if source == "indeed" else "ジモティーで新着があります。"
+
+    # メンション用プレフィックス（テキスト部分）
+    mention_prefix = "井上さん 近藤さん\n"
+
     lines = [f"{name} さんから{title}"]
     if url:
         lines += ["", "詳細はこちら:", url]
 
-    message = "\n".join(lines)
+    base_message = "\n".join(lines)
+    message = mention_prefix + base_message
     message = add_test_prefix(message, mode)
+
+    # mentionees の index / length を計算
+    # "井上さん 近藤さん\n" の場合：
+    #   井上さん → index 0, length 4
+    #   近藤さん → index 5, length 4
+    mentionees = []
+    if LINE_MENTION_INOUE_ID:
+        mentionees.append({
+            "index": 0,
+            "length": 4,
+            "userId": LINE_MENTION_INOUE_ID,
+        })
+    if LINE_MENTION_KONDO_ID:
+        mentionees.append({
+            "index": 5,
+            "length": 4,
+            "userId": LINE_MENTION_KONDO_ID,
+        })
+
+    if not mentionees:
+        log("WARNING: LINE mention IDs not configured; sending without mention")
 
     body = {
         "to": line_to_id,
-        "messages": [{"type": "text", "text": message}],
+        "messages": [
+            {
+                "type": "text",
+                "text": message,
+            }
+        ],
     }
+
+    if mentionees:
+        body["messages"][0]["mention"] = {"mentionees": mentionees}
 
     headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}
     requests.post("https://api.line.me/v2/bot/message/push", json=body, headers=headers)
