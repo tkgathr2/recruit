@@ -2,6 +2,7 @@ import imaplib
 import email
 from email.header import decode_header
 import os
+import time
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
@@ -16,6 +17,9 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_TO_ID = os.getenv("LINE_TO_ID")
 
 LOG_DIR = os.getenv("LOG_DIR", "/tmp")
+
+# --- Polling Interval ---
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "15"))  # デフォルト15秒
 
 
 # --- Logging ---
@@ -151,8 +155,8 @@ def process_mail(mail, msg_id):
     mail.store(msg_id, "+FLAGS", "\\Seen")
 
 
-# --- Main ---
-def main():
+# --- Check mail once ---
+def check_mail():
     try:
         mail = imaplib.IMAP4_SSL(GMAIL_IMAP_HOST)
         mail.login(GMAIL_IMAP_USER, GMAIL_IMAP_PASSWORD)
@@ -170,6 +174,15 @@ def main():
 
     except Exception as e:
         log(f"ERROR: {e}")
+
+
+# --- Main loop ---
+def main():
+    log(f"Starting Gmail polling with POLL_INTERVAL_SECONDS={POLL_INTERVAL_SECONDS}")
+
+    while True:
+        check_mail()
+        time.sleep(POLL_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
