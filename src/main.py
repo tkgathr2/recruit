@@ -188,7 +188,7 @@ def notify_line(source, name, url):
     base_message = "\n".join(lines)
 
     # メンション用テキスト（本文の最後に置く）
-    mention_text = "井上さん 近藤さん"
+    mention_text = "@井上誠司 さん @近藤拓翔 さん"
 
     # 本文＋空行＋メンション行
     combined = base_message + "\n\n" + mention_text
@@ -202,20 +202,20 @@ def notify_line(source, name, url):
     # mention_text の開始位置を message 内から検索
     start = message.rfind(mention_text)
     if start != -1:
-        # mention_text 内の "井上さん" と "近藤さん" の相対位置を求める
-        relative_inoue = mention_text.find("井上さん")
-        relative_kondo = mention_text.find("近藤さん")
+        # mention_text 内の "@井上誠司" と "@近藤拓翔" の相対位置を求める
+        relative_inoue = mention_text.find("@井上誠司")
+        relative_kondo = mention_text.find("@近藤拓翔")
 
-        if LINE_MENTION_INOUE_ID:
+        if LINE_MENTION_INOUE_ID and relative_inoue != -1:
             mentionees.append({
                 "index": start + relative_inoue,
-                "length": len("井上さん"),
+                "length": len("@井上誠司"),
                 "userId": LINE_MENTION_INOUE_ID,
             })
-        if LINE_MENTION_KONDO_ID:
+        if LINE_MENTION_KONDO_ID and relative_kondo != -1:
             mentionees.append({
                 "index": start + relative_kondo,
-                "length": len("近藤さん"),
+                "length": len("@近藤拓翔"),
                 "userId": LINE_MENTION_KONDO_ID,
             })
     else:
