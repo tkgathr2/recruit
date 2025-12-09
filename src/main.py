@@ -21,6 +21,7 @@ LINE_TO_ID_TEST = os.getenv("LINE_TO_ID_TEST")
 LINE_TO_ID_PROD = os.getenv("LINE_TO_ID_PROD")
 
 LOG_DIR = os.getenv("LOG_DIR", "/tmp")
+SLACK_ERROR_WEBHOOK_URL = os.getenv("SLACK_ERROR_WEBHOOK_URL")
 
 # --- Mention IDs ---
 SLACK_MENTION_INOUE_ID = os.getenv("SLACK_MENTION_INOUE_ID")
@@ -40,6 +41,28 @@ def log(msg):
         f.write(line + "\n")
     # 標準出力にも出力（Railway Logs用）
     print(line, flush=True)
+
+
+def notify_error_to_slack(message: str) -> None:
+    """重大なエラーを Slack Webhook に通知する"""
+    if not SLACK_ERROR_WEBHOOK_URL:
+        # Webhook が未設定ならログだけ残す
+        log("ERROR: SLACK_ERROR_WEBHOOK_URL is not set; cannot notify error to Slack")
+        return
+
+    text = f"🚨 Indeed応募通知エラー発生\n{message}"
+
+    try:
+        resp = requests.post(
+            SLACK_ERROR_WEBHOOK_URL,
+            json={"text": text},
+            timeout=5,
+        )
+        if resp.status_code >= 400:
+            log(f"ERROR: failed to send error notification to Slack (status={resp.status_code}, body={resp.text})")
+    except Exception as e:
+        # 通知時のエラーでさらに例外を投げるとループするのでログのみ
+        log(f"ERROR: exception while sending error notification to Slack: {e}")
 
 
 # --- MODE management ---
@@ -166,7 +189,14 @@ def notify_slack(source, name, url):
     message = mention_prefix + "\n".join(lines)
     message = add_test_prefix(message, mode)
 
-    requests.post(webhook_url, json={"text": message})
+    try:
+        resp = requests.post(webhook_url, json={"text": message})
+        if resp.status_code >= 400:
+            log(f"ERROR: Slack notify failed (status={resp.status_code}, body={resp.text})")
+            notify_error_to_slack(f"Slack notify failed: status={resp.status_code}")
+    except Exception as e:
+        log(f"ERROR: Slack notify exception: {e}")
+        notify_error_to_slack(f"Slack notify exception: {e}")
 
 
 # --- LINE notify ---
@@ -287,6 +317,7 @@ def check_mail():
 
     except Exception as e:
         log(f"ERROR: {e}")
+        notify_error_to_slack(f"Gmail polling error: {e}")
 
 
 # --- Main loop ---
