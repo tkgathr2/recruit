@@ -187,59 +187,48 @@ def notify_line(source, name, url):
 
     base_message = "\n".join(lines)
 
-    # メンション用テキスト（本文の最後に置く）
-    mention_text = "@井上誠司 さん @近藤拓翔 さん"
+    # MODE に応じてテストプレフィックスを適用
+    base_message = add_test_prefix(base_message, mode)
 
-    # 本文＋空行＋メンション行
-    combined = base_message + "\n\n" + mention_text
+    # textV2 + substitution 方式でメンションを実装
+    text_v2 = f"{{inoue}} {{kondo}} {base_message}"
 
-    # MODE に応じたテストプレフィックスを最後に適用
-    message = add_test_prefix(combined, mode)
-
-    # mentionees を動的に作成
-    mentionees = []
-
-    # mention_text の開始位置を message 内から検索
-    start = message.rfind(mention_text)
-    if start != -1:
-        # mention_text 内の "@井上誠司" と "@近藤拓翔" の相対位置を求める
-        relative_inoue = mention_text.find("@井上誠司")
-        relative_kondo = mention_text.find("@近藤拓翔")
-
-        if LINE_MENTION_INOUE_ID and relative_inoue != -1:
-            mentionees.append({
-                "index": start + relative_inoue,
-                "length": len("@井上誠司"),
+    substitution = {}
+    if LINE_MENTION_INOUE_ID:
+        substitution["inoue"] = {
+            "type": "mention",
+            "mentionee": {
+                "type": "user",
                 "userId": LINE_MENTION_INOUE_ID,
-            })
-        if LINE_MENTION_KONDO_ID and relative_kondo != -1:
-            mentionees.append({
-                "index": start + relative_kondo,
-                "length": len("@近藤拓翔"),
+            },
+        }
+    if LINE_MENTION_KONDO_ID:
+        substitution["kondo"] = {
+            "type": "mention",
+            "mentionee": {
+                "type": "user",
                 "userId": LINE_MENTION_KONDO_ID,
-            })
-    else:
-        log("WARNING: mention_text not found in message; sending without mention")
+            },
+        }
 
-    if not mentionees:
-        log("WARNING: LINE mention IDs not configured; sending without mention")
+    if not substitution:
+        log("WARNING: LINE mention IDs not configured; sending without substitution")
 
-    # デバッグ用ログ
-    log(f"LINE message: {message}")
-    log(f"LINE mentionees: {mentionees}")
+    message_obj = {
+        "type": "textV2",
+        "text": text_v2,
+        "substitution": substitution,
+    }
 
     body = {
         "to": line_to_id,
-        "messages": [
-            {
-                "type": "text",
-                "text": message,
-            }
-        ],
+        "messages": [message_obj],
     }
 
-    if mentionees:
-        body["messages"][0]["mention"] = {"mentionees": mentionees}
+    # デバッグ用ログ
+    log(f"LINE base_message: {base_message}")
+    log(f"LINE textV2: {text_v2}")
+    log(f"LINE substitution: {substitution}")
 
     headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}
     resp = requests.post("https://api.line.me/v2/bot/message/push", json=body, headers=headers)
