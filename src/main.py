@@ -177,37 +177,53 @@ def notify_line(source, name, url):
 
     title = "Indeedに応募がありました。" if source == "indeed" else "ジモティーで新着があります。"
 
-    # メンション用プレフィックス（テキスト部分）
-    mention_prefix = "井上さん 近藤さん\n"
-
+    # 本文部分
     lines = [f"{name} さんから{title}"]
     if url:
         lines += ["", "詳細はこちら:", url]
 
     base_message = "\n".join(lines)
-    message = mention_prefix + base_message
-    message = add_test_prefix(message, mode)
 
-    # mentionees の index / length を計算
-    # "井上さん 近藤さん\n" の場合：
-    #   井上さん → index 0, length 4
-    #   近藤さん → index 5, length 4
+    # メンション用テキスト（本文の最後に置く）
+    mention_text = "井上さん 近藤さん"
+
+    # 本文＋空行＋メンション行
+    combined = base_message + "\n\n" + mention_text
+
+    # MODE に応じたテストプレフィックスを最後に適用
+    message = add_test_prefix(combined, mode)
+
+    # mentionees を動的に作成
     mentionees = []
-    if LINE_MENTION_INOUE_ID:
-        mentionees.append({
-            "index": 0,
-            "length": 4,
-            "userId": LINE_MENTION_INOUE_ID,
-        })
-    if LINE_MENTION_KONDO_ID:
-        mentionees.append({
-            "index": 5,
-            "length": 4,
-            "userId": LINE_MENTION_KONDO_ID,
-        })
+
+    # mention_text の開始位置を message 内から検索
+    start = message.rfind(mention_text)
+    if start != -1:
+        # mention_text 内の "井上さん" と "近藤さん" の相対位置を求める
+        relative_inoue = mention_text.find("井上さん")
+        relative_kondo = mention_text.find("近藤さん")
+
+        if LINE_MENTION_INOUE_ID:
+            mentionees.append({
+                "index": start + relative_inoue,
+                "length": len("井上さん"),
+                "userId": LINE_MENTION_INOUE_ID,
+            })
+        if LINE_MENTION_KONDO_ID:
+            mentionees.append({
+                "index": start + relative_kondo,
+                "length": len("近藤さん"),
+                "userId": LINE_MENTION_KONDO_ID,
+            })
+    else:
+        log("WARNING: mention_text not found in message; sending without mention")
 
     if not mentionees:
         log("WARNING: LINE mention IDs not configured; sending without mention")
+
+    # デバッグ用ログ
+    log(f"LINE message: {message}")
+    log(f"LINE mentionees: {mentionees}")
 
     body = {
         "to": line_to_id,
@@ -223,7 +239,8 @@ def notify_line(source, name, url):
         body["messages"][0]["mention"] = {"mentionees": mentionees}
 
     headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}
-    requests.post("https://api.line.me/v2/bot/message/push", json=body, headers=headers)
+    resp = requests.post("https://api.line.me/v2/bot/message/push", json=body, headers=headers)
+    log(f"LINE API response: status={resp.status_code}, body={resp.text}")
 
 
 # --- Process mail ---
