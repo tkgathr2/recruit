@@ -263,6 +263,8 @@ def notify_line(source, name, url):
     headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}
     resp = requests.post("https://api.line.me/v2/bot/message/push", json=body, headers=headers)
     log(f"LINE API response: status={resp.status_code}, body={resp.text}")
+    if resp.status_code >= 400:
+        notify_error_to_slack(f"LINE notify failed: status={resp.status_code}, body={resp.text}")
 
 
 # --- Process mail ---
