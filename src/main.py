@@ -35,8 +35,11 @@ POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "15"))  # デフ�
 # --- Logging ---
 def log(msg):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{ts} {msg}"
     with open(os.path.join(LOG_DIR, "recruit.log"), "a", encoding="utf-8") as f:
-        f.write(f"{ts} {msg}\n")
+        f.write(line + "\n")
+    # 標準出力にも出力（Railway Logs用）
+    print(line, flush=True)
 
 
 # --- MODE management ---
