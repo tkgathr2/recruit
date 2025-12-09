@@ -159,7 +159,7 @@ def notify_slack(source, name, url):
     else:
         log("WARNING: Slack mention IDs not fully configured")
 
-    lines = [f"{title} {name} さんから応募がありました。"]
+    lines = [f"{title} 【{name}】 さんから応募がありました。"]
     if url:
         lines += ["", "応募内容はこちら:", url]
 
@@ -181,7 +181,7 @@ def notify_line(source, name, url):
     title = "Indeedに応募がありました。" if source == "indeed" else "ジモティーで新着があります。"
 
     # 本文部分
-    lines = [f"{name} さんから{title}"]
+    lines = [f"【{name}】 さんから{title}"]
     if url:
         lines += ["", "詳細はこちら:", url]
 
