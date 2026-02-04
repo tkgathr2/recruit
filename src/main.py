@@ -8,6 +8,7 @@ import time
 import json
 import re
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Optional, Set, Tuple
 
 import requests
@@ -56,24 +57,47 @@ def log(msg: str) -> None:
     print(line, flush=True)
 
 
+def ensure_processed_ids_dir() -> bool:
+    """Ensure the directory for processed IDs file exists. Returns True if successful."""
+    try:
+        parent_dir = Path(PROCESSED_IDS_FILE).parent
+        if not parent_dir.exists():
+            parent_dir.mkdir(parents=True, exist_ok=True)
+            log(f"Created directory: {parent_dir}")
+        return True
+    except OSError as e:
+        log(f"ERROR: Failed to create directory for processed IDs: {e}")
+        notify_error_to_slack(f"Failed to create directory for processed IDs: {e}")
+        return False
+
+
 def load_processed_ids() -> Set[str]:
     """Load processed message IDs from file."""
     if os.path.exists(PROCESSED_IDS_FILE):
         try:
             with open(PROCESSED_IDS_FILE, "r", encoding="utf-8") as f:
-                return set(json.load(f))
+                data = json.load(f)
+                log(f"Loaded {len(data)} processed IDs from {PROCESSED_IDS_FILE}")
+                return set(data)
         except (json.JSONDecodeError, IOError) as e:
             log(f"WARNING: Failed to load processed IDs: {e}")
+            notify_error_to_slack(f"Failed to load processed IDs: {e}")
+    else:
+        log(f"Processed IDs file does not exist: {PROCESSED_IDS_FILE}")
     return set()
 
 
 def save_processed_ids(processed_ids: Set[str]) -> None:
     """Save processed message IDs to file."""
+    if not ensure_processed_ids_dir():
+        return
     try:
         with open(PROCESSED_IDS_FILE, "w", encoding="utf-8") as f:
             json.dump(list(processed_ids), f)
+        log(f"Saved {len(processed_ids)} processed IDs to {PROCESSED_IDS_FILE}")
     except IOError as e:
         log(f"ERROR: Failed to save processed IDs: {e}")
+        notify_error_to_slack(f"Failed to save processed IDs: {e}")
 
 
 def notify_error_to_slack(message: str) -> None:
@@ -315,12 +339,25 @@ def determine_source(subject: str) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+def get_unique_id(gm_msgid: Optional[str], msg: email.message.Message) -> Optional[str]:
+    """Get unique identifier for email. Prefers X-GM-MSGID, falls back to Message-ID."""
+    if gm_msgid:
+        return f"gm:{gm_msgid}"
+    
+    message_id = msg.get("Message-ID")
+    if message_id:
+        return f"mid:{message_id}"
+    
+    return None
+
+
 def process_mail(
     mail: imaplib.IMAP4_SSL, msg_id: bytes, processed_ids: Set[str]
 ) -> Optional[str]:
-    """Process a single mail. Returns X-GM-MSGID if processed, None otherwise."""
+    """Process a single mail. Returns unique ID if processed, None otherwise."""
     status, data = mail.fetch(msg_id, "(X-GM-MSGID BODY.PEEK[])")
     if status != "OK":
+        log(f"ERROR: Failed to fetch msg_id={msg_id}, status={status}")
         return None
 
     gm_msgid, body_data = parse_fetch_response(data)
@@ -329,11 +366,18 @@ def process_mail(
         log(f"ERROR: Failed to fetch body for msg_id={msg_id}")
         return None
 
-    if gm_msgid and gm_msgid in processed_ids:
-        log(f"Skip already processed: X-GM-MSGID={gm_msgid}")
-        return None
-
     msg = email.message_from_bytes(body_data)
+    
+    # Get unique identifier (X-GM-MSGID or Message-ID)
+    unique_id = get_unique_id(gm_msgid, msg)
+    
+    if not unique_id:
+        log(f"ERROR: No unique ID found for msg_id={msg_id}, skipping to prevent duplicates")
+        return None
+    
+    if unique_id in processed_ids:
+        return None  # Already processed, skip silently
+    
     subject = decode_header_value(msg.get("Subject", ""))
     from_header = decode_header_value(msg.get("From", ""))
     name = extract_name(from_header)
@@ -341,16 +385,16 @@ def process_mail(
     source, default_url = determine_source(subject)
 
     if not source:
-        log(f"Skip mail: {subject}")
-        return gm_msgid
+        log(f"Skip non-target mail: {subject[:50]}...")
+        return unique_id  # Mark as processed to avoid re-checking
 
     url = extract_indeed_url(extract_html(msg)) if source == "indeed" else default_url
-    log(f"Notify {source}: {name}, url={url}")
+    log(f"Notify {source}: {name}, url={url}, id={unique_id}")
 
     notify_slack(source, name, url)
     notify_line(source, name, url)
 
-    return gm_msgid
+    return unique_id
 
 
 def check_mail() -> None:
@@ -380,11 +424,59 @@ def check_mail() -> None:
         notify_error_to_slack(f"Gmail polling error: {e}")
 
 
+def verify_storage() -> bool:
+    """Verify that storage is working correctly at startup."""
+    log(f"=== Storage Verification ===")
+    log(f"PROCESSED_IDS_FILE={PROCESSED_IDS_FILE}")
+    
+    parent_dir = Path(PROCESSED_IDS_FILE).parent
+    log(f"Parent directory: {parent_dir}")
+    log(f"Parent directory exists: {parent_dir.exists()}")
+    
+    if parent_dir.exists():
+        try:
+            # Try to list directory contents
+            contents = list(parent_dir.iterdir())
+            log(f"Directory contents: {[str(f) for f in contents]}")
+        except OSError as e:
+            log(f"ERROR: Cannot list directory: {e}")
+    
+    # Ensure directory exists
+    if not ensure_processed_ids_dir():
+        log("ERROR: Failed to ensure storage directory exists")
+        return False
+    
+    # Test write
+    test_file = parent_dir / ".write_test"
+    try:
+        test_file.write_text("test")
+        test_file.unlink()
+        log("Storage write test: PASSED")
+    except OSError as e:
+        log(f"ERROR: Storage write test FAILED: {e}")
+        notify_error_to_slack(f"Storage write test failed: {e}")
+        return False
+    
+    # Load existing processed IDs
+    processed_ids = load_processed_ids()
+    log(f"Currently tracking {len(processed_ids)} processed emails")
+    log(f"=== Storage Verification Complete ===")
+    
+    return True
+
+
 # --- Main loop ---
 def main() -> None:
     """Main polling loop."""
     log(f"Starting Gmail polling with POLL_INTERVAL_SECONDS={POLL_INTERVAL_SECONDS}")
-
+    log(f"MODE={MODE}, SEARCH_DAYS={SEARCH_DAYS}")
+    
+    # Verify storage is working
+    if not verify_storage():
+        log("CRITICAL: Storage verification failed. Exiting to prevent duplicate notifications.")
+        notify_error_to_slack("CRITICAL: Storage verification failed at startup. Service stopped.")
+        return
+    
     while True:
         check_mail()
         time.sleep(POLL_INTERVAL_SECONDS)
