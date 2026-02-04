@@ -151,10 +151,14 @@ def extract_html(msg: email.message.Message) -> str:
         for part in msg.walk():
             if part.get_content_type() == "text/html":
                 charset = part.get_content_charset() or "utf-8"
-                return part.get_payload(decode=True).decode(charset, errors="replace")
+                payload = part.get_payload(decode=True)
+                if payload:
+                    return payload.decode(charset, errors="replace")
     elif msg.get_content_type() == "text/html":
         charset = msg.get_content_charset() or "utf-8"
-        return msg.get_payload(decode=True).decode(charset, errors="replace")
+        payload = msg.get_payload(decode=True)
+        if payload:
+            return payload.decode(charset, errors="replace")
     return ""
 
 
