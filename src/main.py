@@ -248,12 +248,12 @@ def extract_indeed_url(html: str) -> str:
 
 
 # --- Notification Functions ---
-def notify_slack(source: str, name: str, url: str) -> None:
-    """Send notification to Slack."""
+def notify_slack_with_retry(source: str, name: str, url: str, max_retries: int = 3) -> bool:
+    """Send notification to Slack with retry logic. Returns True if successful."""
     webhook_url = get_slack_webhook_url()
     if not webhook_url:
         log("No Slack Webhook URL")
-        return
+        return False
 
     title = "【Indeed応募】" if source == "indeed" else "【ジモティー】"
 
@@ -269,22 +269,35 @@ def notify_slack(source: str, name: str, url: str) -> None:
 
     message = add_test_prefix(mention_prefix + "\n".join(lines))
 
-    try:
-        resp = requests.post(webhook_url, json={"text": message})
-        if resp.status_code >= 400:
-            log(f"ERROR: Slack notify failed (status={resp.status_code}, body={resp.text})")
-            notify_error_to_slack(f"Slack notify failed: status={resp.status_code}")
-    except Exception as e:
-        log(f"ERROR: Slack notify exception: {e}")
-        notify_error_to_slack(f"Slack notify exception: {e}")
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(webhook_url, json={"text": message}, timeout=10)
+            if resp.status_code < 400:
+                return True
+            log(f"ERROR: Slack notify failed (status={resp.status_code}, body={resp.text}, attempt={attempt + 1}/{max_retries})")
+        except requests.exceptions.Timeout:
+            log(f"ERROR: Slack notify timeout (attempt={attempt + 1}/{max_retries})")
+        except Exception as e:
+            log(f"ERROR: Slack notify exception: {e} (attempt={attempt + 1}/{max_retries})")
+        
+        if attempt < max_retries - 1:
+            time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s
+    
+    notify_error_to_slack(f"Slack notify failed after {max_retries} attempts for {name}")
+    return False
 
 
-def notify_line(source: str, name: str, url: str) -> None:
-    """Send notification to LINE."""
+def notify_slack(source: str, name: str, url: str) -> None:
+    """Send notification to Slack (wrapper for backward compatibility)."""
+    notify_slack_with_retry(source, name, url)
+
+
+def notify_line_with_retry(source: str, name: str, url: str, max_retries: int = 3) -> bool:
+    """Send notification to LINE with retry logic. Returns True if successful."""
     line_to_id = get_line_to_id()
     if not LINE_CHANNEL_ACCESS_TOKEN or not line_to_id:
         log("LINE Token or TO ID missing")
-        return
+        return False
 
     title = "Indeedに応募がありました。" if source == "indeed" else "ジモティーで新着があります。"
 
@@ -327,15 +340,28 @@ def notify_line(source: str, name: str, url: str) -> None:
         "Content-Type": "application/json",
     }
 
-    try:
-        resp = requests.post("https://api.line.me/v2/bot/message/push", json=body, headers=headers)
-        log(f"LINE API response: status={resp.status_code}")
-        if resp.status_code >= 400:
-            log(f"ERROR: LINE notify failed (status={resp.status_code}, body={resp.text})")
-            notify_error_to_slack(f"LINE notify failed: status={resp.status_code}, body={resp.text}")
-    except Exception as e:
-        log(f"ERROR: LINE notify exception: {e}")
-        notify_error_to_slack(f"LINE notify exception: {e}")
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post("https://api.line.me/v2/bot/message/push", json=body, headers=headers, timeout=10)
+            log(f"LINE API response: status={resp.status_code}")
+            if resp.status_code < 400:
+                return True
+            log(f"ERROR: LINE notify failed (status={resp.status_code}, body={resp.text}, attempt={attempt + 1}/{max_retries})")
+        except requests.exceptions.Timeout:
+            log(f"ERROR: LINE notify timeout (attempt={attempt + 1}/{max_retries})")
+        except Exception as e:
+            log(f"ERROR: LINE notify exception: {e} (attempt={attempt + 1}/{max_retries})")
+        
+        if attempt < max_retries - 1:
+            time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s
+    
+    notify_error_to_slack(f"LINE notify failed after {max_retries} attempts for {name}")
+    return False
+
+
+def notify_line(source: str, name: str, url: str) -> None:
+    """Send notification to LINE (wrapper for backward compatibility)."""
+    notify_line_with_retry(source, name, url)
 
 
 # --- IMAP Connection ---

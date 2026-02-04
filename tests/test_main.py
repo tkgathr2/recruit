@@ -30,6 +30,8 @@ from src.main import (
     add_test_prefix,
     notify_slack,
     notify_line,
+    notify_slack_with_retry,
+    notify_line_with_retry,
 )
 
 
@@ -487,3 +489,116 @@ class TestNotifyLine:
         notify_line("indeed", "山田太郎", "https://indeed.com/apply/123")
         
         mock_error.assert_called_once()
+
+
+class TestNotifySlackWithRetry:
+    @patch('src.main.time.sleep')
+    @patch('src.main.requests.post')
+    @patch('src.main.get_slack_webhook_url')
+    @patch('src.main.SLACK_MENTION_INOUE_ID', 'U123')
+    @patch('src.main.SLACK_MENTION_KONDO_ID', 'U456')
+    @patch('src.main.is_test_mode', return_value=False)
+    def test_retry_on_failure_then_success(self, mock_test_mode, mock_get_url, mock_post, mock_sleep):
+        """Test that retry works when first attempt fails but second succeeds"""
+        mock_get_url.return_value = "https://hooks.slack.com/test"
+        mock_post.side_effect = [
+            MagicMock(status_code=500, text="Server Error"),
+            MagicMock(status_code=200)
+        ]
+        
+        result = notify_slack_with_retry("indeed", "山田太郎", "https://indeed.com/apply/123")
+        
+        assert result == True
+        assert mock_post.call_count == 2
+        mock_sleep.assert_called_once_with(1)  # 2^0 = 1 second backoff
+
+    @patch('src.main.time.sleep')
+    @patch('src.main.requests.post')
+    @patch('src.main.get_slack_webhook_url')
+    @patch('src.main.notify_error_to_slack')
+    def test_all_retries_fail(self, mock_error, mock_get_url, mock_post, mock_sleep):
+        """Test that error is reported after all retries fail"""
+        mock_get_url.return_value = "https://hooks.slack.com/test"
+        mock_post.return_value = MagicMock(status_code=500, text="Server Error")
+        
+        result = notify_slack_with_retry("indeed", "山田太郎", "https://indeed.com/apply/123", max_retries=3)
+        
+        assert result == False
+        assert mock_post.call_count == 3
+        mock_error.assert_called_once()
+
+    @patch('src.main.time.sleep')
+    @patch('src.main.requests.post')
+    @patch('src.main.get_slack_webhook_url')
+    @patch('src.main.notify_error_to_slack')
+    def test_timeout_triggers_retry(self, mock_error, mock_get_url, mock_post, mock_sleep):
+        """Test that timeout triggers retry"""
+        import requests
+        mock_get_url.return_value = "https://hooks.slack.com/test"
+        mock_post.side_effect = [
+            requests.exceptions.Timeout("Connection timed out"),
+            MagicMock(status_code=200)
+        ]
+        
+        result = notify_slack_with_retry("indeed", "山田太郎", "https://indeed.com/apply/123")
+        
+        assert result == True
+        assert mock_post.call_count == 2
+
+
+class TestNotifyLineWithRetry:
+    @patch('src.main.time.sleep')
+    @patch('src.main.requests.post')
+    @patch('src.main.get_line_to_id')
+    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
+    @patch('src.main.is_test_mode', return_value=False)
+    def test_retry_on_failure_then_success(self, mock_test_mode, mock_get_id, mock_post, mock_sleep):
+        """Test that retry works when first attempt fails but second succeeds"""
+        mock_get_id.return_value = "group_id"
+        mock_post.side_effect = [
+            MagicMock(status_code=500, text="Server Error"),
+            MagicMock(status_code=200)
+        ]
+        
+        result = notify_line_with_retry("indeed", "山田太郎", "https://indeed.com/apply/123")
+        
+        assert result == True
+        assert mock_post.call_count == 2
+        mock_sleep.assert_called_once_with(1)  # 2^0 = 1 second backoff
+
+    @patch('src.main.time.sleep')
+    @patch('src.main.requests.post')
+    @patch('src.main.get_line_to_id')
+    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
+    @patch('src.main.notify_error_to_slack')
+    @patch('src.main.log')
+    def test_all_retries_fail(self, mock_log, mock_error, mock_get_id, mock_post, mock_sleep):
+        """Test that error is reported after all retries fail"""
+        mock_get_id.return_value = "group_id"
+        mock_post.return_value = MagicMock(status_code=500, text="Server Error")
+        
+        result = notify_line_with_retry("indeed", "山田太郎", "https://indeed.com/apply/123", max_retries=3)
+        
+        assert result == False
+        assert mock_post.call_count == 3
+        mock_error.assert_called_once()
+
+    @patch('src.main.time.sleep')
+    @patch('src.main.requests.post')
+    @patch('src.main.get_line_to_id')
+    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
+    @patch('src.main.notify_error_to_slack')
+    @patch('src.main.log')
+    def test_timeout_triggers_retry(self, mock_log, mock_error, mock_get_id, mock_post, mock_sleep):
+        """Test that timeout triggers retry"""
+        import requests
+        mock_get_id.return_value = "group_id"
+        mock_post.side_effect = [
+            requests.exceptions.Timeout("Connection timed out"),
+            MagicMock(status_code=200)
+        ]
+        
+        result = notify_line_with_retry("indeed", "山田太郎", "https://indeed.com/apply/123")
+        
+        assert result == True
+        assert mock_post.call_count == 2
