@@ -41,7 +41,8 @@ LINE_MENTION_INOUE_ID = os.getenv("LINE_MENTION_INOUE_ID")
 LINE_MENTION_KONDO_ID = os.getenv("LINE_MENTION_KONDO_ID")
 
 # --- Polling Interval ---
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))  # デフォルト30秒（Gmail API制限対策）
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))  # デフォルト60秒（Gmail API制限対策）
+MAX_BACKOFF_SECONDS = int(os.getenv("MAX_BACKOFF_SECONDS", "900"))  # 最大15分のバックオフ
 
 # --- Search window for emails (days) ---
 SEARCH_DAYS = int(os.getenv("SEARCH_DAYS", "7"))  # デフォルト7日間
@@ -515,16 +516,16 @@ def get_gm_msgid_lightweight(mail: imaplib.IMAP4_SSL, uid: str) -> Optional[str]
     return None
 
 
-def check_mail()-> None:
-    """Check mailbox for new applications."""
+def check_mail_with_status() -> bool:
+    """Check mailbox for new applications. Returns True if successful, False if quota/error."""
     try:
         processed_ids, load_success = load_processed_ids()
         
         # If file exists but is corrupted, skip processing to prevent mass re-notifications
         if not load_success:
             log("ERROR: Skipping mail check due to corrupted processed IDs file")
-            return
-
+            return True  # Not a quota error, don't backoff
+        
         with imap_connection() as mail:
             since_date = (datetime.now() - timedelta(days=SEARCH_DAYS)).strftime("%d-%b-%Y")
             # Use UID SEARCH for stable identifiers
@@ -541,7 +542,7 @@ def check_mail()-> None:
                     uids_to_check.append(uid)
             
             if not uids_to_check:
-                return  # All emails already processed
+                return True  # All emails already processed
             
             log(f"UIDs not in cache: {len(uids_to_check)}")
             
@@ -568,7 +569,7 @@ def check_mail()-> None:
                     processed_ids.add(f"uid:{uid_str}")
                 if not save_processed_ids(processed_ids):
                     log("ERROR: Failed to save bootstrapped UIDs")
-                    return
+                    return True  # Not a quota error
             
             if truly_new_uids:
                 log(f"Truly new emails to process: {len(truly_new_uids)}")
@@ -585,11 +586,24 @@ def check_mail()-> None:
                     if not save_processed_ids(processed_ids):
                         # If save fails, stop processing to prevent more potential duplicates
                         log("ERROR: Stopping mail processing due to save failure")
-                        return
+                        return True  # Not a quota error
+        
+        return True  # Success
 
+    except imaplib.IMAP4.abort as e:
+        error_msg = str(e)
+        if "OVERQUOTA" in error_msg:
+            log(f"QUOTA ERROR: {error_msg}")
+            return False  # Quota error, trigger backoff
+        log(f"ERROR: IMAP abort: {e}")
+        return False  # Other IMAP error, also backoff
     except Exception as e:
         log(f"ERROR: {e}")
+        # Check if it's a quota-related error
+        if "OVERQUOTA" in str(e):
+            return False  # Quota error, trigger backoff
         notify_error_to_slack(f"Gmail polling error: {e}")
+        return True  # Non-quota error, don't backoff excessively
 
 
 def verify_storage() -> bool:
@@ -638,9 +652,9 @@ def verify_storage() -> bool:
 
 # --- Main loop ---
 def main() -> None:
-    """Main polling loop."""
+    """Main polling loop with exponential backoff for quota errors."""
     log(f"Starting Gmail polling with POLL_INTERVAL_SECONDS={POLL_INTERVAL_SECONDS}")
-    log(f"MODE={MODE}, SEARCH_DAYS={SEARCH_DAYS}")
+    log(f"MODE={MODE}, SEARCH_DAYS={SEARCH_DAYS}, MAX_BACKOFF_SECONDS={MAX_BACKOFF_SECONDS}")
     
     # Verify storage is working
     if not verify_storage():
@@ -648,9 +662,33 @@ def main() -> None:
         notify_error_to_slack("CRITICAL: Storage verification failed at startup. Service stopped.")
         return
     
+    consecutive_errors = 0
+    quota_notified = False
+    
     while True:
-        check_mail()
-        time.sleep(POLL_INTERVAL_SECONDS)
+        try:
+            success = check_mail_with_status()
+            if success:
+                consecutive_errors = 0
+                quota_notified = False
+                time.sleep(POLL_INTERVAL_SECONDS)
+            else:
+                # Error occurred, apply exponential backoff
+                consecutive_errors += 1
+                backoff = min(POLL_INTERVAL_SECONDS * (2 ** consecutive_errors), MAX_BACKOFF_SECONDS)
+                log(f"Backoff: waiting {backoff} seconds (consecutive_errors={consecutive_errors})")
+                
+                # Notify once when quota error starts
+                if not quota_notified:
+                    notify_error_to_slack(f"Gmail quota exceeded. Applying backoff ({backoff}s). Will retry automatically.")
+                    quota_notified = True
+                
+                time.sleep(backoff)
+        except Exception as e:
+            log(f"ERROR in main loop: {e}")
+            consecutive_errors += 1
+            backoff = min(POLL_INTERVAL_SECONDS * (2 ** consecutive_errors), MAX_BACKOFF_SECONDS)
+            time.sleep(backoff)
 
 
 if __name__ == "__main__":
