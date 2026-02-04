@@ -25,6 +25,7 @@ from src.main import (
     ensure_processed_ids_dir,
     get_unique_id,
     verify_storage,
+    migrate_old_id_format,
     is_test_mode,
     add_test_prefix,
     notify_slack,
@@ -249,6 +250,36 @@ class TestGetUniqueId:
         
         result = get_unique_id(None, msg)
         assert result is None
+
+
+class TestMigrateOldIdFormat:
+    def test_migrate_old_numeric_ids(self):
+        """Test migration of old numeric IDs to new gm: format"""
+        old_ids = {"12345678901234567890", "98765432109876543210"}
+        result = migrate_old_id_format(old_ids)
+        assert "gm:12345678901234567890" in result
+        assert "gm:98765432109876543210" in result
+        assert "12345678901234567890" not in result
+
+    def test_keep_new_format_ids(self):
+        """Test that IDs already in new format are preserved"""
+        new_ids = {"gm:12345", "mid:<test@example.com>"}
+        result = migrate_old_id_format(new_ids)
+        assert result == new_ids
+
+    def test_mixed_format_ids(self):
+        """Test migration with mixed old and new format IDs"""
+        mixed_ids = {"12345", "gm:67890", "mid:<test@example.com>"}
+        result = migrate_old_id_format(mixed_ids)
+        assert "gm:12345" in result
+        assert "gm:67890" in result
+        assert "mid:<test@example.com>" in result
+        assert len(result) == 3
+
+    def test_empty_set(self):
+        """Test migration with empty set"""
+        result = migrate_old_id_format(set())
+        assert result == set()
 
 
 class TestVerifyStorage:

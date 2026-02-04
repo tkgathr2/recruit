@@ -71,6 +71,33 @@ def ensure_processed_ids_dir() -> bool:
         return False
 
 
+def migrate_old_id_format(ids: Set[str]) -> Set[str]:
+    """Migrate old ID format (raw numbers) to new format (gm:xxx prefix).
+    
+    Old format: "12345678901234567890"
+    New format: "gm:12345678901234567890" or "mid:<message-id@example.com>"
+    """
+    migrated = set()
+    migration_count = 0
+    
+    for id_value in ids:
+        if id_value.startswith("gm:") or id_value.startswith("mid:"):
+            # Already in new format
+            migrated.add(id_value)
+        elif id_value.isdigit():
+            # Old format (raw X-GM-MSGID number) - migrate to new format
+            migrated.add(f"gm:{id_value}")
+            migration_count += 1
+        else:
+            # Unknown format, keep as-is (could be old Message-ID without prefix)
+            migrated.add(id_value)
+    
+    if migration_count > 0:
+        log(f"Migrated {migration_count} IDs from old format to new format")
+    
+    return migrated
+
+
 def load_processed_ids() -> Set[str]:
     """Load processed message IDs from file."""
     if os.path.exists(PROCESSED_IDS_FILE):
@@ -78,7 +105,9 @@ def load_processed_ids() -> Set[str]:
             with open(PROCESSED_IDS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 log(f"Loaded {len(data)} processed IDs from {PROCESSED_IDS_FILE}")
-                return set(data)
+                # Migrate old format IDs to new format
+                migrated = migrate_old_id_format(set(data))
+                return migrated
         except (json.JSONDecodeError, IOError) as e:
             log(f"WARNING: Failed to load processed IDs: {e}")
             notify_error_to_slack(f"Failed to load processed IDs: {e}")
