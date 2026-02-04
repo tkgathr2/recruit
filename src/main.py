@@ -106,7 +106,11 @@ def load_processed_ids() -> Set[str]:
                 data = json.load(f)
                 log(f"Loaded {len(data)} processed IDs from {PROCESSED_IDS_FILE}")
                 # Migrate old format IDs to new format
-                migrated = migrate_old_id_format(set(data))
+                original_set = set(data)
+                migrated = migrate_old_id_format(original_set)
+                # Save immediately if migration occurred to prevent re-migration on crash
+                if migrated != original_set:
+                    save_processed_ids(migrated)
                 return migrated
         except (json.JSONDecodeError, IOError) as e:
             log(f"WARNING: Failed to load processed IDs: {e}")
@@ -438,15 +442,12 @@ def check_mail() -> None:
             msg_ids = data[0].split()
             log(f"Emails in last {SEARCH_DAYS} days: {len(msg_ids)}")
 
-            new_processed = False
             for msg_id in msg_ids:
-                gm_msgid = process_mail(mail, msg_id, processed_ids)
-                if gm_msgid:
-                    processed_ids.add(gm_msgid)
-                    new_processed = True
-
-            if new_processed:
-                save_processed_ids(processed_ids)
+                unique_id = process_mail(mail, msg_id, processed_ids)
+                if unique_id:
+                    processed_ids.add(unique_id)
+                    # Save immediately after each email to prevent duplicates on crash
+                    save_processed_ids(processed_ids)
 
     except Exception as e:
         log(f"ERROR: {e}")
