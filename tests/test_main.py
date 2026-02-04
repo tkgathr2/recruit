@@ -24,6 +24,8 @@ from src.main import (
     save_processed_ids,
     is_test_mode,
     add_test_prefix,
+    notify_slack,
+    notify_line,
 )
 
 
@@ -240,12 +242,141 @@ class TestExtractHtmlEdgeCases:
         assert result == ""
 
 
-class TestNotifyLineEdgeCases:
-    def test_line_text_v2_without_substitution(self):
-        """
-        When LINE_MENTION_INOUE_ID and LINE_MENTION_KONDO_ID are not set,
-        the text_v2 still contains {inoue} {kondo} placeholders but substitution is empty.
-        This might cause issues with the LINE API.
-        """
-        # This is a potential bug that should be investigated
-        pass
+class TestNotifySlack:
+    @patch('src.main.requests.post')
+    @patch('src.main.get_slack_webhook_url')
+    @patch('src.main.SLACK_MENTION_INOUE_ID', 'U123')
+    @patch('src.main.SLACK_MENTION_KONDO_ID', 'U456')
+    @patch('src.main.is_test_mode', return_value=False)
+    def test_notify_slack_success(self, mock_test_mode, mock_get_url, mock_post):
+        """Test successful Slack notification"""
+        mock_get_url.return_value = "https://hooks.slack.com/test"
+        mock_post.return_value = MagicMock(status_code=200)
+        
+        notify_slack("indeed", "山田太郎", "https://indeed.com/apply/123")
+        
+        mock_post.assert_called_once()
+        call_args = mock_post.call_args
+        assert "山田太郎" in call_args[1]['json']['text']
+        assert "Indeed応募" in call_args[1]['json']['text']
+
+    @patch('src.main.get_slack_webhook_url')
+    def test_notify_slack_no_webhook(self, mock_get_url):
+        """Test Slack notification when webhook URL is not set"""
+        mock_get_url.return_value = None
+        
+        # Should not raise an exception
+        notify_slack("indeed", "山田太郎", "https://indeed.com/apply/123")
+
+    @patch('src.main.requests.post')
+    @patch('src.main.get_slack_webhook_url')
+    @patch('src.main.notify_error_to_slack')
+    def test_notify_slack_api_error(self, mock_error, mock_get_url, mock_post):
+        """Test Slack notification when API returns error"""
+        mock_get_url.return_value = "https://hooks.slack.com/test"
+        mock_post.return_value = MagicMock(status_code=500, text="Internal Server Error")
+        
+        notify_slack("indeed", "山田太郎", "https://indeed.com/apply/123")
+        
+        mock_error.assert_called_once()
+
+    @patch('src.main.requests.post')
+    @patch('src.main.get_slack_webhook_url')
+    @patch('src.main.notify_error_to_slack')
+    def test_notify_slack_exception(self, mock_error, mock_get_url, mock_post):
+        """Test Slack notification when request raises exception"""
+        mock_get_url.return_value = "https://hooks.slack.com/test"
+        mock_post.side_effect = Exception("Connection error")
+        
+        notify_slack("indeed", "山田太郎", "https://indeed.com/apply/123")
+        
+        mock_error.assert_called_once()
+
+
+class TestNotifyLine:
+    @patch('src.main.requests.post')
+    @patch('src.main.get_line_to_id')
+    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
+    @patch('src.main.LINE_MENTION_INOUE_ID', 'U123')
+    @patch('src.main.LINE_MENTION_KONDO_ID', 'U456')
+    @patch('src.main.is_test_mode', return_value=False)
+    def test_notify_line_success_with_mentions(self, mock_test_mode, mock_get_id, mock_post):
+        """Test successful LINE notification with mentions"""
+        mock_get_id.return_value = "group_id"
+        mock_post.return_value = MagicMock(status_code=200)
+        
+        notify_line("indeed", "山田太郎", "https://indeed.com/apply/123")
+        
+        mock_post.assert_called_once()
+        call_args = mock_post.call_args
+        body = call_args[1]['json']
+        
+        # Check that text_v2 contains placeholders
+        assert "{inoue}" in body['messages'][0]['text']
+        assert "{kondo}" in body['messages'][0]['text']
+        
+        # Check that substitution contains both mentions
+        assert "inoue" in body['messages'][0]['substitution']
+        assert "kondo" in body['messages'][0]['substitution']
+
+    @patch('src.main.requests.post')
+    @patch('src.main.get_line_to_id')
+    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
+    @patch('src.main.LINE_MENTION_INOUE_ID', None)
+    @patch('src.main.LINE_MENTION_KONDO_ID', None)
+    @patch('src.main.is_test_mode', return_value=False)
+    @patch('src.main.log')
+    def test_notify_line_without_mentions(self, mock_log, mock_test_mode, mock_get_id, mock_post):
+        """Test LINE notification without mention IDs - should not include placeholders"""
+        mock_get_id.return_value = "group_id"
+        mock_post.return_value = MagicMock(status_code=200)
+        
+        notify_line("indeed", "山田太郎", "https://indeed.com/apply/123")
+        
+        mock_post.assert_called_once()
+        call_args = mock_post.call_args
+        body = call_args[1]['json']
+        
+        # After fix: text_v2 should NOT contain placeholders when IDs are not set
+        assert "{inoue}" not in body['messages'][0]['text']
+        assert "{kondo}" not in body['messages'][0]['text']
+        
+        # Substitution should be empty
+        assert body['messages'][0]['substitution'] == {}
+
+    @patch('src.main.get_line_to_id')
+    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', None)
+    def test_notify_line_no_token(self, mock_get_id):
+        """Test LINE notification when token is not set"""
+        mock_get_id.return_value = "group_id"
+        
+        # Should not raise an exception
+        notify_line("indeed", "山田太郎", "https://indeed.com/apply/123")
+
+    @patch('src.main.requests.post')
+    @patch('src.main.get_line_to_id')
+    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
+    @patch('src.main.notify_error_to_slack')
+    @patch('src.main.log')
+    def test_notify_line_api_error(self, mock_log, mock_error, mock_get_id, mock_post):
+        """Test LINE notification when API returns error"""
+        mock_get_id.return_value = "group_id"
+        mock_post.return_value = MagicMock(status_code=500, text="Internal Server Error")
+        
+        notify_line("indeed", "山田太郎", "https://indeed.com/apply/123")
+        
+        mock_error.assert_called_once()
+
+    @patch('src.main.requests.post')
+    @patch('src.main.get_line_to_id')
+    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
+    @patch('src.main.notify_error_to_slack')
+    @patch('src.main.log')
+    def test_notify_line_exception(self, mock_log, mock_error, mock_get_id, mock_post):
+        """Test LINE notification when request raises exception"""
+        mock_get_id.return_value = "group_id"
+        mock_post.side_effect = Exception("Connection error")
+        
+        notify_line("indeed", "山田太郎", "https://indeed.com/apply/123")
+        
+        mock_error.assert_called_once()
