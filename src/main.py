@@ -3,9 +3,11 @@ import email
 from email.header import decode_header
 import os
 import time
+import json
+import re
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # --- Env Vars (Railway Variables) ---
 GMAIL_IMAP_HOST = os.getenv("GMAIL_IMAP_HOST", "imap.gmail.com")
@@ -23,6 +25,9 @@ LINE_TO_ID_PROD = os.getenv("LINE_TO_ID_PROD")
 LOG_DIR = os.getenv("LOG_DIR", "/tmp")
 SLACK_ERROR_WEBHOOK_URL = os.getenv("SLACK_ERROR_WEBHOOK_URL")
 
+# --- Processed IDs file for duplicate prevention ---
+PROCESSED_IDS_FILE = os.getenv("PROCESSED_IDS_FILE", os.path.join(LOG_DIR, "processed_ids.json"))
+
 # --- Mention IDs ---
 SLACK_MENTION_INOUE_ID = os.getenv("SLACK_MENTION_INOUE_ID")
 SLACK_MENTION_KONDO_ID = os.getenv("SLACK_MENTION_KONDO_ID")
@@ -31,6 +36,9 @@ LINE_MENTION_KONDO_ID = os.getenv("LINE_MENTION_KONDO_ID")
 
 # --- Polling Interval ---
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "15"))  # デフォルト15秒
+
+# --- Search window for emails (days) ---
+SEARCH_DAYS = int(os.getenv("SEARCH_DAYS", "7"))  # デフォルト7日間
 
 
 # --- Logging ---
@@ -41,6 +49,26 @@ def log(msg):
         f.write(line + "\n")
     # 標準出力にも出力（Railway Logs用）
     print(line, flush=True)
+
+
+def load_processed_ids():
+    """Load processed message IDs from file"""
+    if os.path.exists(PROCESSED_IDS_FILE):
+        try:
+            with open(PROCESSED_IDS_FILE, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except (json.JSONDecodeError, IOError) as e:
+            log(f"WARNING: Failed to load processed IDs: {e}")
+    return set()
+
+
+def save_processed_ids(processed_ids):
+    """Save processed message IDs to file"""
+    try:
+        with open(PROCESSED_IDS_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(processed_ids), f)
+    except IOError as e:
+        log(f"ERROR: Failed to save processed IDs: {e}")
 
 
 def notify_error_to_slack(message: str) -> None:
@@ -268,12 +296,35 @@ def notify_line(source, name, url):
 
 
 # --- Process mail ---
-def process_mail(mail, msg_id):
-    status, data = mail.fetch(msg_id, "(RFC822)")
+def process_mail(mail, msg_id, processed_ids):
+    """Process a single mail. Returns X-GM-MSGID if processed, None otherwise."""
+    # Fetch with BODY.PEEK[] to avoid marking as read, and get X-GM-MSGID for duplicate prevention
+    status, data = mail.fetch(msg_id, "(X-GM-MSGID BODY.PEEK[])")
     if status != "OK":
-        return
+        return None
 
-    msg = email.message_from_bytes(data[0][1])
+    # Parse response to extract X-GM-MSGID and body
+    gm_msgid = None
+    body_data = None
+    for item in data:
+        if isinstance(item, tuple):
+            header = item[0].decode() if isinstance(item[0], bytes) else item[0]
+            if "X-GM-MSGID" in header:
+                match = re.search(r"X-GM-MSGID (\d+)", header)
+                if match:
+                    gm_msgid = match.group(1)
+            body_data = item[1]
+
+    if not body_data:
+        log(f"ERROR: Failed to fetch body for msg_id={msg_id}")
+        return None
+
+    # Check if already processed
+    if gm_msgid and gm_msgid in processed_ids:
+        log(f"Skip already processed: X-GM-MSGID={gm_msgid}")
+        return None
+
+    msg = email.message_from_bytes(body_data)
 
     subject = decode(msg.get("Subject", ""))
     from_header = decode(msg.get("From", ""))
@@ -289,30 +340,45 @@ def process_mail(mail, msg_id):
         url = "https://jmty.jp/web_mail/posts"
     else:
         log(f"Skip mail: {subject}")
-        mail.store(msg_id, "+FLAGS", "\\Seen")
-        return
+        # Do NOT mark as read - just return the ID to track as processed
+        return gm_msgid
 
     log(f"Notify {source}: {name}, url={url}")
 
     notify_slack(source, name, url)
     notify_line(source, name, url)
 
-    mail.store(msg_id, "+FLAGS", "\\Seen")
+    # Do NOT mark as read - return the ID to track as processed
+    return gm_msgid
 
 
 # --- Check mail once ---
 def check_mail():
     try:
+        # Load processed IDs at the start of each check
+        processed_ids = load_processed_ids()
+
         mail = imaplib.IMAP4_SSL(GMAIL_IMAP_HOST)
         mail.login(GMAIL_IMAP_USER, GMAIL_IMAP_PASSWORD)
-        mail.select("INBOX")
-        status, data = mail.search(None, "UNSEEN")
+        mail.select("INBOX", readonly=True)  # Use readonly to prevent any implicit read marking
+
+        # Search for emails from the last N days (regardless of read status)
+        since_date = (datetime.now() - timedelta(days=SEARCH_DAYS)).strftime("%d-%b-%Y")
+        status, data = mail.search(None, "SINCE", since_date)
 
         msg_ids = data[0].split()
-        log(f"Unread count: {len(msg_ids)}")
+        log(f"Emails in last {SEARCH_DAYS} days: {len(msg_ids)}")
 
+        new_processed = False
         for msg_id in msg_ids:
-            process_mail(mail, msg_id)
+            gm_msgid = process_mail(mail, msg_id, processed_ids)
+            if gm_msgid:
+                processed_ids.add(gm_msgid)
+                new_processed = True
+
+        # Save processed IDs if any new ones were added
+        if new_processed:
+            save_processed_ids(processed_ids)
 
         mail.close()
         mail.logout()
