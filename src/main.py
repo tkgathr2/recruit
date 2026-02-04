@@ -226,22 +226,29 @@ def notify_line(source: str, name: str, url: str) -> None:
         lines.extend(["", "詳細はこちら:", url])
 
     base_message = add_test_prefix("\n".join(lines))
-    text_v2 = f"{{inoue}} {{kondo}} {base_message}"
 
+    # Build mention placeholders and substitution based on configured IDs
+    mention_parts = []
     substitution = {}
     if LINE_MENTION_INOUE_ID:
+        mention_parts.append("{inoue}")
         substitution["inoue"] = {
             "type": "mention",
             "mentionee": {"type": "user", "userId": LINE_MENTION_INOUE_ID},
         }
     if LINE_MENTION_KONDO_ID:
+        mention_parts.append("{kondo}")
         substitution["kondo"] = {
             "type": "mention",
             "mentionee": {"type": "user", "userId": LINE_MENTION_KONDO_ID},
         }
 
-    if not substitution:
-        log("WARNING: LINE mention IDs not configured; sending without substitution")
+    # Build text_v2 with only configured mention placeholders
+    if mention_parts:
+        text_v2 = f"{' '.join(mention_parts)} {base_message}"
+    else:
+        text_v2 = base_message
+        log("WARNING: LINE mention IDs not configured; sending without mentions")
 
     body = {
         "to": line_to_id,
@@ -252,10 +259,16 @@ def notify_line(source: str, name: str, url: str) -> None:
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
-    resp = requests.post("https://api.line.me/v2/bot/message/push", json=body, headers=headers)
-    log(f"LINE API response: status={resp.status_code}")
-    if resp.status_code >= 400:
-        notify_error_to_slack(f"LINE notify failed: status={resp.status_code}, body={resp.text}")
+
+    try:
+        resp = requests.post("https://api.line.me/v2/bot/message/push", json=body, headers=headers)
+        log(f"LINE API response: status={resp.status_code}")
+        if resp.status_code >= 400:
+            log(f"ERROR: LINE notify failed (status={resp.status_code}, body={resp.text})")
+            notify_error_to_slack(f"LINE notify failed: status={resp.status_code}, body={resp.text}")
+    except Exception as e:
+        log(f"ERROR: LINE notify exception: {e}")
+        notify_error_to_slack(f"LINE notify exception: {e}")
 
 
 # --- IMAP Connection ---
