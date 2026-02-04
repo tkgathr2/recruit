@@ -22,6 +22,9 @@ from src.main import (
     parse_fetch_response,
     load_processed_ids,
     save_processed_ids,
+    ensure_processed_ids_dir,
+    get_unique_id,
+    verify_storage,
     is_test_mode,
     add_test_prefix,
     notify_slack,
@@ -201,6 +204,75 @@ class TestProcessedIds:
                     mock_log.assert_called()
         finally:
             os.unlink(temp_path)
+
+
+class TestEnsureProcessedIdsDir:
+    def test_creates_directory(self):
+        """Test that directory is created if it doesn't exist"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            new_dir = os.path.join(tmpdir, "subdir", "processed_ids.json")
+            with patch('src.main.PROCESSED_IDS_FILE', new_dir):
+                result = ensure_processed_ids_dir()
+                assert result == True
+                assert os.path.exists(os.path.dirname(new_dir))
+
+    def test_existing_directory(self):
+        """Test that function succeeds when directory already exists"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            existing_file = os.path.join(tmpdir, "processed_ids.json")
+            with patch('src.main.PROCESSED_IDS_FILE', existing_file):
+                result = ensure_processed_ids_dir()
+                assert result == True
+
+
+class TestGetUniqueId:
+    def test_prefers_gm_msgid(self):
+        """Test that X-GM-MSGID is preferred over Message-ID"""
+        msg = MagicMock()
+        msg.get.return_value = "<message-id@example.com>"
+        
+        result = get_unique_id("12345", msg)
+        assert result == "gm:12345"
+
+    def test_fallback_to_message_id(self):
+        """Test fallback to Message-ID when X-GM-MSGID is None"""
+        msg = MagicMock()
+        msg.get.return_value = "<message-id@example.com>"
+        
+        result = get_unique_id(None, msg)
+        assert result == "mid:<message-id@example.com>"
+
+    def test_returns_none_when_no_id(self):
+        """Test returns None when both IDs are unavailable"""
+        msg = MagicMock()
+        msg.get.return_value = None
+        
+        result = get_unique_id(None, msg)
+        assert result is None
+
+
+class TestVerifyStorage:
+    @patch('src.main.notify_error_to_slack')
+    @patch('src.main.log')
+    def test_verify_storage_success(self, mock_log, mock_error):
+        """Test storage verification succeeds with valid directory"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_file = os.path.join(tmpdir, "processed_ids.json")
+            with patch('src.main.PROCESSED_IDS_FILE', test_file):
+                result = verify_storage()
+                assert result == True
+                mock_error.assert_not_called()
+
+    @patch('src.main.notify_error_to_slack')
+    @patch('src.main.log')
+    def test_verify_storage_creates_directory(self, mock_log, mock_error):
+        """Test storage verification creates directory if needed"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            new_dir = os.path.join(tmpdir, "newdir", "processed_ids.json")
+            with patch('src.main.PROCESSED_IDS_FILE', new_dir):
+                result = verify_storage()
+                assert result == True
+                assert os.path.exists(os.path.dirname(new_dir))
 
 
 class TestModeManagement:
