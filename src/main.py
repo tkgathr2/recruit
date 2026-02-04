@@ -1,3 +1,5 @@
+"""Gmail polling service for Indeed/Jimoty job application notifications."""
+
 import imaplib
 import email
 from email.header import decode_header
@@ -5,6 +7,9 @@ import os
 import time
 import json
 import re
+from contextlib import contextmanager
+from typing import Optional, Set, Tuple
+
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
@@ -42,17 +47,17 @@ SEARCH_DAYS = int(os.getenv("SEARCH_DAYS", "7"))  # デフォルト7日間
 
 
 # --- Logging ---
-def log(msg):
+def log(msg: str) -> None:
+    """Log message to file and stdout."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"{ts} {msg}"
     with open(os.path.join(LOG_DIR, "recruit.log"), "a", encoding="utf-8") as f:
         f.write(line + "\n")
-    # 標準出力にも出力（Railway Logs用）
     print(line, flush=True)
 
 
-def load_processed_ids():
-    """Load processed message IDs from file"""
+def load_processed_ids() -> Set[str]:
+    """Load processed message IDs from file."""
     if os.path.exists(PROCESSED_IDS_FILE):
         try:
             with open(PROCESSED_IDS_FILE, "r", encoding="utf-8") as f:
@@ -62,8 +67,8 @@ def load_processed_ids():
     return set()
 
 
-def save_processed_ids(processed_ids):
-    """Save processed message IDs to file"""
+def save_processed_ids(processed_ids: Set[str]) -> None:
+    """Save processed message IDs to file."""
     try:
         with open(PROCESSED_IDS_FILE, "w", encoding="utf-8") as f:
             json.dump(list(processed_ids), f)
@@ -94,96 +99,75 @@ def notify_error_to_slack(message: str) -> None:
 
 
 # --- MODE management ---
-def get_mode():
-    """Return current mode: 'test' or 'prod'"""
-    mode = MODE.lower() if MODE else "prod"
-    return "test" if mode == "test" else "prod"
+def is_test_mode() -> bool:
+    """Check if running in test mode."""
+    return (MODE.lower() if MODE else "prod") == "test"
 
 
-def get_slack_webhook_url(mode):
-    """Get Slack Webhook URL based on mode"""
-    if mode == "test":
-        url = SLACK_WEBHOOK_URL_TEST
-        if not url:
-            log("WARNING: SLACK_WEBHOOK_URL_TEST is not set")
-        return url
-    else:
-        url = SLACK_WEBHOOK_URL_PROD
-        if not url:
-            log("WARNING: SLACK_WEBHOOK_URL_PROD is not set")
-        return url
+def get_slack_webhook_url() -> Optional[str]:
+    """Get Slack Webhook URL based on current mode."""
+    url = SLACK_WEBHOOK_URL_TEST if is_test_mode() else SLACK_WEBHOOK_URL_PROD
+    if not url:
+        log(f"WARNING: SLACK_WEBHOOK_URL_{'TEST' if is_test_mode() else 'PROD'} is not set")
+    return url
 
 
-def get_line_to_id(mode):
-    """Get LINE TO ID based on mode"""
-    if mode == "test":
-        to_id = LINE_TO_ID_TEST
-        if not to_id:
-            log("WARNING: LINE_TO_ID_TEST is not set")
-        return to_id
-    else:
-        to_id = LINE_TO_ID_PROD
-        if not to_id:
-            log("WARNING: LINE_TO_ID_PROD is not set")
-        return to_id
+def get_line_to_id() -> Optional[str]:
+    """Get LINE TO ID based on current mode."""
+    to_id = LINE_TO_ID_TEST if is_test_mode() else LINE_TO_ID_PROD
+    if not to_id:
+        log(f"WARNING: LINE_TO_ID_{'TEST' if is_test_mode() else 'PROD'} is not set")
+    return to_id
 
 
-def add_test_prefix(message, mode):
-    """Add test version prefix if in test mode"""
-    if mode == "test":
-        return f"【テストバージョン】\n{message}"
-    return message
+def add_test_prefix(message: str) -> str:
+    """Add test version prefix if in test mode."""
+    return f"【テストバージョン】\n{message}" if is_test_mode() else message
 
 
-# --- Decode header ---
-def decode(value):
+# --- Email Parsing ---
+def decode_header_value(value: Optional[str]) -> str:
+    """Decode email header value."""
     if not value:
         return ""
     parts = decode_header(value)
-    decoded = ""
-    for text, enc in parts:
-        if isinstance(text, bytes):
-            decoded += text.decode(enc or "utf-8", errors="replace")
-        else:
-            decoded += text
-    return decoded
+    return "".join(
+        text.decode(enc or "utf-8", errors="replace") if isinstance(text, bytes) else text
+        for text, enc in parts
+    )
 
 
-# --- Extract applicant name ---
-def extract_name(from_header):
+def extract_name(from_header: str) -> str:
+    """Extract applicant name from From header."""
     try:
         return from_header.split("<")[0].replace('"', "").strip()
-    except:
+    except (IndexError, AttributeError):
         return from_header
 
 
-# --- Extract HTML part ---
-def extract_html(msg):
+def extract_html(msg: email.message.Message) -> str:
+    """Extract HTML content from email message."""
     if msg.is_multipart():
         for part in msg.walk():
             if part.get_content_type() == "text/html":
                 charset = part.get_content_charset() or "utf-8"
                 return part.get_payload(decode=True).decode(charset, errors="replace")
-    else:
-        if msg.get_content_type() == "text/html":
-            charset = msg.get_content_charset() or "utf-8"
-            return msg.get_payload(decode=True).decode(charset, errors="replace")
+    elif msg.get_content_type() == "text/html":
+        charset = msg.get_content_charset() or "utf-8"
+        return msg.get_payload(decode=True).decode(charset, errors="replace")
     return ""
 
 
-# --- Extract URL from Indeed email ---
-def extract_indeed_url(html):
+def extract_indeed_url(html: str) -> str:
+    """Extract application URL from Indeed email HTML."""
     if not html:
         return ""
     soup = BeautifulSoup(html, "html.parser")
 
-    # Find button "応募内容を確認する"
     for a in soup.find_all("a"):
-        text = (a.get_text() or "").strip()
-        if "応募内容を確認する" in text:
+        if "応募内容を確認する" in (a.get_text() or ""):
             return a.get("href") or ""
 
-    # fallback (rare)
     for a in soup.find_all("a"):
         href = a.get("href") or ""
         if "indeed" in href:
@@ -192,18 +176,16 @@ def extract_indeed_url(html):
     return ""
 
 
-# --- Slack notify ---
-def notify_slack(source, name, url):
-    mode = get_mode()
-    webhook_url = get_slack_webhook_url(mode)
-
+# --- Notification Functions ---
+def notify_slack(source: str, name: str, url: str) -> None:
+    """Send notification to Slack."""
+    webhook_url = get_slack_webhook_url()
     if not webhook_url:
         log("No Slack Webhook URL")
         return
 
     title = "【Indeed応募】" if source == "indeed" else "【ジモティー】"
 
-    # メンション用プレフィックス
     mention_prefix = ""
     if SLACK_MENTION_INOUE_ID and SLACK_MENTION_KONDO_ID:
         mention_prefix = f"<@{SLACK_MENTION_INOUE_ID}> <@{SLACK_MENTION_KONDO_ID}>\n"
@@ -212,10 +194,9 @@ def notify_slack(source, name, url):
 
     lines = [f"{title} 【{name}】 さんから応募がありました。"]
     if url:
-        lines += ["", "応募内容はこちら:", url]
+        lines.extend(["", "応募内容はこちら:", url])
 
-    message = mention_prefix + "\n".join(lines)
-    message = add_test_prefix(message, mode)
+    message = add_test_prefix(mention_prefix + "\n".join(lines))
 
     try:
         resp = requests.post(webhook_url, json={"text": message})
@@ -227,85 +208,75 @@ def notify_slack(source, name, url):
         notify_error_to_slack(f"Slack notify exception: {e}")
 
 
-# --- LINE notify ---
-def notify_line(source, name, url):
-    mode = get_mode()
-    line_to_id = get_line_to_id(mode)
-
+def notify_line(source: str, name: str, url: str) -> None:
+    """Send notification to LINE."""
+    line_to_id = get_line_to_id()
     if not LINE_CHANNEL_ACCESS_TOKEN or not line_to_id:
         log("LINE Token or TO ID missing")
         return
 
     title = "Indeedに応募がありました。" if source == "indeed" else "ジモティーで新着があります。"
 
-    # 本文部分
     lines = [f"【{name}】 さんから{title}"]
     if url:
-        lines += ["", "詳細はこちら:", url]
+        lines.extend(["", "詳細はこちら:", url])
 
-    base_message = "\n".join(lines)
-
-    # MODE に応じてテストプレフィックスを適用
-    base_message = add_test_prefix(base_message, mode)
-
-    # textV2 + substitution 方式でメンションを実装
+    base_message = add_test_prefix("\n".join(lines))
     text_v2 = f"{{inoue}} {{kondo}} {base_message}"
 
     substitution = {}
     if LINE_MENTION_INOUE_ID:
         substitution["inoue"] = {
             "type": "mention",
-            "mentionee": {
-                "type": "user",
-                "userId": LINE_MENTION_INOUE_ID,
-            },
+            "mentionee": {"type": "user", "userId": LINE_MENTION_INOUE_ID},
         }
     if LINE_MENTION_KONDO_ID:
         substitution["kondo"] = {
             "type": "mention",
-            "mentionee": {
-                "type": "user",
-                "userId": LINE_MENTION_KONDO_ID,
-            },
+            "mentionee": {"type": "user", "userId": LINE_MENTION_KONDO_ID},
         }
 
     if not substitution:
         log("WARNING: LINE mention IDs not configured; sending without substitution")
 
-    message_obj = {
-        "type": "textV2",
-        "text": text_v2,
-        "substitution": substitution,
-    }
-
     body = {
         "to": line_to_id,
-        "messages": [message_obj],
+        "messages": [{"type": "textV2", "text": text_v2, "substitution": substitution}],
     }
 
-    # デバッグ用ログ
-    log(f"LINE base_message: {base_message}")
-    log(f"LINE textV2: {text_v2}")
-    log(f"LINE substitution: {substitution}")
-
-    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
     resp = requests.post("https://api.line.me/v2/bot/message/push", json=body, headers=headers)
-    log(f"LINE API response: status={resp.status_code}, body={resp.text}")
+    log(f"LINE API response: status={resp.status_code}")
     if resp.status_code >= 400:
         notify_error_to_slack(f"LINE notify failed: status={resp.status_code}, body={resp.text}")
 
 
-# --- Process mail ---
-def process_mail(mail, msg_id, processed_ids):
-    """Process a single mail. Returns X-GM-MSGID if processed, None otherwise."""
-    # Fetch with BODY.PEEK[] to avoid marking as read, and get X-GM-MSGID for duplicate prevention
-    status, data = mail.fetch(msg_id, "(X-GM-MSGID BODY.PEEK[])")
-    if status != "OK":
-        return None
+# --- IMAP Connection ---
+@contextmanager
+def imap_connection():
+    """Context manager for IMAP connection."""
+    mail = imaplib.IMAP4_SSL(GMAIL_IMAP_HOST)
+    try:
+        mail.login(GMAIL_IMAP_USER, GMAIL_IMAP_PASSWORD)
+        mail.select("INBOX", readonly=True)
+        yield mail
+    finally:
+        try:
+            mail.close()
+            mail.logout()
+        except Exception:
+            pass
 
-    # Parse response to extract X-GM-MSGID and body
+
+# --- Mail Processing ---
+def parse_fetch_response(data: list) -> Tuple[Optional[str], Optional[bytes]]:
+    """Parse IMAP fetch response to extract X-GM-MSGID and body."""
     gm_msgid = None
     body_data = None
+
     for item in data:
         if isinstance(item, tuple):
             header = item[0].decode() if isinstance(item[0], bytes) else item[0]
@@ -315,73 +286,77 @@ def process_mail(mail, msg_id, processed_ids):
                     gm_msgid = match.group(1)
             body_data = item[1]
 
+    return gm_msgid, body_data
+
+
+def determine_source(subject: str) -> Tuple[Optional[str], Optional[str]]:
+    """Determine email source and default URL based on subject."""
+    if "新しい応募者のお知らせ" in subject:
+        return "indeed", None
+    elif "ジモティー" in subject:
+        return "jimoty", "https://jmty.jp/web_mail/posts"
+    return None, None
+
+
+def process_mail(
+    mail: imaplib.IMAP4_SSL, msg_id: bytes, processed_ids: Set[str]
+) -> Optional[str]:
+    """Process a single mail. Returns X-GM-MSGID if processed, None otherwise."""
+    status, data = mail.fetch(msg_id, "(X-GM-MSGID BODY.PEEK[])")
+    if status != "OK":
+        return None
+
+    gm_msgid, body_data = parse_fetch_response(data)
+
     if not body_data:
         log(f"ERROR: Failed to fetch body for msg_id={msg_id}")
         return None
 
-    # Check if already processed
     if gm_msgid and gm_msgid in processed_ids:
         log(f"Skip already processed: X-GM-MSGID={gm_msgid}")
         return None
 
     msg = email.message_from_bytes(body_data)
-
-    subject = decode(msg.get("Subject", ""))
-    from_header = decode(msg.get("From", ""))
+    subject = decode_header_value(msg.get("Subject", ""))
+    from_header = decode_header_value(msg.get("From", ""))
     name = extract_name(from_header)
-    html = extract_html(msg)
 
-    # Determine source
-    if "新しい応募者のお知らせ" in subject:
-        source = "indeed"
-        url = extract_indeed_url(html)
-    elif "ジモティー" in subject:
-        source = "jimoty"
-        url = "https://jmty.jp/web_mail/posts"
-    else:
+    source, default_url = determine_source(subject)
+
+    if not source:
         log(f"Skip mail: {subject}")
-        # Do NOT mark as read - just return the ID to track as processed
         return gm_msgid
 
+    url = extract_indeed_url(extract_html(msg)) if source == "indeed" else default_url
     log(f"Notify {source}: {name}, url={url}")
 
     notify_slack(source, name, url)
     notify_line(source, name, url)
 
-    # Do NOT mark as read - return the ID to track as processed
     return gm_msgid
 
 
-# --- Check mail once ---
-def check_mail():
+def check_mail() -> None:
+    """Check mailbox for new applications."""
     try:
-        # Load processed IDs at the start of each check
         processed_ids = load_processed_ids()
 
-        mail = imaplib.IMAP4_SSL(GMAIL_IMAP_HOST)
-        mail.login(GMAIL_IMAP_USER, GMAIL_IMAP_PASSWORD)
-        mail.select("INBOX", readonly=True)  # Use readonly to prevent any implicit read marking
+        with imap_connection() as mail:
+            since_date = (datetime.now() - timedelta(days=SEARCH_DAYS)).strftime("%d-%b-%Y")
+            status, data = mail.search(None, "SINCE", since_date)
 
-        # Search for emails from the last N days (regardless of read status)
-        since_date = (datetime.now() - timedelta(days=SEARCH_DAYS)).strftime("%d-%b-%Y")
-        status, data = mail.search(None, "SINCE", since_date)
+            msg_ids = data[0].split()
+            log(f"Emails in last {SEARCH_DAYS} days: {len(msg_ids)}")
 
-        msg_ids = data[0].split()
-        log(f"Emails in last {SEARCH_DAYS} days: {len(msg_ids)}")
+            new_processed = False
+            for msg_id in msg_ids:
+                gm_msgid = process_mail(mail, msg_id, processed_ids)
+                if gm_msgid:
+                    processed_ids.add(gm_msgid)
+                    new_processed = True
 
-        new_processed = False
-        for msg_id in msg_ids:
-            gm_msgid = process_mail(mail, msg_id, processed_ids)
-            if gm_msgid:
-                processed_ids.add(gm_msgid)
-                new_processed = True
-
-        # Save processed IDs if any new ones were added
-        if new_processed:
-            save_processed_ids(processed_ids)
-
-        mail.close()
-        mail.logout()
+            if new_processed:
+                save_processed_ids(processed_ids)
 
     except Exception as e:
         log(f"ERROR: {e}")
@@ -389,7 +364,8 @@ def check_mail():
 
 
 # --- Main loop ---
-def main():
+def main() -> None:
+    """Main polling loop."""
     log(f"Starting Gmail polling with POLL_INTERVAL_SECONDS={POLL_INTERVAL_SECONDS}")
 
     while True:
