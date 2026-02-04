@@ -41,7 +41,7 @@ LINE_MENTION_INOUE_ID = os.getenv("LINE_MENTION_INOUE_ID")
 LINE_MENTION_KONDO_ID = os.getenv("LINE_MENTION_KONDO_ID")
 
 # --- Polling Interval ---
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "15"))  # デフォルト15秒
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))  # デフォルト30秒（Gmail API制限対策）
 
 # --- Search window for emails (days) ---
 SEARCH_DAYS = int(os.getenv("SEARCH_DAYS", "7"))  # デフォルト7日間
@@ -439,7 +439,68 @@ def process_mail(
     return unique_id
 
 
-def check_mail() -> None:
+def get_uid_from_fetch(data: list) -> Optional[str]:
+    """Extract UID from IMAP fetch response."""
+    for item in data:
+        if isinstance(item, tuple):
+            header = item[0].decode() if isinstance(item[0], bytes) else item[0]
+            match = re.search(r"UID (\d+)", header)
+            if match:
+                return match.group(1)
+    return None
+
+
+def process_mail_by_uid(
+    mail: imaplib.IMAP4_SSL, uid: bytes, processed_ids: Set[str]
+) -> Optional[str]:
+    """Process a single mail by UID. Returns unique ID if processed, None otherwise."""
+    uid_str = uid.decode() if isinstance(uid, bytes) else uid
+    
+    # Use UID FETCH instead of regular FETCH
+    status, data = mail.uid("fetch", uid_str, "(X-GM-MSGID BODY.PEEK[])")
+    if status != "OK":
+        log(f"ERROR: Failed to fetch uid={uid_str}, status={status}")
+        return None
+
+    gm_msgid, body_data = parse_fetch_response(data)
+
+    if not body_data:
+        log(f"ERROR: Failed to fetch body for uid={uid_str}")
+        return None
+
+    msg = email.message_from_bytes(body_data)
+    
+    # Get unique identifier (X-GM-MSGID or Message-ID)
+    unique_id = get_unique_id(gm_msgid, msg)
+    
+    if not unique_id:
+        log(f"ERROR: No unique ID found for uid={uid_str}, skipping to prevent duplicates")
+        return None
+    
+    # Double-check with X-GM-MSGID/Message-ID (in case UID tracking missed it)
+    if unique_id in processed_ids:
+        return None  # Already processed, skip silently
+    
+    subject = decode_header_value(msg.get("Subject", ""))
+    from_header = decode_header_value(msg.get("From", ""))
+    name = extract_name(from_header)
+
+    source, default_url = determine_source(subject)
+
+    if not source:
+        log(f"Skip non-target mail: {subject[:50]}...")
+        return unique_id  # Mark as processed to avoid re-checking
+
+    url = extract_indeed_url(extract_html(msg)) if source == "indeed" else default_url
+    log(f"Notify {source}: {name}, url={url}, id={unique_id}")
+
+    notify_slack(source, name, url)
+    notify_line(source, name, url)
+
+    return unique_id
+
+
+def check_mail()-> None:
     """Check mailbox for new applications."""
     try:
         processed_ids, load_success = load_processed_ids()
@@ -451,15 +512,29 @@ def check_mail() -> None:
 
         with imap_connection() as mail:
             since_date = (datetime.now() - timedelta(days=SEARCH_DAYS)).strftime("%d-%b-%Y")
-            status, data = mail.search(None, "SINCE", since_date)
+            # Use UID SEARCH for stable identifiers
+            status, data = mail.uid("search", None, "SINCE", since_date)
 
-            msg_ids = data[0].split()
-            log(f"Emails in last {SEARCH_DAYS} days: {len(msg_ids)}")
+            uid_list = data[0].split()
+            log(f"Emails in last {SEARCH_DAYS} days: {len(uid_list)}")
 
-            for msg_id in msg_ids:
-                unique_id = process_mail(mail, msg_id, processed_ids)
+            # Filter out UIDs we've already processed (check uid: prefix)
+            new_uids = []
+            for uid in uid_list:
+                uid_str = uid.decode() if isinstance(uid, bytes) else uid
+                if f"uid:{uid_str}" not in processed_ids:
+                    new_uids.append(uid)
+            
+            if new_uids:
+                log(f"New emails to process: {len(new_uids)}")
+            
+            for uid in new_uids:
+                uid_str = uid.decode() if isinstance(uid, bytes) else uid
+                unique_id = process_mail_by_uid(mail, uid, processed_ids)
                 if unique_id:
+                    # Store both the unique_id (gm: or mid:) and the uid for efficient filtering
                     processed_ids.add(unique_id)
+                    processed_ids.add(f"uid:{uid_str}")
                     # Save immediately after each email to prevent duplicates on crash
                     if not save_processed_ids(processed_ids):
                         # If save fails, stop processing to prevent more potential duplicates
