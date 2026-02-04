@@ -176,8 +176,9 @@ class TestParseFetchResponse:
 class TestProcessedIds:
     def test_load_nonexistent_file(self):
         with patch('src.main.PROCESSED_IDS_FILE', '/nonexistent/path.json'):
-            result = load_processed_ids()
+            result, success = load_processed_ids()
             assert result == set()
+            assert success == True  # First run is considered success
 
     def test_save_and_load(self):
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
@@ -186,9 +187,11 @@ class TestProcessedIds:
         try:
             with patch('src.main.PROCESSED_IDS_FILE', temp_path):
                 ids = {"id1", "id2", "id3"}
-                save_processed_ids(ids)
-                loaded = load_processed_ids()
+                save_result = save_processed_ids(ids)
+                assert save_result == True
+                loaded, success = load_processed_ids()
                 assert loaded == ids
+                assert success == True
         finally:
             os.unlink(temp_path)
 
@@ -200,8 +203,9 @@ class TestProcessedIds:
         try:
             with patch('src.main.PROCESSED_IDS_FILE', temp_path):
                 with patch('src.main.log') as mock_log:
-                    result = load_processed_ids()
+                    result, success = load_processed_ids()
                     assert result == set()
+                    assert success == False  # Corrupted file returns False
                     mock_log.assert_called()
         finally:
             os.unlink(temp_path)
