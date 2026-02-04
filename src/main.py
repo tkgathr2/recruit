@@ -500,6 +500,21 @@ def process_mail_by_uid(
     return unique_id
 
 
+def get_gm_msgid_lightweight(mail: imaplib.IMAP4_SSL, uid: str) -> Optional[str]:
+    """Fetch only X-GM-MSGID for a single email (lightweight, no body)."""
+    status, data = mail.uid("fetch", uid, "(X-GM-MSGID)")
+    if status != "OK":
+        return None
+    
+    for item in data:
+        if isinstance(item, tuple):
+            header = item[0].decode() if isinstance(item[0], bytes) else str(item[0])
+            match = re.search(r"X-GM-MSGID (\d+)", header)
+            if match:
+                return f"gm:{match.group(1)}"
+    return None
+
+
 def check_mail()-> None:
     """Check mailbox for new applications."""
     try:
@@ -518,17 +533,48 @@ def check_mail()-> None:
             uid_list = data[0].split()
             log(f"Emails in last {SEARCH_DAYS} days: {len(uid_list)}")
 
-            # Filter out UIDs we've already processed (check uid: prefix)
-            new_uids = []
+            # Phase 1: Quick filter by UID (for emails we've seen before)
+            uids_to_check = []
             for uid in uid_list:
                 uid_str = uid.decode() if isinstance(uid, bytes) else uid
                 if f"uid:{uid_str}" not in processed_ids:
-                    new_uids.append(uid)
+                    uids_to_check.append(uid)
             
-            if new_uids:
-                log(f"New emails to process: {len(new_uids)}")
+            if not uids_to_check:
+                return  # All emails already processed
             
-            for uid in new_uids:
+            log(f"UIDs not in cache: {len(uids_to_check)}")
+            
+            # Phase 2: Lightweight check - fetch only X-GM-MSGID to filter by gm: prefix
+            # This avoids full FETCH for emails that are already processed but missing uid: entry
+            truly_new_uids = []
+            uids_to_mark = []  # UIDs that are already processed but need uid: entry added
+            
+            for uid in uids_to_check:
+                uid_str = uid.decode() if isinstance(uid, bytes) else uid
+                gm_id = get_gm_msgid_lightweight(mail, uid_str)
+                
+                if gm_id and gm_id in processed_ids:
+                    # Already processed (has gm: entry), just need to add uid: entry
+                    uids_to_mark.append((uid_str, gm_id))
+                else:
+                    # Truly new email, needs full processing
+                    truly_new_uids.append(uid)
+            
+            # Add uid: entries for already-processed emails (bootstrap)
+            if uids_to_mark:
+                log(f"Bootstrapping {len(uids_to_mark)} UIDs for already-processed emails")
+                for uid_str, gm_id in uids_to_mark:
+                    processed_ids.add(f"uid:{uid_str}")
+                if not save_processed_ids(processed_ids):
+                    log("ERROR: Failed to save bootstrapped UIDs")
+                    return
+            
+            if truly_new_uids:
+                log(f"Truly new emails to process: {len(truly_new_uids)}")
+            
+            # Phase 3: Full processing for truly new emails only
+            for uid in truly_new_uids:
                 uid_str = uid.decode() if isinstance(uid, bytes) else uid
                 unique_id = process_mail_by_uid(mail, uid, processed_ids)
                 if unique_id:
