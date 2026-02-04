@@ -98,8 +98,13 @@ def migrate_old_id_format(ids: Set[str]) -> Set[str]:
     return migrated
 
 
-def load_processed_ids() -> Set[str]:
-    """Load processed message IDs from file."""
+def load_processed_ids() -> Tuple[Set[str], bool]:
+    """Load processed message IDs from file.
+    
+    Returns:
+        Tuple of (processed_ids set, success flag).
+        If file exists but can't be read, returns (empty set, False) to prevent mass re-processing.
+    """
     if os.path.exists(PROCESSED_IDS_FILE):
         try:
             with open(PROCESSED_IDS_FILE, "r", encoding="utf-8") as f:
@@ -111,26 +116,30 @@ def load_processed_ids() -> Set[str]:
                 # Save immediately if migration occurred to prevent re-migration on crash
                 if migrated != original_set:
                     save_processed_ids(migrated)
-                return migrated
+                return migrated, True
         except (json.JSONDecodeError, IOError) as e:
-            log(f"WARNING: Failed to load processed IDs: {e}")
-            notify_error_to_slack(f"Failed to load processed IDs: {e}")
+            log(f"ERROR: Failed to load processed IDs (file exists but corrupted): {e}")
+            notify_error_to_slack(f"CRITICAL: Failed to load processed IDs - file corrupted: {e}")
+            # Return False to prevent mass re-processing of all emails
+            return set(), False
     else:
-        log(f"Processed IDs file does not exist: {PROCESSED_IDS_FILE}")
-    return set()
+        log(f"Processed IDs file does not exist: {PROCESSED_IDS_FILE} (first run)")
+    return set(), True
 
 
-def save_processed_ids(processed_ids: Set[str]) -> None:
-    """Save processed message IDs to file."""
+def save_processed_ids(processed_ids: Set[str]) -> bool:
+    """Save processed message IDs to file. Returns True if successful."""
     if not ensure_processed_ids_dir():
-        return
+        return False
     try:
         with open(PROCESSED_IDS_FILE, "w", encoding="utf-8") as f:
             json.dump(list(processed_ids), f)
         log(f"Saved {len(processed_ids)} processed IDs to {PROCESSED_IDS_FILE}")
+        return True
     except IOError as e:
         log(f"ERROR: Failed to save processed IDs: {e}")
         notify_error_to_slack(f"Failed to save processed IDs: {e}")
+        return False
 
 
 def notify_error_to_slack(message: str) -> None:
@@ -433,7 +442,12 @@ def process_mail(
 def check_mail() -> None:
     """Check mailbox for new applications."""
     try:
-        processed_ids = load_processed_ids()
+        processed_ids, load_success = load_processed_ids()
+        
+        # If file exists but is corrupted, skip processing to prevent mass re-notifications
+        if not load_success:
+            log("ERROR: Skipping mail check due to corrupted processed IDs file")
+            return
 
         with imap_connection() as mail:
             since_date = (datetime.now() - timedelta(days=SEARCH_DAYS)).strftime("%d-%b-%Y")
@@ -447,7 +461,10 @@ def check_mail() -> None:
                 if unique_id:
                     processed_ids.add(unique_id)
                     # Save immediately after each email to prevent duplicates on crash
-                    save_processed_ids(processed_ids)
+                    if not save_processed_ids(processed_ids):
+                        # If save fails, stop processing to prevent more potential duplicates
+                        log("ERROR: Stopping mail processing due to save failure")
+                        return
 
     except Exception as e:
         log(f"ERROR: {e}")
@@ -488,7 +505,10 @@ def verify_storage() -> bool:
         return False
     
     # Load existing processed IDs
-    processed_ids = load_processed_ids()
+    processed_ids, load_success = load_processed_ids()
+    if not load_success:
+        log("ERROR: Processed IDs file is corrupted")
+        return False
     log(f"Currently tracking {len(processed_ids)} processed emails")
     log(f"=== Storage Verification Complete ===")
     
