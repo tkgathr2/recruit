@@ -45,7 +45,7 @@ POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))  # デフ�
 MAX_BACKOFF_SECONDS = int(os.getenv("MAX_BACKOFF_SECONDS", "900"))  # 最大15分のバックオフ
 
 # --- Search window for emails (days) ---
-SEARCH_DAYS = int(os.getenv("SEARCH_DAYS", "7"))  # デフォルト7日間
+SEARCH_DAYS = int(os.getenv("SEARCH_DAYS", "1"))  # デフォルト1日間（Gmail API制限対策）
 
 
 # --- Logging ---
