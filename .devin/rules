@@ -52,3 +52,94 @@ curl -s -X POST https://knowhow.up.railway.app/api/feedback \
 - raw_log には具体的な学び・エラーとその解決法・設定値などを含める
 - tags にはテクノロジー名やカテゴリを含める（例: ["railway", "deploy", "postgresql"]）
 - API キーやシークレットを raw_log に含めない
+
+---
+
+## パーツスカウト制度（新機能開発時の必須プロセス）
+
+新機能を実装する前に、必ず既存のOSSパーツ（ライブラリ・パッケージ）を調査し、品質の高い既存パーツを優先的に採用する。自作は最終手段。
+
+### 適用タイミング
+- 新機能を追加する時（例：「Google認証つけて」「決済機能追加」等）
+- 新プロジェクトを作る時
+- ※既存コードの修正・バグ修正には適用しない
+
+### 調査フロー（メジャーサイトから広く調査）
+
+新機能の実装指示を受けたら、コードを書く前に世の中のメジャーなサイトからパーツを探す。
+最大30サイトまで参照可。ただし信頼性の高い有名サイトに限定すること。
+
+#### 参照OKなサイト例（これらに限定しないが、同等の信頼性があるサイトのみ許可）
+
+| カテゴリ | サイト例 |
+|----------|----------|
+| ソースコード | GitHub, GitLab, Bitbucket |
+| JSパッケージ | npm, yarn, pnpm, jsDelivr, unpkg |
+| Pythonパッケージ | PyPI, conda-forge |
+| 他言語パッケージ | crates.io (Rust), pkg.go.dev (Go), RubyGems, NuGet, Maven Central |
+| キュレーション | Awesome Lists (awesome-xxx), OpenBase, LibHunt |
+| 公式ドキュメント | React公式, Next.js公式, FastAPI公式, Django公式 等 |
+| 技術コミュニティ | Stack Overflow, Dev.to, Zenn, Qiita |
+| 比較サイト | Snyk Advisor, Socket.dev, Bundlephobia |
+
+#### 参照NGなサイト
+- 個人ブログ（技術コミュニティサイト以外）
+- 無名・信頼性不明のサイト
+- アフィリエイト目的のまとめサイト
+
+### 採用基準（全て満たすこと）
+
+| 基準 | 条件 |
+|------|------|
+| 人気度 | GitHub スター 1,000+ または 週間DL 10万+ |
+| メンテナンス | 最終コミットが6ヶ月以内 |
+| 型安全 | TypeScript対応（JS）/ Type Hints対応（Python） |
+| テスト | テストスイートが存在する |
+| ライセンス | MIT / Apache 2.0 / BSD（商用利用OK） |
+| ドキュメント | README + 基本的なドキュメントが整備されている |
+
+### 報告フォーマット
+
+調査後、以下の形式でユーザーに報告する：
+
+```
+【パーツスカウト結果】機能名: ○○
+
+候補1: <パッケージ名> ⭐<スター数> DL:<週間DL数>
+  - URL: <GitHub URL>
+  - 最終更新: <日付>
+  - 推奨理由: <一言>
+
+候補2: ...
+候補3: ...
+
+推奨: 候補<N>（理由: ...）
+```
+
+### 採用後の記録
+
+パーツを採用した場合、ノウハウキング君に自動記録する：
+
+```bash
+curl -s -X POST https://knowhow.up.railway.app/api/devin/memorize \
+  -H 'Content-Type: application/json' \
+  -d '{"project_key":"<リポジトリ名>","tool":"devin","status":"success","environment":"local","raw_log":"【パーツ採用】<パッケージ名> v<バージョン> を <機能名> に採用。選定理由: <理由>。GitHub Stars: <数>。","tags":["parts-scout","<パッケージ名>","<技術カテゴリ>"]}'
+```
+
+### 過去の採用実績を参照
+
+新機能開発前に、過去のパーツ採用実績も検索する：
+
+```bash
+curl -s -X POST https://knowhow.up.railway.app/api/devin/recall \
+  -H 'Content-Type: application/json' \
+  -d '{"project_key":"<リポジトリ名>","query":"パーツスカウト parts-scout <機能名>","top_k":5}'
+```
+
+過去に同じ機能で採用済みのパーツがあれば、調査をスキップしてそのパーツを再利用する。
+
+### 例外（自作が許可されるケース）
+- 調査の結果、適切なOSSパーツが存在しない場合
+- 既存パーツが全て採用基準を満たさない場合
+- ユーザーが明示的に「自作して」と指示した場合
+この場合も、調査結果を報告してから自作に進むこと。
