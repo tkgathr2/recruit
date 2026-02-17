@@ -1,3 +1,16 @@
+### 【最優先】DEVIN運用ルール（憲法）自動読み込み
+セッション開始時に必ず最初にDEVIN運用ルールを読み込んでください。
+
+```bash
+curl -s -X POST https://knowhow.up.railway.app/api/devin/recall \
+  -H 'Content-Type: application/json' \
+  -d '{"project_key":"DEVIN_CONSTITUTION","query":"DEVIN運用ルール 憲法 運用ルール","top_k":5}'
+```
+
+返された運用ルールに必ず従ってください。これはすべてのプロジェクトに共通する最優先ルールです。
+
+---
+
 ## ノウハウキング君 (Knowledge DB) 自動連動ルール
 
 ノウハウキング君 は AI 外部記憶基盤です。セッション中に過去の知見を検索し、セッション終了時に学びを記録します。
