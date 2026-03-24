@@ -354,8 +354,8 @@ class TestExtractHtmlEdgeCases:
 class TestNotifySlack:
     @patch('src.main.requests.post')
     @patch('src.main.get_slack_webhook_url')
-    @patch('src.main.SLACK_MENTION_INOUE_ID', 'U123')
-    @patch('src.main.SLACK_MENTION_KONDO_ID', 'U456')
+    @patch('src.main.SLACK_MENTION_ID_1', 'U123')
+    @patch('src.main.SLACK_MENTION_ID_2', 'U456')
     @patch('src.main.is_test_mode', return_value=False)
     def test_notify_slack_success(self, mock_test_mode, mock_get_url, mock_post):
         """Test successful Slack notification"""
@@ -406,8 +406,8 @@ class TestNotifyLine:
     @patch('src.main.requests.post')
     @patch('src.main.get_line_to_id')
     @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
-    @patch('src.main.LINE_MENTION_INOUE_ID', 'U123')
-    @patch('src.main.LINE_MENTION_KONDO_ID', 'U456')
+    @patch('src.main.LINE_MENTION_ID_1', 'U123')
+    @patch('src.main.LINE_MENTION_ID_2', 'U456')
     @patch('src.main.is_test_mode', return_value=False)
     def test_notify_line_success_with_mentions(self, mock_test_mode, mock_get_id, mock_post):
         """Test successful LINE notification with mentions"""
@@ -421,18 +421,18 @@ class TestNotifyLine:
         body = call_args[1]['json']
         
         # Check that text_v2 contains placeholders
-        assert "{inoue}" in body['messages'][0]['text']
-        assert "{kondo}" in body['messages'][0]['text']
+        assert "{mention1}" in body['messages'][0]['text']
+        assert "{mention2}" in body['messages'][0]['text']
         
         # Check that substitution contains both mentions
-        assert "inoue" in body['messages'][0]['substitution']
-        assert "kondo" in body['messages'][0]['substitution']
+        assert "mention1" in body['messages'][0]['substitution']
+        assert "mention2" in body['messages'][0]['substitution']
 
     @patch('src.main.requests.post')
     @patch('src.main.get_line_to_id')
     @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
-    @patch('src.main.LINE_MENTION_INOUE_ID', None)
-    @patch('src.main.LINE_MENTION_KONDO_ID', None)
+    @patch('src.main.LINE_MENTION_ID_1', None)
+    @patch('src.main.LINE_MENTION_ID_2', None)
     @patch('src.main.is_test_mode', return_value=False)
     @patch('src.main.log')
     def test_notify_line_without_mentions(self, mock_log, mock_test_mode, mock_get_id, mock_post):
@@ -447,8 +447,8 @@ class TestNotifyLine:
         body = call_args[1]['json']
         
         # After fix: text_v2 should NOT contain placeholders when IDs are not set
-        assert "{inoue}" not in body['messages'][0]['text']
-        assert "{kondo}" not in body['messages'][0]['text']
+        assert "{mention1}" not in body['messages'][0]['text']
+        assert "{mention2}" not in body['messages'][0]['text']
         
         # Substitution should be empty
         assert body['messages'][0]['substitution'] == {}
@@ -495,8 +495,8 @@ class TestNotifySlackWithRetry:
     @patch('src.main.time.sleep')
     @patch('src.main.requests.post')
     @patch('src.main.get_slack_webhook_url')
-    @patch('src.main.SLACK_MENTION_INOUE_ID', 'U123')
-    @patch('src.main.SLACK_MENTION_KONDO_ID', 'U456')
+    @patch('src.main.SLACK_MENTION_ID_1', 'U123')
+    @patch('src.main.SLACK_MENTION_ID_2', 'U456')
     @patch('src.main.is_test_mode', return_value=False)
     def test_retry_on_failure_then_success(self, mock_test_mode, mock_get_url, mock_post, mock_sleep):
         """Test that retry works when first attempt fails but second succeeds"""
