@@ -34,11 +34,11 @@ SLACK_ERROR_WEBHOOK_URL = os.getenv("SLACK_ERROR_WEBHOOK_URL")
 # --- Processed IDs file for duplicate prevention ---
 PROCESSED_IDS_FILE = os.getenv("PROCESSED_IDS_FILE", os.path.join(LOG_DIR, "processed_ids.json"))
 
-# --- Mention IDs ---
-SLACK_MENTION_INOUE_ID = os.getenv("SLACK_MENTION_INOUE_ID")
-SLACK_MENTION_KONDO_ID = os.getenv("SLACK_MENTION_KONDO_ID")
-LINE_MENTION_INOUE_ID = os.getenv("LINE_MENTION_INOUE_ID")
-LINE_MENTION_KONDO_ID = os.getenv("LINE_MENTION_KONDO_ID")
+# --- Mention IDs (generic slots: set as many as needed) ---
+SLACK_MENTION_ID_1 = os.getenv("SLACK_MENTION_ID_1")
+SLACK_MENTION_ID_2 = os.getenv("SLACK_MENTION_ID_2")
+LINE_MENTION_ID_1 = os.getenv("LINE_MENTION_ID_1")
+LINE_MENTION_ID_2 = os.getenv("LINE_MENTION_ID_2")
 
 # --- Polling Interval ---
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))  # デフォルト60秒（Gmail API制限対策）
@@ -257,11 +257,10 @@ def notify_slack_with_retry(source: str, name: str, url: str, max_retries: int =
 
     title = "【Indeed応募】" if source == "indeed" else "【ジモティー】"
 
-    mention_prefix = ""
-    if SLACK_MENTION_INOUE_ID and SLACK_MENTION_KONDO_ID:
-        mention_prefix = f"<@{SLACK_MENTION_INOUE_ID}> <@{SLACK_MENTION_KONDO_ID}>\n"
-    else:
-        log("WARNING: Slack mention IDs not fully configured")
+    mention_parts = [f"<@{mid}>" for mid in [SLACK_MENTION_ID_1, SLACK_MENTION_ID_2] if mid]
+    mention_prefix = " ".join(mention_parts) + "\n" if mention_parts else ""
+    if not mention_parts:
+        log("WARNING: No Slack mention IDs configured")
 
     lines = [f"{title} 【{name}】 さんから応募がありました。"]
     if url:
@@ -310,18 +309,14 @@ def notify_line_with_retry(source: str, name: str, url: str, max_retries: int = 
     # Build mention placeholders and substitution based on configured IDs
     mention_parts = []
     substitution = {}
-    if LINE_MENTION_INOUE_ID:
-        mention_parts.append("{inoue}")
-        substitution["inoue"] = {
-            "type": "mention",
-            "mentionee": {"type": "user", "userId": LINE_MENTION_INOUE_ID},
-        }
-    if LINE_MENTION_KONDO_ID:
-        mention_parts.append("{kondo}")
-        substitution["kondo"] = {
-            "type": "mention",
-            "mentionee": {"type": "user", "userId": LINE_MENTION_KONDO_ID},
-        }
+    for idx, line_id in enumerate([LINE_MENTION_ID_1, LINE_MENTION_ID_2], start=1):
+        if line_id:
+            key = f"mention{idx}"
+            mention_parts.append("{" + key + "}")
+            substitution[key] = {
+                "type": "mention",
+                "mentionee": {"type": "user", "userId": line_id},
+            }
 
     # Build text_v2 with only configured mention placeholders
     if mention_parts:
