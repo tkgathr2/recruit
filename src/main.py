@@ -302,7 +302,11 @@ def notify_line_with_retry(source: str, name: str, url: str, max_retries: int = 
 
     lines = [f"【{name}】 さんから{title}"]
     if url:
-        lines.extend(["", "詳細はこちら:", url])
+        # Force LINE to open URL in external browser (Chrome/Safari)
+        # to avoid Google OAuth blocking in LINE's in-app browser
+        separator = "&" if "?" in url else "?"
+        external_url = f"{url}{separator}openExternalBrowser=1"
+        lines.extend(["", "詳細はこちら:", external_url])
 
     base_message = add_test_prefix("\n".join(lines))
 

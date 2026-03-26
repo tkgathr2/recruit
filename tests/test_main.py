@@ -431,6 +431,45 @@ class TestNotifyLine:
     @patch('src.main.requests.post')
     @patch('src.main.get_line_to_id')
     @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
+    @patch('src.main.LINE_MENTION_ID_1', 'U123')
+    @patch('src.main.LINE_MENTION_ID_2', None)
+    @patch('src.main.is_test_mode', return_value=False)
+    def test_notify_line_url_opens_in_external_browser(self, mock_test_mode, mock_get_id, mock_post):
+        """Test that LINE notification URL includes openExternalBrowser=1 parameter"""
+        mock_get_id.return_value = "group_id"
+        mock_post.return_value = MagicMock(status_code=200)
+        
+        notify_line("indeed", "山田太郎", "https://indeed.com/apply/123")
+        
+        call_args = mock_post.call_args
+        body = call_args[1]['json']
+        text = body['messages'][0]['text']
+        
+        assert "openExternalBrowser=1" in text
+        assert "https://indeed.com/apply/123?openExternalBrowser=1" in text
+
+    @patch('src.main.requests.post')
+    @patch('src.main.get_line_to_id')
+    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
+    @patch('src.main.LINE_MENTION_ID_1', 'U123')
+    @patch('src.main.LINE_MENTION_ID_2', None)
+    @patch('src.main.is_test_mode', return_value=False)
+    def test_notify_line_url_with_query_params_external_browser(self, mock_test_mode, mock_get_id, mock_post):
+        """Test that openExternalBrowser=1 uses & when URL already has query params"""
+        mock_get_id.return_value = "group_id"
+        mock_post.return_value = MagicMock(status_code=200)
+        
+        notify_line("indeed", "山田太郎", "https://indeed.com/apply/123?ref=email")
+        
+        call_args = mock_post.call_args
+        body = call_args[1]['json']
+        text = body['messages'][0]['text']
+        
+        assert "https://indeed.com/apply/123?ref=email&openExternalBrowser=1" in text
+
+    @patch('src.main.requests.post')
+    @patch('src.main.get_line_to_id')
+    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
     @patch('src.main.LINE_MENTION_ID_1', None)
     @patch('src.main.LINE_MENTION_ID_2', None)
     @patch('src.main.is_test_mode', return_value=False)
