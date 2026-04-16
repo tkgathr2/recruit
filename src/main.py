@@ -310,24 +310,14 @@ def notify_line_with_retry(source: str, name: str, url: str, max_retries: int = 
 
     base_message = add_test_prefix("\n".join(lines))
 
-    # Build mention placeholders and substitution based on configured IDs
-    mention_parts = []
-    substitution = {}
-    for idx, line_id in enumerate([LINE_MENTION_ID_1, LINE_MENTION_ID_2], start=1):
-        if line_id:
-            key = f"mention{idx}"
-            mention_parts.append("{" + key + "}")
-            substitution[key] = {
-                "type": "mention",
-                "mentionee": {"type": "user", "userId": line_id},
-            }
-
-    # Build text_v2 with only configured mention placeholders
-    if mention_parts:
-        text_v2 = f"{' '.join(mention_parts)} {base_message}"
-    else:
-        text_v2 = base_message
-        log("WARNING: LINE mention IDs not configured; sending without mentions")
+    # Use @all mention to notify all members in the group
+    substitution = {
+        "mention_all": {
+            "type": "mention",
+            "mentionee": {"type": "all"},
+        }
+    }
+    text_v2 = "{mention_all} " + base_message
 
     body = {
         "to": line_to_id,
