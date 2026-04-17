@@ -32,6 +32,7 @@ from src.main import (
     notify_line,
     notify_slack_with_retry,
     notify_line_with_retry,
+    process_mail_by_uid,
 )
 
 
@@ -665,8 +666,8 @@ def test_process_mail_by_uid_both_notifications_fail(tmp_path):
 
     processed_ids = set()
 
-    with patch("main.notify_slack_with_retry", return_value=False) as mock_slack, \
-         patch("main.notify_line_with_retry", return_value=False) as mock_line:
+    with patch("src.main.notify_slack_with_retry", return_value=False) as mock_slack, \
+         patch("src.main.notify_line_with_retry", return_value=False) as mock_line:
                      result = process_mail_by_uid(mock_mail, b"1", processed_ids)
 
     # 両方失敗 → None を返す（未処理扱い）
@@ -694,8 +695,8 @@ def test_process_mail_by_uid_slack_only_success(tmp_path):
 
     processed_ids = set()
 
-    with patch("main.notify_slack_with_retry", return_value=True), \
-         patch("main.notify_line_with_retry", return_value=False):
+    with patch("src.main.notify_slack_with_retry", return_value=True), \
+         patch("src.main.notify_line_with_retry", return_value=False):
                      result = process_mail_by_uid(mock_mail, b"2", processed_ids)
 
     # Slackだけ成功 → unique_idを返す（処理済みにする）
