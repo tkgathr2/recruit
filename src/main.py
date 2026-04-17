@@ -1,16 +1,15 @@
 """Gmail polling service for Indeed/Jimoty job application notifications."""
-
 import imaplib
 import email
 from email.header import decode_header
 import os
+import socket
 import time
 import json
 import re
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Set, Tuple
-
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
@@ -27,7 +26,6 @@ SLACK_WEBHOOK_URL_PROD = os.getenv("SLACK_WEBHOOK_URL_PROD")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_TO_ID_TEST = os.getenv("LINE_TO_ID_TEST")
 LINE_TO_ID_PROD = os.getenv("LINE_TO_ID_PROD")
-
 LOG_DIR = os.getenv("LOG_DIR", "/tmp")
 SLACK_ERROR_WEBHOOK_URL = os.getenv("SLACK_ERROR_WEBHOOK_URL")
 
@@ -74,13 +72,12 @@ def ensure_processed_ids_dir() -> bool:
 
 def migrate_old_id_format(ids: Set[str]) -> Set[str]:
     """Migrate old ID format (raw numbers) to new format (gm:xxx prefix).
-    
+
     Old format: "12345678901234567890"
     New format: "gm:12345678901234567890" or "mid:<message-id@example.com>"
     """
     migrated = set()
     migration_count = 0
-    
     for id_value in ids:
         if id_value.startswith("gm:") or id_value.startswith("mid:"):
             # Already in new format
@@ -92,32 +89,31 @@ def migrate_old_id_format(ids: Set[str]) -> Set[str]:
         else:
             # Unknown format, keep as-is (could be old Message-ID without prefix)
             migrated.add(id_value)
-    
     if migration_count > 0:
         log(f"Migrated {migration_count} IDs from old format to new format")
-    
     return migrated
 
 
 def load_processed_ids() -> Tuple[Set[str], bool]:
     """Load processed message IDs from file.
-    
+
     Returns:
         Tuple of (processed_ids set, success flag).
-        If file exists but can't be read, returns (empty set, False) to prevent mass re-processing.
+        If file exists but can't be read, returns (empty set, False)
+        to prevent mass re-processing.
     """
     if os.path.exists(PROCESSED_IDS_FILE):
         try:
             with open(PROCESSED_IDS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                log(f"Loaded {len(data)} processed IDs from {PROCESSED_IDS_FILE}")
-                # Migrate old format IDs to new format
-                original_set = set(data)
-                migrated = migrate_old_id_format(original_set)
-                # Save immediately if migration occurred to prevent re-migration on crash
-                if migrated != original_set:
-                    save_processed_ids(migrated)
-                return migrated, True
+            log(f"Loaded {len(data)} processed IDs from {PROCESSED_IDS_FILE}")
+            # Migrate old format IDs to new format
+            original_set = set(data)
+            migrated = migrate_old_id_format(original_set)
+            # Save immediately if migration occurred to prevent re-migration on crash
+            if migrated != original_set:
+                save_processed_ids(migrated)
+            return migrated, True
         except (json.JSONDecodeError, IOError) as e:
             log(f"ERROR: Failed to load processed IDs (file exists but corrupted): {e}")
             notify_error_to_slack(f"CRITICAL: Failed to load processed IDs - file corrupted: {e}")
@@ -125,11 +121,12 @@ def load_processed_ids() -> Tuple[Set[str], bool]:
             return set(), False
     else:
         log(f"Processed IDs file does not exist: {PROCESSED_IDS_FILE} (first run)")
-    return set(), True
+        return set(), True
 
 
 def save_processed_ids(processed_ids: Set[str]) -> bool:
     """Save processed message IDs to file. Returns True if successful.
+
     Note: uid: entries are session-only cache and are NOT persisted to disk.
     Only gm: and mid: entries (which provide deduplication correctness) are saved.
     This prevents unbounded file growth from uid: cache accumulation.
@@ -155,9 +152,7 @@ def notify_error_to_slack(message: str) -> None:
     if not webhook_url:
         log("ERROR: No Slack webhook URL configured; cannot notify error to Slack")
         return
-
     text = f"🚨 Indeed応募通知エラー発生\n{message}"
-
     try:
         resp = requests.post(
             webhook_url,
@@ -240,16 +235,13 @@ def extract_indeed_url(html: str) -> str:
     if not html:
         return ""
     soup = BeautifulSoup(html, "html.parser")
-
     for a in soup.find_all("a"):
         if "応募内容を確認する" in (a.get_text() or ""):
             return a.get("href") or ""
-
     for a in soup.find_all("a"):
         href = a.get("href") or ""
         if "indeed" in href:
             return href
-
     return ""
 
 
@@ -260,20 +252,15 @@ def notify_slack_with_retry(source: str, name: str, url: str, max_retries: int =
     if not webhook_url:
         log("No Slack Webhook URL")
         return False
-
     title = "【Indeed応募】" if source == "indeed" else "【ジモティー】"
-
     mention_parts = [f"<@{mid}>" for mid in [SLACK_MENTION_ID_1, SLACK_MENTION_ID_2] if mid]
     mention_prefix = " ".join(mention_parts) + "\n" if mention_parts else ""
     if not mention_parts:
         log("WARNING: No Slack mention IDs configured")
-
     lines = [f"{title} 【{name}】 さんから応募がありました。"]
     if url:
         lines.extend(["", "応募内容はこちら:", url])
-
     message = add_test_prefix(mention_prefix + "\n".join(lines))
-
     for attempt in range(max_retries):
         try:
             resp = requests.post(webhook_url, json={"text": message}, timeout=10)
@@ -284,17 +271,10 @@ def notify_slack_with_retry(source: str, name: str, url: str, max_retries: int =
             log(f"ERROR: Slack notify timeout (attempt={attempt + 1}/{max_retries})")
         except Exception as e:
             log(f"ERROR: Slack notify exception: {e} (attempt={attempt + 1}/{max_retries})")
-        
         if attempt < max_retries - 1:
             time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s
-    
     notify_error_to_slack(f"Slack notify failed after {max_retries} attempts for {name}")
     return False
-
-
-def notify_slack(source: str, name: str, url: str) -> None:
-    """Send notification to Slack (wrapper for backward compatibility)."""
-    notify_slack_with_retry(source, name, url)
 
 
 def notify_line_with_retry(source: str, name: str, url: str, max_retries: int = 3) -> bool:
@@ -303,9 +283,7 @@ def notify_line_with_retry(source: str, name: str, url: str, max_retries: int = 
     if not LINE_CHANNEL_ACCESS_TOKEN or not line_to_id:
         log("LINE Token or TO ID missing")
         return False
-
     title = "Indeedに応募がありました。" if source == "indeed" else "ジモティーで新着があります。"
-
     lines = [f"【{name}】 さんから{title}"]
     if url:
         # Force LINE to open URL in external browser (Chrome/Safari)
@@ -313,9 +291,7 @@ def notify_line_with_retry(source: str, name: str, url: str, max_retries: int = 
         separator = "&" if "?" in url else "?"
         external_url = f"{url}{separator}openExternalBrowser=1"
         lines.extend(["", "詳細はこちら:", external_url])
-
     base_message = add_test_prefix("\n".join(lines))
-
     # Use @all mention to notify all members in the group
     substitution = {
         "mention_all": {
@@ -324,17 +300,14 @@ def notify_line_with_retry(source: str, name: str, url: str, max_retries: int = 
         }
     }
     text_v2 = "{mention_all} " + base_message
-
     body = {
         "to": line_to_id,
         "messages": [{"type": "textV2", "text": text_v2, "substitution": substitution}],
     }
-
     headers = {
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
-
     for attempt in range(max_retries):
         try:
             resp = requests.post("https://api.line.me/v2/bot/message/push", json=body, headers=headers, timeout=10)
@@ -346,29 +319,25 @@ def notify_line_with_retry(source: str, name: str, url: str, max_retries: int = 
             log(f"ERROR: LINE notify timeout (attempt={attempt + 1}/{max_retries})")
         except Exception as e:
             log(f"ERROR: LINE notify exception: {e} (attempt={attempt + 1}/{max_retries})")
-        
         if attempt < max_retries - 1:
             time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s
-    
     notify_error_to_slack(f"LINE notify failed after {max_retries} attempts for {name}")
     return False
-
-
-def notify_line(source: str, name: str, url: str) -> None:
-    """Send notification to LINE (wrapper for backward compatibility)."""
-    notify_line_with_retry(source, name, url)
 
 
 # --- IMAP Connection ---
 @contextmanager
 def imap_connection():
-    """Context manager for IMAP connection."""
+    """Context manager for IMAP connection with timeout protection."""
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(30)
     mail = imaplib.IMAP4_SSL(GMAIL_IMAP_HOST)
     try:
         mail.login(GMAIL_IMAP_USER, GMAIL_IMAP_PASSWORD)
         mail.select("INBOX", readonly=True)
         yield mail
     finally:
+        socket.setdefaulttimeout(old_timeout)
         try:
             mail.close()
             mail.logout()
@@ -381,7 +350,6 @@ def parse_fetch_response(data: list) -> Tuple[Optional[str], Optional[bytes]]:
     """Parse IMAP fetch response to extract X-GM-MSGID and body."""
     gm_msgid = None
     body_data = None
-
     for item in data:
         if isinstance(item, tuple):
             header = item[0].decode() if isinstance(item[0], bytes) else item[0]
@@ -390,7 +358,6 @@ def parse_fetch_response(data: list) -> Tuple[Optional[str], Optional[bytes]]:
                 if match:
                     gm_msgid = match.group(1)
             body_data = item[1]
-
     return gm_msgid, body_data
 
 
@@ -407,68 +374,17 @@ def get_unique_id(gm_msgid: Optional[str], msg: email.message.Message) -> Option
     """Get unique identifier for email. Prefers X-GM-MSGID, falls back to Message-ID."""
     if gm_msgid:
         return f"gm:{gm_msgid}"
-    
     message_id = msg.get("Message-ID")
     if message_id:
         return f"mid:{message_id}"
-    
     return None
-
-
-def process_mail(
-    mail: imaplib.IMAP4_SSL, msg_id: bytes, processed_ids: Set[str]
-) -> Optional[str]:
-    """Process a single mail. Returns unique ID if processed, None otherwise."""
-    status, data = mail.fetch(msg_id, "(X-GM-MSGID BODY.PEEK[])")
-    if status != "OK":
-        log(f"ERROR: Failed to fetch msg_id={msg_id}, status={status}")
-        return None
-
-    gm_msgid, body_data = parse_fetch_response(data)
-
-    if not body_data:
-        log(f"ERROR: Failed to fetch body for msg_id={msg_id}")
-        return None
-
-    msg = email.message_from_bytes(body_data)
-    
-    # Get unique identifier (X-GM-MSGID or Message-ID)
-    unique_id = get_unique_id(gm_msgid, msg)
-    
-    if not unique_id:
-        log(f"ERROR: No unique ID found for msg_id={msg_id}, skipping to prevent duplicates")
-        return None
-    
-    if unique_id in processed_ids:
-        return None  # Already processed, skip silently
-    
-    subject = decode_header_value(msg.get("Subject", ""))
-    from_header = decode_header_value(msg.get("From", ""))
-    name = extract_name(from_header)
-
-    source, default_url = determine_source(subject)
-
-    if not source:
-        log(f"Skip non-target mail: {subject[:50]}...")
-        return unique_id  # Mark as processed to avoid re-checking
-
-    url = extract_indeed_url(extract_html(msg)) if source == "indeed" else default_url
-    log(f"Notify {source}: {name}, url={url}, id={unique_id}")
-
-    slack_ok = notify_slack_with_retry(source, name, url)
-    line_ok = notify_line_with_retry(source, name, url)
-    if not slack_ok and not line_ok:
-        log(f"ERROR: All notifications failed for {name} ({unique_id}), will retry next cycle")
-        return None
-
-    return unique_id
 
 
 def get_uid_from_fetch(data: list) -> Optional[str]:
     """Extract UID from IMAP fetch response."""
     for item in data:
         if isinstance(item, tuple):
-            header = item[0].decode() if isinstance(item[0], bytes) else item[0]
+            header = item[0].decode() if isinstance(item[0], bytes) else str(item[0])
             match = re.search(r"UID (\d+)", header)
             if match:
                 return match.group(1)
@@ -476,11 +392,13 @@ def get_uid_from_fetch(data: list) -> Optional[str]:
 
 
 def process_mail_by_uid(
-    mail: imaplib.IMAP4_SSL, uid: bytes, processed_ids: Set[str]
+    mail: imaplib.IMAP4_SSL,
+    uid: bytes,
+    processed_ids: Set[str]
 ) -> Optional[str]:
     """Process a single mail by UID. Returns unique ID if processed, None otherwise."""
     uid_str = uid.decode() if isinstance(uid, bytes) else uid
-    
+
     # Use UID FETCH instead of regular FETCH
     status, data = mail.uid("fetch", uid_str, "(X-GM-MSGID BODY.PEEK[])")
     if status != "OK":
@@ -488,30 +406,27 @@ def process_mail_by_uid(
         return None
 
     gm_msgid, body_data = parse_fetch_response(data)
-
     if not body_data:
         log(f"ERROR: Failed to fetch body for uid={uid_str}")
         return None
 
     msg = email.message_from_bytes(body_data)
-    
+
     # Get unique identifier (X-GM-MSGID or Message-ID)
     unique_id = get_unique_id(gm_msgid, msg)
-    
     if not unique_id:
         log(f"ERROR: No unique ID found for uid={uid_str}, skipping to prevent duplicates")
         return None
-    
+
     # Double-check with X-GM-MSGID/Message-ID (in case UID tracking missed it)
     if unique_id in processed_ids:
         return None  # Already processed, skip silently
-    
+
     subject = decode_header_value(msg.get("Subject", ""))
     from_header = decode_header_value(msg.get("From", ""))
     name = extract_name(from_header)
 
     source, default_url = determine_source(subject)
-
     if not source:
         log(f"Skip non-target mail: {subject[:50]}...")
         return unique_id  # Mark as processed to avoid re-checking
@@ -521,6 +436,7 @@ def process_mail_by_uid(
 
     slack_ok = notify_slack_with_retry(source, name, url)
     line_ok = notify_line_with_retry(source, name, url)
+
     if not slack_ok and not line_ok:
         log(f"ERROR: All notifications failed for {name} ({unique_id}), will retry next cycle")
         return None
@@ -533,7 +449,6 @@ def get_gm_msgid_lightweight(mail: imaplib.IMAP4_SSL, uid: str) -> Optional[str]
     status, data = mail.uid("fetch", uid, "(X-GM-MSGID)")
     if status != "OK":
         return None
-    
     for item in data:
         if isinstance(item, tuple):
             header = item[0].decode() if isinstance(item[0], bytes) else str(item[0])
@@ -547,17 +462,17 @@ def check_mail_with_status() -> bool:
     """Check mailbox for new applications. Returns True if successful, False if quota/error."""
     try:
         processed_ids, load_success = load_processed_ids()
-        
+
         # If file exists but is corrupted, skip processing to prevent mass re-notifications
         if not load_success:
             log("ERROR: Skipping mail check due to corrupted processed IDs file")
             return True  # Not a quota error, don't backoff
-        
+
         with imap_connection() as mail:
             since_date = (datetime.now() - timedelta(days=SEARCH_DAYS)).strftime("%d-%b-%Y")
+
             # Use UID SEARCH for stable identifiers
             status, data = mail.uid("search", None, "SINCE", since_date)
-
             uid_list = data[0].split()
             log(f"Emails in last {SEARCH_DAYS} days: {len(uid_list)}")
 
@@ -567,28 +482,27 @@ def check_mail_with_status() -> bool:
                 uid_str = uid.decode() if isinstance(uid, bytes) else uid
                 if f"uid:{uid_str}" not in processed_ids:
                     uids_to_check.append(uid)
-            
+
             if not uids_to_check:
                 return True  # All emails already processed
-            
+
             log(f"UIDs not in cache: {len(uids_to_check)}")
-            
+
             # Phase 2: Lightweight check - fetch only X-GM-MSGID to filter by gm: prefix
             # This avoids full FETCH for emails that are already processed but missing uid: entry
             truly_new_uids = []
             uids_to_mark = []  # UIDs that are already processed but need uid: entry added
-            
+
             for uid in uids_to_check:
                 uid_str = uid.decode() if isinstance(uid, bytes) else uid
                 gm_id = get_gm_msgid_lightweight(mail, uid_str)
-                
                 if gm_id and gm_id in processed_ids:
                     # Already processed (has gm: entry), just need to add uid: entry
                     uids_to_mark.append((uid_str, gm_id))
                 else:
                     # Truly new email, needs full processing
                     truly_new_uids.append(uid)
-            
+
             # Add uid: entries for already-processed emails (bootstrap)
             if uids_to_mark:
                 log(f"Bootstrapping {len(uids_to_mark)} UIDs for already-processed emails")
@@ -597,24 +511,24 @@ def check_mail_with_status() -> bool:
                 if not save_processed_ids(processed_ids):
                     log("ERROR: Failed to save bootstrapped UIDs")
                     return True  # Not a quota error
-            
+
             if truly_new_uids:
                 log(f"Truly new emails to process: {len(truly_new_uids)}")
-            
-            # Phase 3: Full processing for truly new emails only
-            for uid in truly_new_uids:
-                uid_str = uid.decode() if isinstance(uid, bytes) else uid
-                unique_id = process_mail_by_uid(mail, uid, processed_ids)
-                if unique_id:
-                    # Store both the unique_id (gm: or mid:) and the uid for efficient filtering
-                    processed_ids.add(unique_id)
-                    processed_ids.add(f"uid:{uid_str}")
-                    # Save immediately after each email to prevent duplicates on crash
-                    if not save_processed_ids(processed_ids):
-                        # If save fails, stop processing to prevent more potential duplicates
-                        log("ERROR: Stopping mail processing due to save failure")
-                        return True  # Not a quota error
-        
+
+                # Phase 3: Full processing for truly new emails only
+                for uid in truly_new_uids:
+                    uid_str = uid.decode() if isinstance(uid, bytes) else uid
+                    unique_id = process_mail_by_uid(mail, uid, processed_ids)
+                    if unique_id:
+                        # Store both the unique_id (gm: or mid:) and the uid for efficient filtering
+                        processed_ids.add(unique_id)
+                        processed_ids.add(f"uid:{uid_str}")
+                        # Save immediately after each email to prevent duplicates on crash
+                        if not save_processed_ids(processed_ids):
+                            # If save fails, stop processing to prevent more potential duplicates
+                            log("ERROR: Stopping mail processing due to save failure")
+                            return True  # Not a quota error
+
         return True  # Success
 
     except imaplib.IMAP4.abort as e:
@@ -637,11 +551,10 @@ def verify_storage() -> bool:
     """Verify that storage is working correctly at startup."""
     log(f"=== Storage Verification ===")
     log(f"PROCESSED_IDS_FILE={PROCESSED_IDS_FILE}")
-    
     parent_dir = Path(PROCESSED_IDS_FILE).parent
     log(f"Parent directory: {parent_dir}")
     log(f"Parent directory exists: {parent_dir.exists()}")
-    
+
     if parent_dir.exists():
         try:
             # Try to list directory contents
@@ -649,12 +562,12 @@ def verify_storage() -> bool:
             log(f"Directory contents: {[str(f) for f in contents]}")
         except OSError as e:
             log(f"ERROR: Cannot list directory: {e}")
-    
+
     # Ensure directory exists
     if not ensure_processed_ids_dir():
         log("ERROR: Failed to ensure storage directory exists")
         return False
-    
+
     # Test write
     test_file = parent_dir / ".write_test"
     try:
@@ -665,15 +578,15 @@ def verify_storage() -> bool:
         log(f"ERROR: Storage write test FAILED: {e}")
         notify_error_to_slack(f"Storage write test failed: {e}")
         return False
-    
+
     # Load existing processed IDs
     processed_ids, load_success = load_processed_ids()
     if not load_success:
         log("ERROR: Processed IDs file is corrupted")
         return False
+
     log(f"Currently tracking {len(processed_ids)} processed emails")
     log(f"=== Storage Verification Complete ===")
-    
     return True
 
 
@@ -682,16 +595,15 @@ def main() -> None:
     """Main polling loop with exponential backoff for quota errors."""
     log(f"Starting Gmail polling with POLL_INTERVAL_SECONDS={POLL_INTERVAL_SECONDS}")
     log(f"MODE={MODE}, SEARCH_DAYS={SEARCH_DAYS}, MAX_BACKOFF_SECONDS={MAX_BACKOFF_SECONDS}")
-    
+
     # Verify storage is working
     if not verify_storage():
         log("CRITICAL: Storage verification failed. Exiting to prevent duplicate notifications.")
         notify_error_to_slack("CRITICAL: Storage verification failed at startup. Service stopped.")
         return
-    
+
     consecutive_errors = 0
     quota_notified = False
-    
     while True:
         try:
             success = check_mail_with_status()
@@ -704,12 +616,10 @@ def main() -> None:
                 consecutive_errors += 1
                 backoff = min(POLL_INTERVAL_SECONDS * (2 ** consecutive_errors), MAX_BACKOFF_SECONDS)
                 log(f"Backoff: waiting {backoff} seconds (consecutive_errors={consecutive_errors})")
-                
                 # Notify once when quota error starts
                 if not quota_notified:
                     notify_error_to_slack(f"Gmail quota exceeded. Applying backoff ({backoff}s). Will retry automatically.")
                     quota_notified = True
-                
                 time.sleep(backoff)
         except Exception as e:
             log(f"ERROR in main loop: {e}")
