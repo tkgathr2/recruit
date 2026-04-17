@@ -641,3 +641,62 @@ class TestNotifyLineWithRetry:
         
         assert result == True
         assert mock_post.call_count == 2
+
+
+
+def test_process_mail_by_uid_both_notifications_fail(tmp_path):
+        """SlackとLINE両方の通知が失敗した場合、Noneを返して未処理にする"""
+        import email
+        from unittest.mock import MagicMock, patch
+
+    # ダミーのメールデータを作成
+        msg = email.message.Message()
+    msg["Subject"] = "Indeed: 新しい応募者のお知らせ - テスト太郎"
+    msg["From"] = "テスト太郎 <test@example.com>"
+    msg.set_payload("test body")
+    raw_bytes = msg.as_bytes()
+
+    mock_mail = MagicMock()
+    # UID fetchの戻り値を設定
+    mock_mail.uid.return_value = (
+                "OK",
+                [(b"1 (X-GM-MSGID 9999999999999999999 UID 1)", raw_bytes)],
+    )
+
+    processed_ids = set()
+
+    with patch("main.notify_slack_with_retry", return_value=False) as mock_slack, \
+         patch("main.notify_line_with_retry", return_value=False) as mock_line:
+                     result = process_mail_by_uid(mock_mail, b"1", processed_ids)
+
+    # 両方失敗 → None を返す（未処理扱い）
+    assert result is None, "両通知失敗時はNoneを返すべき"
+    mock_slack.assert_called_once()
+    mock_line.assert_called_once()
+
+
+def test_process_mail_by_uid_slack_only_success(tmp_path):
+        """Slackだけ成功した場合、unique_idを返して処理済みにする"""
+        import email
+        from unittest.mock import MagicMock, patch
+
+    msg = email.message.Message()
+    msg["Subject"] = "Indeed: 新しい応募者のお知らせ - テスト花子"
+    msg["From"] = "テスト花子 <hanako@example.com>"
+    msg.set_payload("test body")
+    raw_bytes = msg.as_bytes()
+
+    mock_mail = MagicMock()
+    mock_mail.uid.return_value = (
+                "OK",
+                [(b"2 (X-GM-MSGID 8888888888888888888 UID 2)", raw_bytes)],
+    )
+
+    processed_ids = set()
+
+    with patch("main.notify_slack_with_retry", return_value=True), \
+         patch("main.notify_line_with_retry", return_value=False):
+                     result = process_mail_by_uid(mock_mail, b"2", processed_ids)
+
+    # Slackだけ成功 → unique_idを返す（処理済みにする）
+    assert result is not None, "少なくとも1つ成功時はunique_idを返すべき"
