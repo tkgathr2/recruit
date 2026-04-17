@@ -145,16 +145,16 @@ def save_processed_ids(processed_ids: Set[str]) -> bool:
 
 def notify_error_to_slack(message: str) -> None:
     """重大なエラーを Slack Webhook に通知する"""
-    if not SLACK_ERROR_WEBHOOK_URL:
-        # Webhook が未設定ならログだけ残す
-        log("ERROR: SLACK_ERROR_WEBHOOK_URL is not set; cannot notify error to Slack")
+    webhook_url = SLACK_ERROR_WEBHOOK_URL or SLACK_WEBHOOK_URL_PROD
+    if not webhook_url:
+        log("ERROR: No Slack webhook URL configured; cannot notify error to Slack")
         return
 
     text = f"🚨 Indeed応募通知エラー発生\n{message}"
 
     try:
         resp = requests.post(
-            SLACK_ERROR_WEBHOOK_URL,
+            webhook_url,
             json={"text": text},
             timeout=5,
         )
@@ -449,8 +449,11 @@ def process_mail(
     url = extract_indeed_url(extract_html(msg)) if source == "indeed" else default_url
     log(f"Notify {source}: {name}, url={url}, id={unique_id}")
 
-    notify_slack(source, name, url)
-    notify_line(source, name, url)
+    slack_ok = notify_slack_with_retry(source, name, url)
+    line_ok = notify_line_with_retry(source, name, url)
+    if not slack_ok and not line_ok:
+        log(f"ERROR: All notifications failed for {name} ({unique_id}), will retry next cycle")
+        return None
 
     return unique_id
 
@@ -510,8 +513,11 @@ def process_mail_by_uid(
     url = extract_indeed_url(extract_html(msg)) if source == "indeed" else default_url
     log(f"Notify {source}: {name}, url={url}, id={unique_id}")
 
-    notify_slack(source, name, url)
-    notify_line(source, name, url)
+    slack_ok = notify_slack_with_retry(source, name, url)
+    line_ok = notify_line_with_retry(source, name, url)
+    if not slack_ok and not line_ok:
+        log(f"ERROR: All notifications failed for {name} ({unique_id}), will retry next cycle")
+        return None
 
     return unique_id
 
