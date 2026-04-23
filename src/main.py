@@ -255,6 +255,42 @@ def extract_indeed_url(html: str) -> str:
     return ""
 
 
+def extract_phone_number(html: str) -> Optional[str]:
+    """メール本文HTMLから電話番号を抽出する。"""
+    if not html:
+        return None
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(separator="\n")
+    # 日本の電話番号パターン（携帯・固定・フリーダイヤル）
+    patterns = [
+        r'0[789]0[-\s]?\d{4}[-\s]?\d{4}',   # 携帯: 090/080/070
+        r'0\d{1,4}[-\s]?\d{1,4}[-\s]?\d{4}', # 固定: 03-xxxx-xxxx 等
+        r'0120[-\s]?\d{3}[-\s]?\d{3}',        # フリーダイヤル
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(0).strip()
+    return None
+
+
+def extract_body_text(html: str, max_chars: int = 500) -> str:
+    """メール本文HTMLからプレーンテキストを抽出する（最大max_chars文字）。"""
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+    # script/styleタグを除去
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    text = soup.get_text(separator="\n")
+    # 連続する空行を1行にまとめる
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    result = "\n".join(lines)
+    if len(result) > max_chars:
+        result = result[:max_chars] + "…"
+    return result
+
+
 def extract_applicant_name_from_html(html: str) -> Optional[str]:
     """IndeedメールのHTML本文から応募者名を抽出する。
 
@@ -289,7 +325,7 @@ def extract_applicant_name_from_html(html: str) -> Optional[str]:
 
 
 # --- Notification Functions ---
-def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optional[str] = None, max_retries: int = 3) -> bool:
+def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optional[str] = None, phone: Optional[str] = None, body_text: Optional[str] = None, max_retries: int = 3) -> bool:
     """Send notification to Slack with retry logic. Returns True if successful."""
     webhook_url = get_slack_webhook_url()
     if not webhook_url:
@@ -304,8 +340,12 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
     lines = [f"{title} 【{name}】 さんから応募がありました。"]
     if job_title:
         lines.append(f"求人: {job_title}")
+    if phone:
+        lines.append(f"📞 電話番号: {phone}")
     if url:
         lines.extend(["", "応募内容はこちら:", url])
+    if body_text:
+        lines.extend(["", "--- メール本文 ---", body_text])
     message = add_test_prefix(mention_prefix + "\n".join(lines))
     for attempt in range(max_retries):
         try:
@@ -323,7 +363,7 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
     return False
 
 
-def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional[str] = None, max_retries: int = 3) -> bool:
+def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional[str] = None, phone: Optional[str] = None, body_text: Optional[str] = None, max_retries: int = 3) -> bool:
     """Send notification to LINE with retry logic. Returns True if successful."""
     line_to_id = get_line_to_id()
     if not LINE_CHANNEL_ACCESS_TOKEN or not line_to_id:
@@ -333,12 +373,16 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
     lines = [f"【{name}】 さんから{title}"]
     if job_title:
         lines.append(f"求人: {job_title}")
+    if phone:
+        lines.append(f"📞 電話番号: {phone}")
     if url:
         # Force LINE to open URL in external browser (Chrome/Safari)
         # to avoid Google OAuth blocking in LINE's in-app browser
         separator = "&" if "?" in url else "?"
         external_url = f"{url}{separator}openExternalBrowser=1"
         lines.extend(["", "詳細はこちら:", external_url])
+    if body_text:
+        lines.extend(["", "--- メール本文 ---", body_text])
     base_message = add_test_prefix("\n".join(lines))
     # Use @all mention to notify all members in the group
     substitution = {
@@ -481,10 +525,14 @@ def process_mail_by_uid(
     else:
         applicant_name = extract_name(from_header)
 
-    log(f"Notify {source}: {applicant_name}, url={url}, id={unique_id}")
+    # 電話番号・本文テキストを抽出
+    phone = extract_phone_number(html)
+    body_text = extract_body_text(html)
 
-    slack_ok = notify_slack_with_retry(source, applicant_name, url)
-    line_ok = notify_line_with_retry(source, applicant_name, url)
+    log(f"Notify {source}: {applicant_name}, phone={phone}, url={url}, id={unique_id}")
+
+    slack_ok = notify_slack_with_retry(source, applicant_name, url, phone=phone, body_text=body_text)
+    line_ok = notify_line_with_retry(source, applicant_name, url, phone=phone, body_text=body_text)
 
     if not slack_ok and not line_ok:
         log(f"ERROR: All notifications failed for {applicant_name} ({unique_id}), will retry next cycle")
