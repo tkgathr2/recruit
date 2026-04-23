@@ -14,7 +14,7 @@ from datetime import datetime
 # Environment variables
 INDEED_API_KEY = os.getenv("INDEED_API_KEY", "0f2b0de1b8ff96890172eeeba0816aaab662605e3efebbc0450745798c4b35ae")
 INDEED_CTK = os.getenv("INDEED_CTK")
-INDEED_GRAPHQL_ENDPOINT = "https://apis.indeed.com/graphql"
+INDEED_GRAPHQL_ENDPOINT = "https://apis.indeed.com/graphql?co=JP&locale=ja"
 
 
 def fetch_all_details(legacy_id: str, timeout: int = 10) -> Dict[str, Any]:
@@ -41,9 +41,9 @@ def fetch_all_details(legacy_id: str, timeout: int = 10) -> Dict[str, Any]:
     if not legacy_id or not INDEED_CTK:
         return {}
 
-    # GraphQL query with profile details and questionnaire answers
+    # GraphQL query - profile details only (answers field not available in this API version)
     query = """
-    query CRP_CandidateSubmissions($input: CandidateSubmissionsInput!, $inNexusPremiumPlus: Boolean!) {
+    query CRP_CandidateSubmissions($input: CandidateSubmissionsInput!) {
       candidateSubmissions(input: $input) {
         results {
           id
@@ -54,16 +54,6 @@ def fetch_all_details(legacy_id: str, timeout: int = 10) -> Dict[str, Any]:
                 contact { phoneNumber email aliasedEmail }
                 location { location }
               }
-              answers {
-                ... on TextAnswer {
-                  questionKey
-                  value
-                }
-                ... on MultipleChoiceAnswer {
-                  questionKey
-                  values
-                }
-              }
             }
           }
         }
@@ -72,8 +62,7 @@ def fetch_all_details(legacy_id: str, timeout: int = 10) -> Dict[str, Any]:
     """
 
     variables = {
-        "input": {"legacyIds": [legacy_id]},
-        "inNexusPremiumPlus": True
+        "input": {"legacyIds": [legacy_id]}
     }
 
     headers = {
@@ -122,22 +111,12 @@ def fetch_all_details(legacy_id: str, timeout: int = 10) -> Dict[str, Any]:
         email = contact.get("email") or contact.get("aliasedEmail")
         location = profile.get("location", {}).get("location")
 
-        # Extract questionnaire answers
-        answers = submission_data.get("answers", [])
-        parsed_answers = []
-        for answer in answers:
-            answer_dict = {
-                "questionKey": answer.get("questionKey"),
-                "value": answer.get("value") or answer.get("values")
-            }
-            parsed_answers.append(answer_dict)
-
         return {
             "name": name,
             "phone": phone,
             "email": email,
             "location": location,
-            "answers": parsed_answers,
+            "answers": [],
             "raw_data": data
         }
 
