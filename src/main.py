@@ -281,6 +281,19 @@ def extract_indeed_legacy_id(html: str) -> Optional[str]:
     return None
 
 
+def extract_indeed_engage_urls(html: str) -> list:
+    """Indeed通知メールのHTMLからengage.indeed.comトラッキングURLを全て抽出する。
+
+    新形式(base64url)・旧形式(hex)問わず engage.indeed.com/f/a/ URLを返す。
+    これらURLはリダイレクトをたどると employers.indeed.com/candidates/view?id=<hex> に到達する。
+    """
+    if not html:
+        return []
+    # engage.indeed.com/f/a/<任意の文字列>~~ パターン
+    matches = re.findall(r'(https://engage\.indeed\.com/f/a/[A-Za-z0-9_\-]{10,}~~[^\s"\'<>]*)', html)
+    return list(dict.fromkeys(matches))  # 重複除去（順序保持）
+
+
 def extract_phone_number(html: str) -> Optional[str]:
     """メール本文HTMLから電話番号を抽出する。"""
     if not html:
@@ -632,15 +645,26 @@ def process_mail_by_uid(
         if legacy_id:
             log(f"Indeed legacyId found in HTML: {legacy_id}")
         else:
-            log("Indeed legacyId not found in HTML, trying tracking URL redirect...")
-            if url:
-                legacy_id = resolve_legacy_id_from_tracking_url(url)
+            # HTMLから直接hex IDが取れなかった場合:
+            # engage.indeed.com トラッキングURLをたどってhex IDを取得する
+            log("Indeed legacyId not found in HTML, trying engage tracking URL redirect...")
+            engage_urls = extract_indeed_engage_urls(html)
+            log(f"Indeed engage URLs found: {len(engage_urls)}")
+            for engage_url in engage_urls:
+                legacy_id = resolve_legacy_id_from_tracking_url(engage_url)
                 if legacy_id:
-                    log(f"Indeed legacyId resolved via tracking URL redirect: {legacy_id}")
+                    log(f"Indeed legacyId resolved via engage URL redirect: {legacy_id} (from {engage_url[:60]}...)")
+                    break
+            if not legacy_id:
+                # フォールバック: extract_indeed_url で取得した汎用URLも試みる
+                if url and "engage.indeed.com" in url:
+                    legacy_id = resolve_legacy_id_from_tracking_url(url)
+                    if legacy_id:
+                        log(f"Indeed legacyId resolved via fallback URL redirect: {legacy_id}")
+                    else:
+                        log("Indeed legacyId not found via any tracking URL, API fetch skipped")
                 else:
-                    log("Indeed legacyId not found via tracking URL either, using HTML extraction only")
-            else:
-                log("No URL available, using HTML extraction only")
+                    log(f"Indeed legacyId not found (no valid engage URL), API fetch skipped")
         if legacy_id:
             details = fetch_all_details(legacy_id)
             if details:
