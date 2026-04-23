@@ -255,6 +255,31 @@ def extract_indeed_url(html: str) -> str:
     return ""
 
 
+def extract_indeed_legacy_id(html: str) -> Optional[str]:
+    """Indeed通知メールのHTMLからlegacyId（12桁hex）を抽出する。
+
+    Indeed通知メールには以下のURLパターンが含まれる:
+    - https://employers.indeed.com/candidates/view?id=<legacyId>
+    - https://engage.indeed.com/f/a/<legacyId>~~/...
+    legacyId は 12桁の16進数文字列。
+    """
+    if not html:
+        return None
+    # パターン1: 直接URLに含まれる場合
+    direct = re.search(r'employers\.indeed\.com/candidates(?:/view)?\?(?:[^"\'<>\s]*&)?id=([a-f0-9]{10,16})', html)
+    if direct:
+        return direct.group(1)
+    # パターン2: engage.indeed.com/f/a/<legacyId>~~ 形式
+    engage = re.search(r'engage\.indeed\.com/f/a/([a-f0-9]{10,16})(?:~~|/)', html)
+    if engage:
+        return engage.group(1)
+    # パターン3: 任意のURLの id= パラメータ（indeed ドメイン内）
+    any_id = re.search(r'indeed\.com[^"\'<>\s]*[?&]id=([a-f0-9]{10,16})', html)
+    if any_id:
+        return any_id.group(1)
+    return None
+
+
 def extract_phone_number(html: str) -> Optional[str]:
     """メール本文HTMLから電話番号を抽出する。"""
     if not html:
@@ -325,7 +350,7 @@ def extract_applicant_name_from_html(html: str) -> Optional[str]:
 
 
 # --- Notification Functions ---
-def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optional[str] = None, phone: Optional[str] = None, body_text: Optional[str] = None, max_retries: int = 3) -> bool:
+def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optional[str] = None, phone: Optional[str] = None, body_text: Optional[str] = None, max_retries: int = 3, location: Optional[str] = None, email: Optional[str] = None, answers: Optional[list] = None) -> bool:
     """Send notification to Slack with retry logic. Returns True if successful."""
     webhook_url = get_slack_webhook_url()
     if not webhook_url:
@@ -342,6 +367,16 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
         lines.append(f"求人: {job_title}")
     if phone:
         lines.append(f"📞 電話番号: {phone}")
+    if location:
+        lines.append(f"📍 住所: {location}")
+    if email:
+        lines.append(f"📧 メール: {email}")
+    if answers:
+        for ans in answers:
+            key = ans.get("questionKey", "")
+            val = ans.get("value")
+            if val and key:
+                lines.append(f"📝 {key}: {val}")
     if url:
         lines.extend(["", "応募内容はこちら:", url])
     if body_text:
@@ -363,7 +398,7 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
     return False
 
 
-def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional[str] = None, phone: Optional[str] = None, body_text: Optional[str] = None, max_retries: int = 3) -> bool:
+def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional[str] = None, phone: Optional[str] = None, body_text: Optional[str] = None, max_retries: int = 3, location: Optional[str] = None, email: Optional[str] = None, answers: Optional[list] = None) -> bool:
     """Send notification to LINE with retry logic. Returns True if successful."""
     line_to_id = get_line_to_id()
     if not LINE_CHANNEL_ACCESS_TOKEN or not line_to_id:
@@ -375,6 +410,16 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
         lines.append(f"求人: {job_title}")
     if phone:
         lines.append(f"📞 電話番号: {phone}")
+    if location:
+        lines.append(f"📍 住所: {location}")
+    if email:
+        lines.append(f"📧 メール: {email}")
+    if answers:
+        for ans in answers:
+            key = ans.get("questionKey", "")
+            val = ans.get("value")
+            if val and key:
+                lines.append(f"📝 {key}: {val}")
     if url:
         # Force LINE to open URL in external browser (Chrome/Safari)
         # to avoid Google OAuth blocking in LINE's in-app browser
@@ -529,10 +574,31 @@ def process_mail_by_uid(
     phone = extract_phone_number(html)
     body_text = extract_body_text(html)
 
+    # Indeed応募の場合: URLからlegacyIdを抽出してAPIで全詳細を取得
+    indeed_location: Optional[str] = None
+    indeed_email: Optional[str] = None
+    indeed_answers: Optional[list] = None
+    if source == "indeed":
+        from indeed_fetcher import fetch_all_details
+        legacy_id = extract_indeed_legacy_id(html)
+        if legacy_id:
+            log(f"Indeed legacyId found: {legacy_id}, fetching full details via API")
+            details = fetch_all_details(legacy_id)
+            if details:
+                phone = details.get("phone") or phone  # APIの方が正確
+                indeed_location = details.get("location")
+                indeed_email = details.get("email")
+                indeed_answers = details.get("answers") or []
+                log(f"Indeed API details: phone={phone}, location={indeed_location}, answers={len(indeed_answers or [])}件")
+            else:
+                log(f"Indeed API returned no details for legacyId={legacy_id}")
+        else:
+            log("Indeed legacyId not found in email HTML, using HTML extraction only")
+
     log(f"Notify {source}: {applicant_name}, phone={phone}, url={url}, id={unique_id}")
 
-    slack_ok = notify_slack_with_retry(source, applicant_name, url, phone=phone, body_text=body_text)
-    line_ok = notify_line_with_retry(source, applicant_name, url, phone=phone, body_text=body_text)
+    slack_ok = notify_slack_with_retry(source, applicant_name, url, phone=phone, body_text=body_text, location=indeed_location, email=indeed_email, answers=indeed_answers)
+    line_ok = notify_line_with_retry(source, applicant_name, url, phone=phone, body_text=body_text, location=indeed_location, email=indeed_email, answers=indeed_answers)
 
     if not slack_ok and not line_ok:
         log(f"ERROR: All notifications failed for {applicant_name} ({unique_id}), will retry next cycle")
@@ -547,11 +613,16 @@ def get_gm_msgid_lightweight(mail: imaplib.IMAP4_SSL, uid: str) -> Optional[str]
     if status != "OK":
         return None
     for item in data:
+        # IMAP metadata-only fetch returns bytes, not tuples (unlike BODY fetch)
         if isinstance(item, tuple):
-            header = item[0].decode() if isinstance(item[0], bytes) else str(item[0])
-            match = re.search(r"X-GM-MSGID (\d+)", header)
-            if match:
-                return f"gm:{match.group(1)}"
+            text = item[0].decode() if isinstance(item[0], bytes) else str(item[0])
+        elif isinstance(item, bytes):
+            text = item.decode()
+        else:
+            continue
+        match = re.search(r"X-GM-MSGID (\d+)", text)
+        if match:
+            return f"gm:{match.group(1)}"
     return None
 
 
