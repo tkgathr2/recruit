@@ -316,6 +316,53 @@ def extract_body_text(html: str, max_chars: int = 500) -> str:
     return result
 
 
+def format_phone_for_slack(phone: str) -> str:
+    """Format phone number as a Slack tel: link.
+
+    Converts '+81 80 2478 7813' → '<tel:+818024787813|080-2478-7813>'
+    so it becomes a tappable link in Slack mobile.
+    """
+    if not phone:
+        return phone
+    # Remove spaces to build the tel URI
+    tel_uri = phone.replace(" ", "")
+    # Build Japanese local display format: +81 80 XXXX XXXX → 080-XXXX-XXXX
+    digits = tel_uri.lstrip("+")
+    if digits.startswith("81") and len(digits) >= 11:
+        local = "0" + digits[2:]  # 81 → 0
+        # Format: 090/080/060 (3 digits) - 4 digits - 4 digits
+        if len(local) == 11:
+            display = f"{local[:3]}-{local[3:7]}-{local[7:]}"
+        elif len(local) == 10:
+            display = f"{local[:2]}-{local[2:6]}-{local[6:]}"
+        else:
+            display = local
+    else:
+        display = phone
+    return f"<tel:{tel_uri}|{display}>"
+
+
+def format_phone_for_line(phone: str) -> str:
+    """Format phone number for LINE tap-to-call.
+
+    Converts '+81 80 2478 7813' → '080-2478-7813'
+    LINE automatically turns hyphen-formatted Japanese numbers into tappable links.
+    """
+    if not phone:
+        return phone
+    tel_uri = phone.replace(" ", "")
+    digits = tel_uri.lstrip("+")
+    if digits.startswith("81") and len(digits) >= 11:
+        local = "0" + digits[2:]
+        if len(local) == 11:
+            return f"{local[:3]}-{local[3:7]}-{local[7:]}"
+        elif len(local) == 10:
+            return f"{local[:2]}-{local[2:6]}-{local[6:]}"
+        else:
+            return local
+    return phone
+
+
 def extract_applicant_name_from_html(html: str) -> Optional[str]:
     """IndeedメールのHTML本文から応募者名を抽出する。
 
@@ -366,17 +413,17 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
     if job_title:
         lines.append(f"求人: {job_title}")
     if phone:
-        lines.append(f"📞 電話番号: {phone}")
+        lines.append(f"電話番号: {format_phone_for_slack(phone)}")
     if location:
-        lines.append(f"📍 住所: {location}")
+        lines.append(f"住所: {location}")
     if email:
-        lines.append(f"📧 メール: {email}")
+        lines.append(f"メール: {email}")
     if answers:
         for ans in answers:
             key = ans.get("questionKey", "")
             val = ans.get("value")
             if val and key:
-                lines.append(f"📝 {key}: {val}")
+                lines.append(f"{key}: {val}")
     if url:
         lines.extend(["", "応募内容はこちら:", url])
     if body_text:
@@ -409,7 +456,7 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
     if job_title:
         lines.append(f"求人: {job_title}")
     if phone:
-        lines.append(f"📞 電話番号: {phone}")
+        lines.append(f"📞 電話番号: {format_phone_for_line(phone)}")
     if location:
         lines.append(f"📍 住所: {location}")
     if email:
