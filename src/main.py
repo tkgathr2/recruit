@@ -256,25 +256,26 @@ def extract_indeed_url(html: str) -> str:
 
 
 def extract_indeed_legacy_id(html: str) -> Optional[str]:
-    """Indeed通知メールのHTMLからlegacyId（12桁hex）を抽出する。
+    """Indeed通知メールのHTMLからlegacyId（hex）を抽出する。
 
     Indeed通知メールには以下のURLパターンが含まれる:
     - https://employers.indeed.com/candidates/view?id=<legacyId>
-    - https://engage.indeed.com/f/a/<legacyId>~~/...
-    legacyId は 12桁の16進数文字列。
+    - https://engage.indeed.com/f/a/<legacyId>~~/...  (旧形式: hex)
+    - https://engage.indeed.com/f/a/<base64url>~~...  (新形式: base64url 22文字)
+    legacyId は hex文字列（8〜20桁）。
     """
     if not html:
         return None
-    # パターン1: 直接URLに含まれる場合
-    direct = re.search(r'employers\.indeed\.com/candidates(?:/view)?\?(?:[^"\'<>\s]*&)?id=([a-f0-9]{10,16})', html)
+    # パターン1: employers.indeed.com に直接 id= パラメータが含まれる場合
+    direct = re.search(r'employers\.indeed\.com/candidates(?:/view)?\?(?:[^"\'<>\s]*&)?id=([a-f0-9]{8,20})', html)
     if direct:
         return direct.group(1)
-    # パターン2: engage.indeed.com/f/a/<legacyId>~~ 形式
-    engage = re.search(r'engage\.indeed\.com/f/a/([a-f0-9]{10,16})(?:~~|/)', html)
-    if engage:
-        return engage.group(1)
+    # パターン2: engage.indeed.com/f/a/<hex>~~ 形式（旧形式）
+    engage_hex = re.search(r'engage\.indeed\.com/f/a/([a-f0-9]{10,16})(?:~~|/)', html)
+    if engage_hex:
+        return engage_hex.group(1)
     # パターン3: 任意のURLの id= パラメータ（indeed ドメイン内）
-    any_id = re.search(r'indeed\.com[^"\'<>\s]*[?&]id=([a-f0-9]{10,16})', html)
+    any_id = re.search(r'indeed\.com[^"\'<>\s]*[?&]id=([a-f0-9]{8,20})', html)
     if any_id:
         return any_id.group(1)
     return None
@@ -626,10 +627,21 @@ def process_mail_by_uid(
     indeed_email: Optional[str] = None
     indeed_answers: Optional[list] = None
     if source == "indeed":
-        from indeed_fetcher import fetch_all_details
+        from indeed_fetcher import fetch_all_details, resolve_legacy_id_from_tracking_url
         legacy_id = extract_indeed_legacy_id(html)
         if legacy_id:
-            log(f"Indeed legacyId found: {legacy_id}, fetching full details via API")
+            log(f"Indeed legacyId found in HTML: {legacy_id}")
+        else:
+            log("Indeed legacyId not found in HTML, trying tracking URL redirect...")
+            if url:
+                legacy_id = resolve_legacy_id_from_tracking_url(url)
+                if legacy_id:
+                    log(f"Indeed legacyId resolved via tracking URL redirect: {legacy_id}")
+                else:
+                    log("Indeed legacyId not found via tracking URL either, using HTML extraction only")
+            else:
+                log("No URL available, using HTML extraction only")
+        if legacy_id:
             details = fetch_all_details(legacy_id)
             if details:
                 phone = details.get("phone") or phone  # APIの方が正確
@@ -638,9 +650,7 @@ def process_mail_by_uid(
                 indeed_answers = details.get("answers") or []
                 log(f"Indeed API details: phone={phone}, location={indeed_location}, answers={len(indeed_answers or [])}件")
             else:
-                log(f"Indeed API returned no details for legacyId={legacy_id}")
-        else:
-            log("Indeed legacyId not found in email HTML, using HTML extraction only")
+                log(f"Indeed API returned no details for legacyId={legacy_id} (CTK expired? API error?)")
 
     log(f"Notify {source}: {applicant_name}, phone={phone}, url={url}, id={unique_id}")
 

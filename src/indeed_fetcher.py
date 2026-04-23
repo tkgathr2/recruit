@@ -5,6 +5,7 @@ GraphQL API, including personal details and questionnaire responses.
 """
 
 import os
+import re
 import requests
 from typing import Optional, Dict, Any
 from datetime import datetime
@@ -164,6 +165,52 @@ def fetch_phone_for_applicant(name: str) -> Optional[str]:
     """
     # This is a legacy function that would require different API capabilities
     # In practice, fetch_all_details() with legacy_id is the recommended approach
+    return None
+
+
+def resolve_legacy_id_from_tracking_url(url: str, timeout: int = 10) -> Optional[str]:
+    """Follow Indeed email tracking URL redirect to extract legacyId.
+
+    Indeed email tracking URLs (engage.indeed.com/f/a/...) redirect to
+    employers.indeed.com/candidates/view?id=<legacyId>.
+    Follow the redirect chain (up to 5 hops) to find the legacyId.
+
+    Args:
+        url: The engage.indeed.com tracking URL from the email
+        timeout: Request timeout in seconds
+
+    Returns:
+        legacyId string if found, None otherwise
+    """
+    if not url or "indeed" not in url:
+        return None
+    try:
+        current_url = url
+        for _ in range(5):
+            resp = requests.get(
+                current_url,
+                allow_redirects=False,
+                timeout=timeout,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    )
+                },
+            )
+            location = resp.headers.get("Location", "")
+            # Check both current URL and redirect target for legacyId
+            for check_url in [current_url, location]:
+                if check_url:
+                    match = re.search(r"[?&]id=([a-f0-9]{8,20})", check_url)
+                    if match:
+                        return match.group(1)
+            if not location or resp.status_code not in (301, 302, 303, 307, 308):
+                break
+            current_url = location
+    except Exception:
+        pass
     return None
 
 
