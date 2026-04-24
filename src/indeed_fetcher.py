@@ -175,14 +175,16 @@ def _extract_id_from_text(text: str) -> Optional[str]:
     return None
 
 
-def resolve_legacy_id_from_tracking_url(url: str, timeout: int = 10) -> Optional[str]:
+def resolve_legacy_id_from_tracking_url(url: str, timeout: int = 15) -> Optional[str]:
     """Follow Indeed email tracking URL redirect to extract legacyId.
 
     Indeed email tracking URLs (engage.indeed.com/f/a/...) redirect to
     employers.indeed.com/candidates/view?id=<legacyId>.
-    Follow the redirect chain (up to 5 hops) to find the legacyId.
-    If a non-redirect 200 response is received, parses the body for the legacyId
-    (handles JavaScript and meta-refresh redirects as well).
+
+    Strategy:
+    1. First try allow_redirects=True to get the final URL in one shot.
+    2. Fall back to manual hop-by-hop following if step 1 gives no ID.
+    3. If a non-redirect 200 is received, parse the body (JS/meta redirect).
 
     Args:
         url: The engage.indeed.com tracking URL from the email
@@ -193,6 +195,39 @@ def resolve_legacy_id_from_tracking_url(url: str, timeout: int = 10) -> Optional
     """
     if not url or "indeed" not in url:
         return None
+
+    common_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Cookie": f"CTK={INDEED_CTK}" if INDEED_CTK else "",
+    }
+
+    # --- Strategy 1: allow_redirects=True (simplest, follows all redirects automatically) ---
+    try:
+        print(f"[indeed_fetcher] strategy1: allow_redirects=True url={url[:80]}", flush=True)
+        resp = requests.get(url, allow_redirects=True, timeout=timeout, headers=common_headers)
+        final_url = resp.url
+        print(f"[indeed_fetcher] strategy1: final_url={final_url[:120]} status={resp.status_code}", flush=True)
+        # Check final URL
+        found = _extract_id_from_text(final_url)
+        if found:
+            print(f"[indeed_fetcher] strategy1: legacyId={found}", flush=True)
+            return found
+        # Check response body
+        body = resp.text or ""
+        found = _extract_id_from_text(body)
+        if found:
+            print(f"[indeed_fetcher] strategy1: legacyId found in body: {found}", flush=True)
+            return found
+        snippet = body[:300].replace('\n', ' ')
+        print(f"[indeed_fetcher] strategy1: no ID found. body snippet: {snippet}", flush=True)
+    except Exception as e:
+        print(f"[indeed_fetcher] strategy1 exception: {type(e).__name__}: {e}", flush=True)
+
+    # --- Strategy 2: manual hop-by-hop (allow_redirects=False) ---
     try:
         current_url = url
         for hop in range(5):
@@ -200,47 +235,38 @@ def resolve_legacy_id_from_tracking_url(url: str, timeout: int = 10) -> Optional
                 current_url,
                 allow_redirects=False,
                 timeout=timeout,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"
-                    ),
-                    "Cookie": f"CTK={INDEED_CTK}" if INDEED_CTK else "",
-                },
+                headers=common_headers,
             )
             location = resp.headers.get("Location", "")
-            print(f"[indeed_fetcher] hop={hop} status={resp.status_code} location={location[:120] if location else 'none'}", flush=True)
+            print(f"[indeed_fetcher] strategy2 hop={hop} status={resp.status_code} location={location[:120] if location else 'none'}", flush=True)
 
             # Check current URL and Location header for legacyId
             for check_url in [current_url, location]:
                 if check_url:
                     found = _extract_id_from_text(check_url)
                     if found:
-                        print(f"[indeed_fetcher] legacyId found in URL: {found}", flush=True)
+                        print(f"[indeed_fetcher] strategy2: legacyId={found} from url", flush=True)
                         return found
 
-            # If we got a redirect, follow it
+            # Follow redirect if present
             if location and resp.status_code in (301, 302, 303, 307, 308):
                 current_url = location
                 continue
 
-            # No redirect: parse response body for legacyId (JS/meta redirect or embedded)
+            # No redirect: parse body
             body = resp.text or ""
-            print(f"[indeed_fetcher] non-redirect response, body length={len(body)}, checking body...", flush=True)
-            # Log a snippet of the body for diagnosis
-            snippet = body[:500].replace('\n', ' ')
-            print(f"[indeed_fetcher] body snippet: {snippet}", flush=True)
+            snippet = body[:300].replace('\n', ' ')
+            print(f"[indeed_fetcher] strategy2: body snippet: {snippet}", flush=True)
             found = _extract_id_from_text(body)
             if found:
-                print(f"[indeed_fetcher] legacyId found in body: {found}", flush=True)
+                print(f"[indeed_fetcher] strategy2: legacyId={found} from body", flush=True)
                 return found
-            # No legacyId found, stop
-            print(f"[indeed_fetcher] legacyId not found in body, giving up", flush=True)
             break
 
     except Exception as e:
-        print(f"[indeed_fetcher] resolve_legacy_id exception: {type(e).__name__}: {e}", flush=True)
+        print(f"[indeed_fetcher] strategy2 exception: {type(e).__name__}: {e}", flush=True)
+
+    print(f"[indeed_fetcher] all strategies failed, no legacyId found", flush=True)
     return None
 
 
