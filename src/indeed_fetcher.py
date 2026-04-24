@@ -147,12 +147,42 @@ def fetch_phone_for_applicant(name: str) -> Optional[str]:
     return None
 
 
+def _extract_id_from_text(text: str) -> Optional[str]:
+    """Helper: extract Indeed legacyId (hex) from a URL or HTML snippet.
+
+    Looks for:
+      - ?id=<hex> or &id=<hex> (URL query param)
+      - /candidates/view?id=<hex>
+      - JavaScript window.location redirect
+    Hex length: 8–40 characters.
+    """
+    # URL query param: ?id= or &id=
+    m = re.search(r"[?&]id=([a-f0-9]{8,40})", text)
+    if m:
+        return m.group(1)
+    # JavaScript redirect: window.location.href = "...?id=<hex>"
+    m = re.search(r'window\.location(?:\.href)?\s*=\s*["\']([^"\']+)["\']', text)
+    if m:
+        inner = re.search(r"[?&]id=([a-f0-9]{8,40})", m.group(1))
+        if inner:
+            return inner.group(1)
+    # Meta refresh: <meta http-equiv="refresh" content="0; url=...?id=<hex>">
+    m = re.search(r'content=["\'][^"\']*url=([^"\']+)["\']', text, re.IGNORECASE)
+    if m:
+        inner = re.search(r"[?&]id=([a-f0-9]{8,40})", m.group(1))
+        if inner:
+            return inner.group(1)
+    return None
+
+
 def resolve_legacy_id_from_tracking_url(url: str, timeout: int = 10) -> Optional[str]:
     """Follow Indeed email tracking URL redirect to extract legacyId.
 
     Indeed email tracking URLs (engage.indeed.com/f/a/...) redirect to
     employers.indeed.com/candidates/view?id=<legacyId>.
     Follow the redirect chain (up to 5 hops) to find the legacyId.
+    If a non-redirect 200 response is received, parses the body for the legacyId
+    (handles JavaScript and meta-refresh redirects as well).
 
     Args:
         url: The engage.indeed.com tracking URL from the email
@@ -163,8 +193,6 @@ def resolve_legacy_id_from_tracking_url(url: str, timeout: int = 10) -> Optional
     """
     if not url or "indeed" not in url:
         return None
-    import logging as _logging
-    _log = _logging.getLogger(__name__)
     try:
         current_url = url
         for hop in range(5):
@@ -177,21 +205,40 @@ def resolve_legacy_id_from_tracking_url(url: str, timeout: int = 10) -> Optional
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/120.0.0.0 Safari/537.36"
-                    )
+                    ),
+                    "Cookie": f"CTK={INDEED_CTK}" if INDEED_CTK else "",
                 },
             )
             location = resp.headers.get("Location", "")
-            print(f"[indeed_fetcher] hop={hop} status={resp.status_code} location={location[:100] if location else 'none'}", flush=True)
-            # Check both current URL and redirect target for legacyId
+            print(f"[indeed_fetcher] hop={hop} status={resp.status_code} location={location[:120] if location else 'none'}", flush=True)
+
+            # Check current URL and Location header for legacyId
             for check_url in [current_url, location]:
                 if check_url:
-                    match = re.search(r"[?&]id=([a-f0-9]{8,20})", check_url)
-                    if match:
-                        return match.group(1)
-            if not location or resp.status_code not in (301, 302, 303, 307, 308):
-                print(f"[indeed_fetcher] redirect chain ended: status={resp.status_code} has_location={bool(location)}", flush=True)
-                break
-            current_url = location
+                    found = _extract_id_from_text(check_url)
+                    if found:
+                        print(f"[indeed_fetcher] legacyId found in URL: {found}", flush=True)
+                        return found
+
+            # If we got a redirect, follow it
+            if location and resp.status_code in (301, 302, 303, 307, 308):
+                current_url = location
+                continue
+
+            # No redirect: parse response body for legacyId (JS/meta redirect or embedded)
+            body = resp.text or ""
+            print(f"[indeed_fetcher] non-redirect response, body length={len(body)}, checking body...", flush=True)
+            # Log a snippet of the body for diagnosis
+            snippet = body[:500].replace('\n', ' ')
+            print(f"[indeed_fetcher] body snippet: {snippet}", flush=True)
+            found = _extract_id_from_text(body)
+            if found:
+                print(f"[indeed_fetcher] legacyId found in body: {found}", flush=True)
+                return found
+            # No legacyId found, stop
+            print(f"[indeed_fetcher] legacyId not found in body, giving up", flush=True)
+            break
+
     except Exception as e:
         print(f"[indeed_fetcher] resolve_legacy_id exception: {type(e).__name__}: {e}", flush=True)
     return None
