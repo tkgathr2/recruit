@@ -640,7 +640,7 @@ def process_mail_by_uid(
     indeed_email: Optional[str] = None
     indeed_answers: Optional[list] = None
     if source == "indeed":
-        from indeed_fetcher import fetch_all_details, resolve_legacy_id_from_tracking_url
+        from indeed_fetcher import fetch_all_details, resolve_legacy_id_from_tracking_url, fetch_by_name
         legacy_id = extract_indeed_legacy_id(html)
         if legacy_id:
             log(f"Indeed legacyId found in HTML: {legacy_id}")
@@ -662,9 +662,10 @@ def process_mail_by_uid(
                     if legacy_id:
                         log(f"Indeed legacyId resolved via fallback URL redirect: {legacy_id}")
                     else:
-                        log("Indeed legacyId not found via any tracking URL, API fetch skipped")
+                        log("Indeed legacyId not found via any tracking URL")
                 else:
-                    log(f"Indeed legacyId not found (no valid engage URL), API fetch skipped")
+                    log(f"Indeed legacyId not found (no valid engage URL)")
+
         if legacy_id:
             details = fetch_all_details(legacy_id)
             if details:
@@ -675,6 +676,18 @@ def process_mail_by_uid(
                 log(f"Indeed API details: phone={phone}, location={indeed_location}, answers={len(indeed_answers or [])}件")
             else:
                 log(f"Indeed API returned no details for legacyId={legacy_id} (CTK expired? API error?)")
+
+        # フォールバック: legacyId取得失敗 or API失敗の場合、名前検索で取得試行
+        if not (phone or indeed_location or indeed_email):
+            log(f"Trying name-based search for '{applicant_name}'...")
+            name_details = fetch_by_name(applicant_name)
+            if name_details:
+                phone = name_details.get("phone") or phone
+                indeed_location = name_details.get("location") or indeed_location
+                indeed_email = name_details.get("email") or indeed_email
+                log(f"Name-search details: phone={phone}, location={indeed_location}, email={indeed_email}")
+            else:
+                log(f"Name-search: no match for '{applicant_name}'")
 
     log(f"Notify {source}: {applicant_name}, phone={phone}, url={url}, id={unique_id}")
 

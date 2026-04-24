@@ -128,6 +128,123 @@ def fetch_all_details(legacy_id: str, timeout: int = 10) -> Dict[str, Any]:
         return {}
 
 
+def fetch_recent_candidates(limit: int = 30, timeout: int = 15) -> list:
+    """Indeed GraphQL APIから最近の応募者一覧を取得する（legacyId不要）。
+
+    engage.indeed.comリダイレクトが使えない場合のフォールバック。
+    legacyIdsを指定せずにAPIを叩き、最新の応募者リストを取得する。
+
+    Returns:
+        list of dicts: [{name, phone, email, location, legacy_id}, ...]
+        空リストの場合はAPI呼び出し失敗または応募者なし
+    """
+    if not INDEED_CTK:
+        return []
+
+    # legacyIds を指定しない（全件取得を試みる）
+    query = """
+    query CRP_CandidateSubmissions($input: CandidateSubmissionsInput!) {
+      candidateSubmissions(input: $input) {
+        results {
+          id
+          ... on CandidateSubmission {
+            data {
+              profile {
+                name { displayName }
+                contact { phoneNumber email aliasedEmail }
+                location { location }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+
+    # legacyIdsなし・limit指定で最近の応募者を取得試行
+    variables = {
+        "input": {}  # legacyIds指定なし → 全件取得を期待
+    }
+
+    headers = {
+        "content-type": "application/json",
+        "indeed-api-key": INDEED_API_KEY,
+        "indeed-ctk": INDEED_CTK,
+        "indeed-client-sub-app": "talent-management-experience",
+        "indeed-client-sub-app-component": "./CandidateReviewPage",
+        "Origin": "https://employers.indeed.com",
+        "Referer": "https://employers.indeed.com/",
+        "Cookie": f"CTK={INDEED_CTK}",
+    }
+
+    try:
+        response = requests.post(
+            INDEED_GRAPHQL_ENDPOINT,
+            json={"query": query, "variables": variables},
+            headers=headers,
+            timeout=timeout
+        )
+        response.raise_for_status()
+        data = response.json()
+        print(f"[indeed_fetcher] fetch_recent_candidates response: {str(data)[:300]}", flush=True)
+
+        results = (data.get("data") or {}).get("candidateSubmissions", {}).get("results", [])
+        candidates = []
+        for submission in results:
+            sub_data = submission.get("data", {})
+            profile = sub_data.get("profile", {})
+            name = profile.get("name", {}).get("displayName")
+            contact = profile.get("contact", {})
+            phone = contact.get("phoneNumber")
+            email = contact.get("email") or contact.get("aliasedEmail")
+            location = profile.get("location", {}).get("location")
+            legacy_id = submission.get("id")
+            if name:
+                candidates.append({
+                    "name": name,
+                    "phone": phone,
+                    "email": email,
+                    "location": location,
+                    "legacy_id": legacy_id,
+                })
+        print(f"[indeed_fetcher] fetch_recent_candidates: {len(candidates)} candidates found", flush=True)
+        return candidates
+    except Exception as e:
+        print(f"[indeed_fetcher] fetch_recent_candidates exception: {type(e).__name__}: {e}", flush=True)
+        return []
+
+
+def fetch_by_name(name: str, timeout: int = 15) -> Dict[str, Any]:
+    """応募者名でIndeed APIを検索して連絡先を取得する。
+
+    engage URLリダイレクトが失敗した場合のフォールバック。
+    fetch_recent_candidates()の結果から名前でマッチングする。
+
+    Args:
+        name: 応募者の表示名（完全一致または部分一致）
+
+    Returns:
+        Dictionary with phone, email, location fields, or empty dict
+    """
+    if not name:
+        return {}
+    candidates = fetch_recent_candidates()
+    name_lower = name.strip().lower()
+    # 完全一致を優先
+    for c in candidates:
+        if c.get("name", "").strip().lower() == name_lower:
+            print(f"[indeed_fetcher] fetch_by_name: exact match for '{name}'", flush=True)
+            return c
+    # 部分一致
+    for c in candidates:
+        c_name = c.get("name", "").strip().lower()
+        if name_lower in c_name or c_name in name_lower:
+            print(f"[indeed_fetcher] fetch_by_name: partial match '{c.get('name')}' for '{name}'", flush=True)
+            return c
+    print(f"[indeed_fetcher] fetch_by_name: no match for '{name}' among {len(candidates)} candidates", flush=True)
+    return {}
+
+
 def fetch_phone_for_applicant(name: str) -> Optional[str]:
     """
     Legacy function for backward compatibility.
