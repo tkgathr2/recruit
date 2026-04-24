@@ -163,9 +163,11 @@ def resolve_legacy_id_from_tracking_url(url: str, timeout: int = 10) -> Optional
     """
     if not url or "indeed" not in url:
         return None
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
     try:
         current_url = url
-        for _ in range(5):
+        for hop in range(5):
             resp = requests.get(
                 current_url,
                 allow_redirects=False,
@@ -179,6 +181,7 @@ def resolve_legacy_id_from_tracking_url(url: str, timeout: int = 10) -> Optional
                 },
             )
             location = resp.headers.get("Location", "")
+            print(f"[indeed_fetcher] hop={hop} status={resp.status_code} location={location[:100] if location else 'none'}", flush=True)
             # Check both current URL and redirect target for legacyId
             for check_url in [current_url, location]:
                 if check_url:
@@ -186,10 +189,11 @@ def resolve_legacy_id_from_tracking_url(url: str, timeout: int = 10) -> Optional
                     if match:
                         return match.group(1)
             if not location or resp.status_code not in (301, 302, 303, 307, 308):
+                print(f"[indeed_fetcher] redirect chain ended: status={resp.status_code} has_location={bool(location)}", flush=True)
                 break
             current_url = location
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[indeed_fetcher] resolve_legacy_id exception: {type(e).__name__}: {e}", flush=True)
     return None
 
 
