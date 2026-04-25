@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Optional, Set, Tuple
 import requests
 from bs4 import BeautifulSoup
+from flask import Flask, request as flask_request, jsonify
+from threading import Thread
 from datetime import datetime, timedelta
 
 # --- Env Vars (Railway Variables) ---
@@ -26,6 +28,7 @@ SLACK_WEBHOOK_URL_PROD = os.getenv("SLACK_WEBHOOK_URL_PROD")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_TO_ID_TEST = os.getenv("LINE_TO_ID_TEST")
 LINE_TO_ID_PROD = os.getenv("LINE_TO_ID_PROD")
+COWORK_WEBHOOK_TOKEN = os.getenv("COWORK_WEBHOOK_TOKEN", "")
 LOG_DIR = os.getenv("LOG_DIR", "/tmp")
 SLACK_ERROR_WEBHOOK_URL = os.getenv("SLACK_ERROR_WEBHOOK_URL")
 
@@ -39,14 +42,14 @@ LINE_MENTION_ID_1 = os.getenv("LINE_MENTION_ID_1")
 LINE_MENTION_ID_2 = os.getenv("LINE_MENTION_ID_2")
 
 # --- Polling Interval ---
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))  # デフォルト60秒（Gmail API制限対策）
-MAX_BACKOFF_SECONDS = int(os.getenv("MAX_BACKOFF_SECONDS", "900"))  # 最大15分のバックオフ
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))  # ããã©ã«ã60ç§ï¼Gmail APIå¶éå¯¾ç­ï¼
+MAX_BACKOFF_SECONDS = int(os.getenv("MAX_BACKOFF_SECONDS", "900"))  # æå¤§15åã®ããã¯ãªã
 
 # --- Search window for emails (days) ---
-SEARCH_DAYS = int(os.getenv("SEARCH_DAYS", "1"))  # デフォルト1日間（Gmail API制限対策）
+SEARCH_DAYS = int(os.getenv("SEARCH_DAYS", "1"))  # ããã©ã«ã1æ¥éï¼Gmail APIå¶éå¯¾ç­ï¼
 
-# --- Batch limit per cycle (QUOTA ERROR対策) ---
-MAX_EMAILS_PER_CYCLE = int(os.getenv("MAX_EMAILS_PER_CYCLE", "10"))  # 1サイクルで処理する最大メール数
+# --- Batch limit per cycle (QUOTA ERRORå¯¾ç­) ---
+MAX_EMAILS_PER_CYCLE = int(os.getenv("MAX_EMAILS_PER_CYCLE", "10"))  # 1ãµã¤ã¯ã«ã§å¦çããæå¤§ã¡ã¼ã«æ°
 
 
 # --- Logging ---
@@ -155,12 +158,12 @@ def save_processed_ids(processed_ids: Set[str]) -> bool:
 
 
 def notify_error_to_slack(message: str) -> None:
-    """重大なエラーを Slack Webhook に通知する"""
+    """éå¤§ãªã¨ã©ã¼ã Slack Webhook ã«éç¥ãã"""
     webhook_url = SLACK_ERROR_WEBHOOK_URL or SLACK_WEBHOOK_URL_PROD
     if not webhook_url:
         log("ERROR: No Slack webhook URL configured; cannot notify error to Slack")
         return
-    text = f"🚨 Indeed応募通知エラー発生\n{message}"
+    text = f"ð¨ Indeedå¿åéç¥ã¨ã©ã¼çºç\n{message}"
     try:
         resp = requests.post(
             webhook_url,
@@ -170,7 +173,7 @@ def notify_error_to_slack(message: str) -> None:
         if resp.status_code >= 400:
             log(f"ERROR: failed to send error notification to Slack (status={resp.status_code}, body={resp.text})")
     except Exception as e:
-        # 通知時のエラーでさらに例外を投げるとループするのでログのみ
+        # éç¥æã®ã¨ã©ã¼ã§ããã«ä¾å¤ãæããã¨ã«ã¼ãããã®ã§ã­ã°ã®ã¿
         log(f"ERROR: exception while sending error notification to Slack: {e}")
 
 
@@ -198,7 +201,7 @@ def get_line_to_id() -> Optional[str]:
 
 def add_test_prefix(message: str) -> str:
     """Add test version prefix if in test mode."""
-    return f"【テストバージョン】\n{message}" if is_test_mode() else message
+    return f"ããã¹ããã¼ã¸ã§ã³ã\n{message}" if is_test_mode() else message
 
 
 # --- Email Parsing ---
@@ -246,7 +249,7 @@ def extract_indeed_url(html: str) -> str:
         return ""
     soup = BeautifulSoup(html, "html.parser")
     for a in soup.find_all("a"):
-        if "応募内容を確認する" in (a.get_text() or ""):
+        if "å¿ååå®¹ãç¢ºèªãã" in (a.get_text() or ""):
             return a.get("href") or ""
     for a in soup.find_all("a"):
         href = a.get("href") or ""
@@ -256,25 +259,25 @@ def extract_indeed_url(html: str) -> str:
 
 
 def extract_indeed_legacy_id(html: str) -> Optional[str]:
-    """Indeed通知メールのHTMLからlegacyId（hex）を抽出する。
+    """Indeedéç¥ã¡ã¼ã«ã®HTMLããlegacyIdï¼hexï¼ãæ½åºããã
 
-    Indeed通知メールには以下のURLパターンが含まれる:
+    Indeedéç¥ã¡ã¼ã«ã«ã¯ä»¥ä¸ã®URLãã¿ã¼ã³ãå«ã¾ãã:
     - https://employers.indeed.com/candidates/view?id=<legacyId>
-    - https://engage.indeed.com/f/a/<legacyId>~~/...  (旧形式: hex)
-    - https://engage.indeed.com/f/a/<base64url>~~...  (新形式: base64url 22文字)
-    legacyId は hex文字列（8〜20桁）。
+    - https://engage.indeed.com/f/a/<legacyId>~~/...  (æ§å½¢å¼: hex)
+    - https://engage.indeed.com/f/a/<base64url>~~...  (æ°å½¢å¼: base64url 22æå­)
+    legacyId ã¯ hexæå­åï¼8ã20æ¡ï¼ã
     """
     if not html:
         return None
-    # パターン1: employers.indeed.com に直接 id= パラメータが含まれる場合
+    # ãã¿ã¼ã³1: employers.indeed.com ã«ç´æ¥ id= ãã©ã¡ã¼ã¿ãå«ã¾ããå ´å
     direct = re.search(r'employers\.indeed\.com/candidates(?:/view)?\?(?:[^"\'<>\s]*&)?id=([a-f0-9]{8,20})', html)
     if direct:
         return direct.group(1)
-    # パターン2: engage.indeed.com/f/a/<hex>~~ 形式（旧形式）
+    # ãã¿ã¼ã³2: engage.indeed.com/f/a/<hex>~~ å½¢å¼ï¼æ§å½¢å¼ï¼
     engage_hex = re.search(r'engage\.indeed\.com/f/a/([a-f0-9]{10,16})(?:~~|/)', html)
     if engage_hex:
         return engage_hex.group(1)
-    # パターン3: 任意のURLの id= パラメータ（indeed ドメイン内）
+    # ãã¿ã¼ã³3: ä»»æã®URLã® id= ãã©ã¡ã¼ã¿ï¼indeed ãã¡ã¤ã³åï¼
     any_id = re.search(r'indeed\.com[^"\'<>\s]*[?&]id=([a-f0-9]{8,20})', html)
     if any_id:
         return any_id.group(1)
@@ -282,29 +285,29 @@ def extract_indeed_legacy_id(html: str) -> Optional[str]:
 
 
 def extract_indeed_engage_urls(html: str) -> list:
-    """Indeed通知メールのHTMLからengage.indeed.comトラッキングURLを全て抽出する。
+    """Indeedéç¥ã¡ã¼ã«ã®HTMLããengage.indeed.comãã©ãã­ã³ã°URLãå¨ã¦æ½åºããã
 
-    新形式(base64url)・旧形式(hex)問わず engage.indeed.com/f/a/ URLを返す。
-    これらURLはリダイレクトをたどると employers.indeed.com/candidates/view?id=<hex> に到達する。
+    æ°å½¢å¼(base64url)ã»æ§å½¢å¼(hex)åãã engage.indeed.com/f/a/ URLãè¿ãã
+    ãããURLã¯ãªãã¤ã¬ã¯ãããã©ãã¨ employers.indeed.com/candidates/view?id=<hex> ã«å°éããã
     """
     if not html:
         return []
-    # engage.indeed.com/f/a/<任意の文字列>~~ パターン
+    # engage.indeed.com/f/a/<ä»»æã®æå­å>~~ ãã¿ã¼ã³
     matches = re.findall(r'(https://engage\.indeed\.com/f/a/[A-Za-z0-9_\-]{10,}~~[^\s"\'<>]*)', html)
-    return list(dict.fromkeys(matches))  # 重複除去（順序保持）
+    return list(dict.fromkeys(matches))  # éè¤é¤å»ï¼é åºä¿æï¼
 
 
 def extract_phone_number(html: str) -> Optional[str]:
-    """メール本文HTMLから電話番号を抽出する。"""
+    """ã¡ã¼ã«æ¬æHTMLããé»è©±çªå·ãæ½åºããã"""
     if not html:
         return None
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(separator="\n")
-    # 日本の電話番号パターン（携帯・固定・フリーダイヤル）
+    # æ¥æ¬ã®é»è©±çªå·ãã¿ã¼ã³ï¼æºå¸¯ã»åºå®ã»ããªã¼ãã¤ã¤ã«ï¼
     patterns = [
-        r'0[789]0[-\s]?\d{4}[-\s]?\d{4}',   # 携帯: 090/080/070
-        r'0\d{1,4}[-\s]?\d{1,4}[-\s]?\d{4}', # 固定: 03-xxxx-xxxx 等
-        r'0120[-\s]?\d{3}[-\s]?\d{3}',        # フリーダイヤル
+        r'0[789]0[-\s]?\d{4}[-\s]?\d{4}',   # æºå¸¯: 090/080/070
+        r'0\d{1,4}[-\s]?\d{1,4}[-\s]?\d{4}', # åºå®: 03-xxxx-xxxx ç­
+        r'0120[-\s]?\d{3}[-\s]?\d{3}',        # ããªã¼ãã¤ã¤ã«
     ]
     for pattern in patterns:
         match = re.search(pattern, text)
@@ -314,36 +317,36 @@ def extract_phone_number(html: str) -> Optional[str]:
 
 
 def extract_body_text(html: str, max_chars: int = 500) -> str:
-    """メール本文HTMLからプレーンテキストを抽出する（最大max_chars文字）。"""
+    """ã¡ã¼ã«æ¬æHTMLãããã¬ã¼ã³ãã­ã¹ããæ½åºããï¼æå¤§max_charsæå­ï¼ã"""
     if not html:
         return ""
     soup = BeautifulSoup(html, "html.parser")
-    # script/styleタグを除去
+    # script/styleã¿ã°ãé¤å»
     for tag in soup(["script", "style"]):
         tag.decompose()
     text = soup.get_text(separator="\n")
-    # 連続する空行を1行にまとめる
+    # é£ç¶ããç©ºè¡ã1è¡ã«ã¾ã¨ãã
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     result = "\n".join(lines)
     if len(result) > max_chars:
-        result = result[:max_chars] + "…"
+        result = result[:max_chars] + "â¦"
     return result
 
 
 def format_phone_for_slack(phone: str) -> str:
     """Format phone number as a Slack tel: link.
 
-    Converts '+81 80 2478 7813' → '<tel:+818024787813|080-2478-7813>'
+    Converts '+81 80 2478 7813' â '<tel:+818024787813|080-2478-7813>'
     so it becomes a tappable link in Slack mobile.
     """
     if not phone:
         return phone
     # Remove spaces to build the tel URI
     tel_uri = phone.replace(" ", "")
-    # Build Japanese local display format: +81 80 XXXX XXXX → 080-XXXX-XXXX
+    # Build Japanese local display format: +81 80 XXXX XXXX â 080-XXXX-XXXX
     digits = tel_uri.lstrip("+")
     if digits.startswith("81") and len(digits) >= 11:
-        local = "0" + digits[2:]  # 81 → 0
+        local = "0" + digits[2:]  # 81 â 0
         # Format: 090/080/060 (3 digits) - 4 digits - 4 digits
         if len(local) == 11:
             display = f"{local[:3]}-{local[3:7]}-{local[7:]}"
@@ -359,7 +362,7 @@ def format_phone_for_slack(phone: str) -> str:
 def format_phone_for_line(phone: str) -> str:
     """Format phone number for LINE tap-to-call.
 
-    Converts '+81 80 2478 7813' → '080-2478-7813'
+    Converts '+81 80 2478 7813' â '080-2478-7813'
     LINE automatically turns hyphen-formatted Japanese numbers into tappable links.
     """
     if not phone:
@@ -378,32 +381,32 @@ def format_phone_for_line(phone: str) -> str:
 
 
 def extract_applicant_name_from_html(html: str) -> Optional[str]:
-    """IndeedメールのHTML本文から応募者名を抽出する。
+    """Indeedã¡ã¼ã«ã®HTMLæ¬æããå¿åèåãæ½åºããã
 
-    Indeedのメールはfrom_headerが「Indeed <noreply@indeed.com>」のため
-    ヘッダーからは応募者名を取得できない。代わりにメール本文HTMLから取得する。
+    Indeedã®ã¡ã¼ã«ã¯from_headerããIndeed <noreply@indeed.com>ãã®ãã
+    ãããã¼ããã¯å¿åèåãåå¾ã§ããªããä»£ããã«ã¡ã¼ã«æ¬æHTMLããåå¾ããã
 
-    試みるパターン:
-    1. 「○○さんからの応募」「○○ さんが応募しました」等のテキスト
-    2. 件名「新しい応募者のお知らせ: ○○」のパターン
-    3. td/div/p内に「応募者:」「応募者名:」等のラベルに続く名前
+    è©¦ã¿ããã¿ã¼ã³:
+    1. ãââããããã®å¿åããââ ãããå¿åãã¾ãããç­ã®ãã­ã¹ã
+    2. ä»¶åãæ°ããå¿åèã®ãç¥ãã: ââãã®ãã¿ã¼ã³
+    3. td/div/påã«ãå¿åè:ããå¿åèå:ãç­ã®ã©ãã«ã«ç¶ãåå
     """
     if not html:
         return None
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(separator="\n")
 
-    # パターン1: 「○○さんからの応募」「○○さんが応募しました」
+    # ãã¿ã¼ã³1: ãââããããã®å¿åããââãããå¿åãã¾ããã
     for pattern in [
-        r"([^\s　\n]+(?:\s[^\s　\n]+)?)\s*さん(?:から(?:の)?応募|が応募)",
-        r"新しい応募者(?:のお知らせ)?[:：]\s*([^\n\r]+)",
-        r"応募者(?:名)?[:：]\s*([^\n\r]+)",
-        r"([^\s　\n]{1,20})\s*(?:様|さん)(?:\s|$|が|から|の)",
+        r"([^\sã\n]+(?:\s[^\sã\n]+)?)\s*ãã(?:ãã(?:ã®)?å¿å|ãå¿å)",
+        r"æ°ããå¿åè(?:ã®ãç¥ãã)?[:ï¼]\s*([^\n\r]+)",
+        r"å¿åè(?:å)?[:ï¼]\s*([^\n\r]+)",
+        r"([^\sã\n]{1,20})\s*(?:æ§|ãã)(?:\s|$|ã|ãã|ã®)",
     ]:
         match = re.search(pattern, text)
         if match:
             name = match.group(1).strip()
-            # 明らかに名前ではないものを除外（URLや長すぎる文字列）
+            # æããã«ååã§ã¯ãªããã®ãé¤å¤ï¼URLãé·ãããæå­åï¼
             if name and len(name) <= 30 and "http" not in name and "@" not in name:
                 return name
 
@@ -417,21 +420,21 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
     if not webhook_url:
         log("No Slack Webhook URL")
         return False
-    title = "【Indeed応募】" if source == "indeed" else "【ジモティー】"
+    title = "ãIndeedå¿åã" if source == "indeed" else "ãã¸ã¢ãã£ã¼ã"
     mention_parts = [f"<@{mid}>" for mid in [SLACK_MENTION_ID_1, SLACK_MENTION_ID_2] if mid]
     mention_prefix = " ".join(mention_parts) + "\n" if mention_parts else ""
     if not mention_parts:
         log("WARNING: No Slack mention IDs configured")
 
-    lines = [f"{title} 【{name}】 さんから応募がありました。"]
+    lines = [f"{title} ã{name}ã ããããå¿åãããã¾ããã"]
     if job_title:
-        lines.append(f"求人: {job_title}")
+        lines.append(f"æ±äºº: {job_title}")
     if phone:
-        lines.append(f"電話番号: {format_phone_for_slack(phone)}")
+        lines.append(f"é»è©±çªå·: {format_phone_for_slack(phone)}")
     if location:
-        lines.append(f"住所: {location}")
+        lines.append(f"ä½æ: {location}")
     if email:
-        lines.append(f"メール: {email}")
+        lines.append(f"ã¡ã¼ã«: {email}")
     if answers:
         for ans in answers:
             key = ans.get("questionKey", "")
@@ -439,9 +442,9 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
             if val and key:
                 lines.append(f"{key}: {val}")
     if url:
-        lines.extend(["", "応募内容はこちら:", url])
+        lines.extend(["", "å¿ååå®¹ã¯ãã¡ã:", url])
     if body_text:
-        lines.extend(["", "--- メール本文 ---", body_text])
+        lines.extend(["", "--- ã¡ã¼ã«æ¬æ ---", body_text])
     message = add_test_prefix(mention_prefix + "\n".join(lines))
     for attempt in range(max_retries):
         try:
@@ -465,30 +468,30 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
     if not LINE_CHANNEL_ACCESS_TOKEN or not line_to_id:
         log("LINE Token or TO ID missing")
         return False
-    title = "Indeedに応募がありました。" if source == "indeed" else "ジモティーで新着があります。"
-    lines = [f"【{name}】 さんから{title}"]
+    title = "Indeedã«å¿åãããã¾ããã" if source == "indeed" else "ã¸ã¢ãã£ã¼ã§æ°çãããã¾ãã"
+    lines = [f"ã{name}ã ãããã{title}"]
     if job_title:
-        lines.append(f"求人: {job_title}")
+        lines.append(f"æ±äºº: {job_title}")
     if phone:
-        lines.append(f"📞 電話番号: {format_phone_for_line(phone)}")
+        lines.append(f"ð é»è©±çªå·: {format_phone_for_line(phone)}")
     if location:
-        lines.append(f"📍 住所: {location}")
+        lines.append(f"ð ä½æ: {location}")
     if email:
-        lines.append(f"📧 メール: {email}")
+        lines.append(f"ð§ ã¡ã¼ã«: {email}")
     if answers:
         for ans in answers:
             key = ans.get("questionKey", "")
             val = ans.get("value")
             if val and key:
-                lines.append(f"📝 {key}: {val}")
+                lines.append(f"ð {key}: {val}")
     if url:
         # Force LINE to open URL in external browser (Chrome/Safari)
         # to avoid Google OAuth blocking in LINE's in-app browser
         separator = "&" if "?" in url else "?"
         external_url = f"{url}{separator}openExternalBrowser=1"
-        lines.extend(["", "詳細はこちら:", external_url])
+        lines.extend(["", "è©³ç´°ã¯ãã¡ã:", external_url])
     if body_text:
-        lines.extend(["", "--- メール本文 ---", body_text])
+        lines.extend(["", "--- ã¡ã¼ã«æ¬æ ---", body_text])
     base_message = add_test_prefix("\n".join(lines))
     # Use @all mention to notify all members in the group
     substitution = {
@@ -563,9 +566,9 @@ def parse_fetch_response(data: list) -> Tuple[Optional[str], Optional[bytes]]:
 
 def determine_source(subject: str) -> Tuple[Optional[str], Optional[str]]:
     """Determine email source and default URL based on subject."""
-    if "新しい応募者のお知らせ" in subject:
+    if "æ°ããå¿åèã®ãç¥ãã" in subject:
         return "indeed", None
-    elif "ジモティー" in subject:
+    elif "ã¸ã¢ãã£ã¼" in subject:
         return "jimoty", "https://jmty.jp/web_mail/posts"
     return None, None
 
@@ -622,8 +625,8 @@ def process_mail_by_uid(
     html = extract_html(msg)
     url = extract_indeed_url(html) if source == "indeed" else default_url
 
-    # IndeedメールはFrom=「Indeed <noreply@indeed.com>」なので
-    # メール本文HTMLから応募者名を取得する。取れなければFromヘッダーの名前を使う。
+    # Indeedã¡ã¼ã«ã¯From=ãIndeed <noreply@indeed.com>ããªã®ã§
+    # ã¡ã¼ã«æ¬æHTMLããå¿åèåãåå¾ãããåããªããã°Fromãããã¼ã®ååãä½¿ãã
     if source == "indeed":
         applicant_name = extract_applicant_name_from_html(html)
         if not applicant_name:
@@ -631,11 +634,11 @@ def process_mail_by_uid(
     else:
         applicant_name = extract_name(from_header)
 
-    # 電話番号・本文テキストを抽出
+    # é»è©±çªå·ã»æ¬æãã­ã¹ããæ½åº
     phone = extract_phone_number(html)
     body_text = extract_body_text(html)
 
-    # Indeed応募の場合: URLからlegacyIdを抽出してAPIで全詳細を取得
+    # Indeedå¿åã®å ´å: URLããlegacyIdãæ½åºãã¦APIã§å¨è©³ç´°ãåå¾
     indeed_location: Optional[str] = None
     indeed_email: Optional[str] = None
     indeed_answers: Optional[list] = None
@@ -645,8 +648,8 @@ def process_mail_by_uid(
         if legacy_id:
             log(f"Indeed legacyId found in HTML: {legacy_id}")
         else:
-            # HTMLから直接hex IDが取れなかった場合:
-            # engage.indeed.com トラッキングURLをたどってhex IDを取得する
+            # HTMLããç´æ¥hex IDãåããªãã£ãå ´å:
+            # engage.indeed.com ãã©ãã­ã³ã°URLããã©ã£ã¦hex IDãåå¾ãã
             log("Indeed legacyId not found in HTML, trying engage tracking URL redirect...")
             engage_urls = extract_indeed_engage_urls(html)
             log(f"Indeed engage URLs found: {len(engage_urls)}")
@@ -656,7 +659,7 @@ def process_mail_by_uid(
                     log(f"Indeed legacyId resolved via engage URL redirect: {legacy_id} (from {engage_url[:60]}...)")
                     break
             if not legacy_id:
-                # フォールバック: extract_indeed_url で取得した汎用URLも試みる
+                # ãã©ã¼ã«ããã¯: extract_indeed_url ã§åå¾ããæ±ç¨URLãè©¦ã¿ã
                 if url and "engage.indeed.com" in url:
                     legacy_id = resolve_legacy_id_from_tracking_url(url)
                     if legacy_id:
@@ -669,15 +672,15 @@ def process_mail_by_uid(
         if legacy_id:
             details = fetch_all_details(legacy_id)
             if details:
-                phone = details.get("phone") or phone  # APIの方が正確
+                phone = details.get("phone") or phone  # APIã®æ¹ãæ­£ç¢º
                 indeed_location = details.get("location")
                 indeed_email = details.get("email")
                 indeed_answers = details.get("answers") or []
-                log(f"Indeed API details: phone={phone}, location={indeed_location}, answers={len(indeed_answers or [])}件")
+                log(f"Indeed API details: phone={phone}, location={indeed_location}, answers={len(indeed_answers or [])}ä»¶")
             else:
                 log(f"Indeed API returned no details for legacyId={legacy_id} (CTK expired? API error?)")
 
-        # フォールバック: legacyId取得失敗 or API失敗の場合、名前検索で取得試行
+        # ãã©ã¼ã«ããã¯: legacyIdåå¾å¤±æ or APIå¤±æã®å ´åãååæ¤ç´¢ã§åå¾è©¦è¡
         if not (phone or indeed_location or indeed_email):
             log(f"Trying name-based search for '{applicant_name}'...")
             name_details = fetch_by_name(applicant_name)
@@ -776,7 +779,7 @@ def check_mail_with_status() -> bool:
 
             if truly_new_uids:
                 total_new = len(truly_new_uids)
-                # QUOTA ERROR対策: 1サイクルで処理するメール数を制限する
+                # QUOTA ERRORå¯¾ç­: 1ãµã¤ã¯ã«ã§å¦çããã¡ã¼ã«æ°ãå¶éãã
                 batch = truly_new_uids[:MAX_EMAILS_PER_CYCLE]
                 if total_new > MAX_EMAILS_PER_CYCLE:
                     log(f"Truly new emails to process: {total_new} (processing {MAX_EMAILS_PER_CYCLE} this cycle, {total_new - MAX_EMAILS_PER_CYCLE} deferred)")
@@ -862,9 +865,53 @@ def verify_storage() -> bool:
     return True
 
 
+# --- Flask Webhook Server (Cowork LINE通知用) ---
+flask_app = Flask(__name__)
+
+
+@flask_app.after_request
+def add_cors(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Cowork-Token"
+    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS, GET"
+    return response
+
+
+@flask_app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({"status": "ok"})
+
+
+@flask_app.route("/notify-line", methods=["POST", "OPTIONS"])
+def notify_line_webhook():
+    if flask_request.method == "OPTIONS":
+        return "", 204
+    if COWORK_WEBHOOK_TOKEN:
+        if flask_request.headers.get("X-Cowork-Token", "") != COWORK_WEBHOOK_TOKEN:
+            return jsonify({"error": "Unauthorized"}), 401
+    data = flask_request.get_json(force=True) or {}
+    name    = data.get("name", "")
+    phone   = data.get("phone") or None
+    email   = data.get("email") or None
+    address = data.get("address") or None
+    log(f"[webhook] notify-line: name={name}, phone={phone}, email={email}")
+    ok = notify_line_with_retry("indeed", name, "", phone=phone, email=email, location=address)
+    return jsonify({"ok": ok})
+
+
+def run_flask_server() -> None:
+    port = int(os.getenv("PORT", "8080"))
+    log(f"Starting Flask webhook server on port {port}")
+    flask_app.run(host="0.0.0.0", port=port, use_reloader=False)
+
+
 # --- Main loop ---
 def main() -> None:
     """Main polling loop with exponential backoff for quota errors."""
+    # Start Flask webhook server in background thread
+    flask_thread = Thread(target=run_flask_server, daemon=True)
+    flask_thread.start()
+
     log(f"Starting Gmail polling with POLL_INTERVAL_SECONDS={POLL_INTERVAL_SECONDS}")
     log(f"MODE={MODE}, SEARCH_DAYS={SEARCH_DAYS}, MAX_BACKOFF_SECONDS={MAX_BACKOFF_SECONDS}, MAX_EMAILS_PER_CYCLE={MAX_EMAILS_PER_CYCLE}")
 
