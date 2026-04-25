@@ -415,7 +415,7 @@ def extract_applicant_name_from_html(html: str) -> Optional[str]:
 
 
 # --- Notification Functions ---
-def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optional[str] = None, phone: Optional[str] = None, body_text: Optional[str] = None, max_retries: int = 3, location: Optional[str] = None, email: Optional[str] = None, answers: Optional[list] = None) -> bool:
+def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optional[str] = None, phone: Optional[str] = None, body_text: Optional[str] = None, max_retries: int = 3, location: Optional[str] = None, email_addr: Optional[str] = None, answers: Optional[list] = None) -> bool:
     """Send notification to Slack with retry logic. Returns True if successful."""
     webhook_url = get_slack_webhook_url()
     if not webhook_url:
@@ -434,8 +434,8 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
         lines.append(f"電話番号: {format_phone_for_slack(phone)}")
     if location:
         lines.append(f"住所: {location}")
-    if email:
-        lines.append(f"メール: {email}")
+    if email_addr:
+        lines.append(f"メール: {email_addr}")
     if answers:
         for ans in answers:
             key = ans.get("questionKey", "")
@@ -463,7 +463,7 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
     return False
 
 
-def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional[str] = None, phone: Optional[str] = None, body_text: Optional[str] = None, max_retries: int = 3, location: Optional[str] = None, email: Optional[str] = None, answers: Optional[list] = None) -> bool:
+def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional[str] = None, phone: Optional[str] = None, body_text: Optional[str] = None, max_retries: int = 3, location: Optional[str] = None, email_addr: Optional[str] = None, answers: Optional[list] = None) -> bool:
     """Send notification to LINE with retry logic. Returns True if successful."""
     line_to_id = get_line_to_id()
     if not LINE_CHANNEL_ACCESS_TOKEN or not line_to_id:
@@ -477,8 +477,8 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
         lines.append(f"📞 電話番号: {format_phone_for_line(phone)}")
     if location:
         lines.append(f"📍 住所: {location}")
-    if email:
-        lines.append(f"📧 メール: {email}")
+    if email_addr:
+        lines.append(f"📧 メール: {email_addr}")
     if answers:
         for ans in answers:
             key = ans.get("questionKey", "")
@@ -695,8 +695,8 @@ def process_mail_by_uid(
 
     log(f"Notify {source}: {applicant_name}, phone={phone}, url={url}, id={unique_id}")
 
-    slack_ok = notify_slack_with_retry(source, applicant_name, url, phone=phone, body_text=body_text, location=indeed_location, email=indeed_email, answers=indeed_answers)
-    line_ok = notify_line_with_retry(source, applicant_name, url, phone=phone, body_text=body_text, location=indeed_location, email=indeed_email, answers=indeed_answers)
+    slack_ok = notify_slack_with_retry(source, applicant_name, url, phone=phone, body_text=body_text, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
+    line_ok = notify_line_with_retry(source, applicant_name, url, phone=phone, body_text=body_text, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
 
     if not slack_ok:
         log(f"WARNING: Slack notification failed for {applicant_name} ({unique_id})")
@@ -743,6 +743,9 @@ def check_mail_with_status() -> bool:
 
             # Use UID SEARCH for stable identifiers
             status, data = mail.uid("search", None, "SINCE", since_date)
+            if status != "OK" or not data or not data[0]:
+                log(f"ERROR: IMAP UID search failed: status={status}")
+                return True  # Not a quota error
             uid_list = data[0].split()
             log(f"Emails in last {SEARCH_DAYS} days: {len(uid_list)}")
 
@@ -880,8 +883,6 @@ def add_cors(response):
     origin = flask_request.headers.get("Origin", "")
     if origin in allowed_origins:
         response.headers["Access-Control-Allow-Origin"] = origin
-    else:
-        response.headers["Access-Control-Allow-Origin"] = "https://cowork.anthropic.com"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Cowork-Token"
     response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS, GET"
     return response
@@ -907,7 +908,7 @@ def notify_line_webhook():
     email_addr = data.get("email") or None
     address = data.get("address") or None
     log(f"[webhook] notify-line: name={name}, phone={phone}, email={email_addr}")
-    ok = notify_line_with_retry("indeed", name, "", phone=phone, email=email_addr, location=address)
+    ok = notify_line_with_retry("indeed", name, "", phone=phone, email_addr=email_addr, location=address)
     return jsonify({"ok": ok})
 
 
