@@ -380,6 +380,19 @@ def format_phone_for_line(phone: str) -> str:
             return local
     return phone
 
+def shorten_url(url: str) -> str:
+    """Shorten URL using TinyURL API. Returns original URL if shortening fails."""
+    if not url:
+        return url
+    try:
+        api = "https://tinyurl.com/api-create.php" + "?url=" + requests.utils.quote(url, safe="")
+        resp = requests.get(api, timeout=5)
+        if resp.status_code == 200 and resp.text.strip().startswith("http"):
+            return resp.text.strip()
+    except Exception:
+        pass
+    return url
+
 
 def extract_applicant_name_from_html(html: str) -> Optional[str]:
     """IndeedメールのHTML本文から応募者名を抽出する。
@@ -422,11 +435,7 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
         log("No Slack Webhook URL")
         return False
     title = "【Indeed応募】" if source == "indeed" else "【ジモティー】"
-    mention_parts = [f"<@{mid}>" for mid in [SLACK_MENTION_ID_1, SLACK_MENTION_ID_2] if mid]
-    mention_prefix = " ".join(mention_parts) + "\n" if mention_parts else ""
-    if not mention_parts:
-        log("WARNING: No Slack mention IDs configured")
-
+    mention_prefix = "<!channel>\n"
     lines = [f"{title} 【{name}】 さんから応募がありました。"]
     if job_title:
         lines.append(f"求人: {job_title}")
@@ -443,9 +452,7 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
             if val and key:
                 lines.append(f"{key}: {val}")
     if url:
-        lines.extend(["", "応募内容はこちら:", url])
-    if body_text:
-        lines.extend(["", "--- メール本文 ---", body_text])
+        lines.extend(["", "\u5fdc\u52df\u5185\u5bb9\u306f\u3053\u3061\u3089:", shorten_url(url)])
     message = add_test_prefix(mention_prefix + "\n".join(lines))
     for attempt in range(max_retries):
         try:
@@ -490,9 +497,7 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
         # to avoid Google OAuth blocking in LINE's in-app browser
         separator = "&" if "?" in url else "?"
         external_url = f"{url}{separator}openExternalBrowser=1"
-        lines.extend(["", "詳細はこちら:", external_url])
-    if body_text:
-        lines.extend(["", "--- メール本文 ---", body_text])
+        lines.extend(["", "\u8a73\u7d30\u306f\u3053\u3061\u3089:", shorten_url(external_url)])
     base_message = add_test_prefix("\n".join(lines))
     # Use @all mention to notify all members in the group
     substitution = {
