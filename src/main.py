@@ -13,7 +13,7 @@ from typing import Optional, Set, Tuple
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, request as flask_request, jsonify
-from threading import Thread
+from threading import Thread, RLock
 from datetime import datetime, timedelta
 
 # --- Env Vars (Railway Variables) ---
@@ -29,6 +29,7 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_TO_ID_TEST = os.getenv("LINE_TO_ID_TEST")
 LINE_TO_ID_PROD = os.getenv("LINE_TO_ID_PROD")
 COWORK_WEBHOOK_TOKEN = os.getenv("COWORK_WEBHOOK_TOKEN", "")
+_processed_ids_lock = RLock()  # Thread-safe access to processed_ids
 LOG_DIR = os.getenv("LOG_DIR", "/tmp")
 SLACK_ERROR_WEBHOOK_URL = os.getenv("SLACK_ERROR_WEBHOOK_URL")
 
@@ -697,6 +698,10 @@ def process_mail_by_uid(
     slack_ok = notify_slack_with_retry(source, applicant_name, url, phone=phone, body_text=body_text, location=indeed_location, email=indeed_email, answers=indeed_answers)
     line_ok = notify_line_with_retry(source, applicant_name, url, phone=phone, body_text=body_text, location=indeed_location, email=indeed_email, answers=indeed_answers)
 
+    if not slack_ok:
+        log(f"WARNING: Slack notification failed for {applicant_name} ({unique_id})")
+    if not line_ok:
+        log(f"WARNING: LINE notification failed for {applicant_name} ({unique_id})")
     if not slack_ok and not line_ok:
         log(f"ERROR: All notifications failed for {applicant_name} ({unique_id}), will retry next cycle")
         return None
@@ -871,7 +876,12 @@ flask_app = Flask(__name__)
 
 @flask_app.after_request
 def add_cors(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
+    allowed_origins = {"https://employers.indeed.com", "https://cowork.anthropic.com", "https://claude.ai"}
+    origin = flask_request.headers.get("Origin", "")
+    if origin in allowed_origins:
+        response.headers["Access-Control-Allow-Origin"] = origin
+    else:
+        response.headers["Access-Control-Allow-Origin"] = "https://cowork.anthropic.com"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Cowork-Token"
     response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS, GET"
     return response
@@ -886,16 +896,18 @@ def health_check():
 def notify_line_webhook():
     if flask_request.method == "OPTIONS":
         return "", 204
-    if COWORK_WEBHOOK_TOKEN:
-        if flask_request.headers.get("X-Cowork-Token", "") != COWORK_WEBHOOK_TOKEN:
-            return jsonify({"error": "Unauthorized"}), 401
+    if not COWORK_WEBHOOK_TOKEN:
+        log("ERROR: COWORK_WEBHOOK_TOKEN not configured - rejecting all requests for security")
+        return jsonify({"error": "Service not configured"}), 503
+    if flask_request.headers.get("X-Cowork-Token", "") != COWORK_WEBHOOK_TOKEN:
+        return jsonify({"error": "Unauthorized"}), 401
     data = flask_request.get_json(force=True) or {}
     name    = data.get("name", "")
     phone   = data.get("phone") or None
-    email   = data.get("email") or None
+    email_addr = data.get("email") or None
     address = data.get("address") or None
-    log(f"[webhook] notify-line: name={name}, phone={phone}, email={email}")
-    ok = notify_line_with_retry("indeed", name, "", phone=phone, email=email, location=address)
+    log(f"[webhook] notify-line: name={name}, phone={phone}, email={email_addr}")
+    ok = notify_line_with_retry("indeed", name, "", phone=phone, email=email_addr, location=address)
     return jsonify({"ok": ok})
 
 
