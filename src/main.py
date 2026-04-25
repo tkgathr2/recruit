@@ -681,8 +681,8 @@ def process_mail_by_uid(
             else:
                 log(f"Indeed API returned no details for legacyId={legacy_id} (CTK expired? API error?)")
 
-        # フォールバック: legacyId取得失敗 or API失敗の場合、名前検索で取得試行
-        if not (phone or indeed_location or indeed_email):
+        # フォールバック: phoneがない場合も名前検索で補完（GraphQL APIが電話番号を返さないことがある）
+        if not phone:
             log(f"Trying name-based search for '{applicant_name}'...")
             name_details = fetch_by_name(applicant_name)
             if name_details:
