@@ -451,25 +451,36 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
     if not webhook_url:
         log("No Slack Webhook URL")
         return False
-    title = "【Indeed応募】" if source == "indeed" else "【ジモティー】"
     mention_prefix = "<!channel>\n"
-    lines = [f"{title} 【{name}】 さんから応募がありました。"]
-    if job_title:
-        lines.append(f"求人: {job_title}")
-    if phone:
-        lines.append(f"電話番号: {format_phone_for_slack(phone)}")
-    if location:
-        lines.append(f"住所: {location}")
-    if email_addr:
-        lines.append(f"メール: {email_addr}")
-    if answers:
-        for ans in answers:
-            key = ans.get("questionKey", "")
-            val = ans.get("value")
-            if val and key:
-                lines.append(f"{key}: {val}")
-    if url:
-        lines.extend(["", "応募内容はこちら:", shorten_url(url)])
+    if source == "indeed":
+        lines = ["【Indeed 新着応募】"]
+        lines.append(f"氏名：{name}")
+        if job_title:
+            lines.append(f"求人：{job_title}")
+        lines.append(f"電話：{format_phone_for_slack(phone) if phone else '未登録'}")
+        lines.append(f"住所：{location if location else '未登録'}")
+        if email_addr:
+            lines.append(f"メール：{email_addr}")
+        if url:
+            lines.append(f"URL：{shorten_url(url)}")
+    else:
+        lines = [f"【ジモティー】 【{name}】 さんから応募がありました。"]
+        if job_title:
+            lines.append(f"求人: {job_title}")
+        if phone:
+            lines.append(f"電話番号: {format_phone_for_slack(phone)}")
+        if location:
+            lines.append(f"住所: {location}")
+        if email_addr:
+            lines.append(f"メール: {email_addr}")
+        if answers:
+            for ans in answers:
+                key = ans.get("questionKey", "")
+                val = ans.get("value")
+                if val and key:
+                    lines.append(f"{key}: {val}")
+        if url:
+            lines.extend(["", "応募内容はこちら:", shorten_url(url)])
     message = add_test_prefix(mention_prefix + "\n".join(lines))
     for attempt in range(max_retries):
         try:
@@ -493,28 +504,35 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
     if not LINE_CHANNEL_ACCESS_TOKEN or not line_to_id:
         log("LINE Token or TO ID missing")
         return False
-    title = "Indeedに応募がありました。" if source == "indeed" else "ジモティーで新着があります。"
-    lines = [f"【{name}】 さんから{title}"]
-    if job_title:
-        lines.append(f"求人: {job_title}")
-    if phone:
-        lines.append(f"📞 電話番号: {format_phone_for_line(phone)}")
-    if location:
-        lines.append(f"📍 住所: {location}")
-    if email_addr:
-        lines.append(f"📧 メール: {email_addr}")
-    if answers:
-        for ans in answers:
-            key = ans.get("questionKey", "")
-            val = ans.get("value")
-            if val and key:
-                lines.append(f"📝 {key}: {val}")
-    if url:
-        # Force LINE to open URL in external browser (Chrome/Safari)
-        # to avoid Google OAuth blocking in LINE's in-app browser
-        separator = "&" if "?" in url else "?"
-        external_url = f"{url}{separator}openExternalBrowser=1"
-        lines.extend(["", "詳細はこちら:", shorten_url(external_url)])
+    if source == "indeed":
+        lines = ["【Indeed 新着応募】"]
+        lines.append(f"氏名：{name}")
+        if job_title:
+            lines.append(f"求人：{job_title}")
+        lines.append(f"電話：{format_phone_for_line(phone) if phone else '未登録'}")
+        lines.append(f"住所：{location if location else '未登録'}")
+        if email_addr:
+            lines.append(f"メール：{email_addr}")
+        if url:
+            lines.append(f"URL：{shorten_url(url)}")
+    else:
+        lines = [f"【{name}】 さんからジモティーで新着があります。"]
+        if job_title:
+            lines.append(f"求人: {job_title}")
+        if phone:
+            lines.append(f"📞 電話番号: {format_phone_for_line(phone)}")
+        if location:
+            lines.append(f"📍 住所: {location}")
+        if email_addr:
+            lines.append(f"📧 メール: {email_addr}")
+        if answers:
+            for ans in answers:
+                key = ans.get("questionKey", "")
+                val = ans.get("value")
+                if val and key:
+                    lines.append(f"📝 {key}: {val}")
+        if url:
+            lines.extend(["", "詳細はこちら:", shorten_url(url)])
     base_message = add_test_prefix("\n".join(lines))
     # Use @all mention to notify all members in the group
     substitution = {
