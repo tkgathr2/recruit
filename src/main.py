@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Set, Tuple
 import requests
+from urllib.parse import quote
 from bs4 import BeautifulSoup
 from flask import Flask, request as flask_request, jsonify
 from threading import Thread, RLock
@@ -385,12 +386,12 @@ def shorten_url(url: str) -> str:
     if not url:
         return url
     try:
-        api = "https://tinyurl.com/api-create.php" + "?url=" + requests.utils.quote(url, safe="")
+        api = "https://tinyurl.com/api-create.php" + "?url=" + quote(url, safe="")
         resp = requests.get(api, timeout=5)
         if resp.status_code == 200 and resp.text.strip().startswith("http"):
             return resp.text.strip()
     except Exception:
-        pass
+        log("WARNING: shorten_url failed, using original URL")
     return url
 
 
@@ -452,7 +453,7 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
             if val and key:
                 lines.append(f"{key}: {val}")
     if url:
-        lines.extend(["", "\u5fdc\u52df\u5185\u5bb9\u306f\u3053\u3061\u3089:", shorten_url(url)])
+        lines.extend(["", "応募内容はこちら:", shorten_url(url)])
     message = add_test_prefix(mention_prefix + "\n".join(lines))
     for attempt in range(max_retries):
         try:
@@ -497,7 +498,7 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
         # to avoid Google OAuth blocking in LINE's in-app browser
         separator = "&" if "?" in url else "?"
         external_url = f"{url}{separator}openExternalBrowser=1"
-        lines.extend(["", "\u8a73\u7d30\u306f\u3053\u3061\u3089:", shorten_url(external_url)])
+        lines.extend(["", "詳細はこちら:", shorten_url(external_url)])
     base_message = add_test_prefix("\n".join(lines))
     # Use @all mention to notify all members in the group
     substitution = {
@@ -642,7 +643,6 @@ def process_mail_by_uid(
 
     # 電話番号・本文テキストを抽出
     phone = extract_phone_number(html)
-    body_text = extract_body_text(html)
 
     # Indeed応募の場合: URLからlegacyIdを抽出してAPIで全詳細を取得
     indeed_location: Optional[str] = None
@@ -700,8 +700,8 @@ def process_mail_by_uid(
 
     log(f"Notify {source}: {applicant_name}, phone={phone}, url={url}, id={unique_id}")
 
-    slack_ok = notify_slack_with_retry(source, applicant_name, url, phone=phone, body_text=body_text, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
-    line_ok = notify_line_with_retry(source, applicant_name, url, phone=phone, body_text=body_text, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
+    slack_ok = notify_slack_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
+    line_ok = notify_line_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
 
     if not slack_ok:
         log(f"WARNING: Slack notification failed for {applicant_name} ({unique_id})")
