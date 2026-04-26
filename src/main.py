@@ -692,6 +692,8 @@ def process_mail_by_uid(
                     log(f"Indeed legacyId not found (no valid engage URL)")
 
         if legacy_id:
+            # legacyIdが取得できた場合、管理画面URLを生成（engage URLより安定・短縮URL用）
+            url = f"https://employers.indeed.com/candidates/view?id={legacy_id}"
             details = fetch_all_details(legacy_id)
             if details:
                 phone = details.get("phone") or phone  # APIの方が正確
