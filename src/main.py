@@ -318,6 +318,22 @@ def extract_phone_number(html: str) -> Optional[str]:
     return None
 
 
+def normalize_phone_number(phone: str) -> str:
+    """+81形式を日本国内形式(0XX-XXXX-XXXX)に変換する。""" 
+    if not phone:
+        return phone
+    digits = re.sub(r'[\s\-\(\)]', '', phone)
+    if digits.startswith('+81'):
+        digits = '0' + digits[3:]
+    if re.match(r'^0[789]0\d{8}$', digits):   # 携帯 090/080/070
+        return f"{digits[:3]}-{digits[3:7]}-{digits[7:]}"
+    if re.match(r'^0\d{9}$', digits):           # 固定10桁
+        return f"{digits[:2]}-{digits[2:6]}-{digits[6:]}"
+    if re.match(r'^0120\d{6}$', digits):        # フリーダイヤル
+        return f"{digits[:4]}-{digits[4:7]}-{digits[7:]}"
+    return phone
+
+
 def extract_body_text(html: str, max_chars: int = 500) -> str:
     """メール本文HTMLからプレーンテキストを抽出する（最大max_chars文字）。"""
     if not html:
@@ -698,6 +714,8 @@ def process_mail_by_uid(
             else:
                 log(f"Name-search: no match for '{applicant_name}'")
 
+    if phone:
+        phone = normalize_phone_number(phone)
     log(f"Notify {source}: {applicant_name}, phone={phone}, url={url}, id={unique_id}")
 
     slack_ok = notify_slack_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
