@@ -17,6 +17,11 @@ from flask import Flask, request as flask_request, jsonify
 from threading import Thread, RLock
 from datetime import datetime, timedelta
 
+# --- Startup Protection (GLOBAL STATE) ---
+_startup_time = datetime.now()
+_first_cycle_done = False
+_first_cycle_lock = RLock()  # Protect _first_cycle_done from race conditions
+
 # --- Env Vars (Railway Variables) ---
 GMAIL_IMAP_HOST = os.getenv("GMAIL_IMAP_HOST", "imap.gmail.com")
 GMAIL_IMAP_USER = os.getenv("GMAIL_IMAP_USER")
@@ -780,6 +785,8 @@ def get_gm_msgid_lightweight(mail: imaplib.IMAP4_SSL, uid: str) -> Optional[str]
 def check_mail_with_status() -> bool:
     """Check mailbox for new applications. Returns True if successful, False if quota/error."""
     try:
+        global _first_cycle_done
+
         processed_ids, load_success = load_processed_ids()
 
         # If file exists but is corrupted, skip processing to prevent mass re-notifications
@@ -836,6 +843,27 @@ def check_mail_with_status() -> bool:
 
             if truly_new_uids:
                 total_new = len(truly_new_uids)
+
+                # === STARTUP PROTECTION: Detect restart with lost state ===
+                # 起動直後の安全チェック: processed_ids が空の場合、
+                # 既存メールを "seen" としてサイレントマークする（通知しない）
+                # これにより再起動時の二重通知を防ぐ
+                with _first_cycle_lock:
+                    if not _first_cycle_done and len(processed_ids) == 0 and len(truly_new_uids) > 3:
+                        log(f"STARTUP PROTECTION: processed_ids is empty and {len(truly_new_uids)} 'new' emails found.")
+                        log(f"This likely means a restart with lost state. Silently marking existing emails as processed...")
+                        for uid in truly_new_uids:
+                            uid_str = uid.decode() if isinstance(uid, bytes) else uid
+                            gm_id = get_gm_msgid_lightweight(mail, uid_str)
+                            if gm_id:
+                                processed_ids.add(gm_id)
+                                processed_ids.add(f"uid:{uid_str}")
+                        save_processed_ids(processed_ids)
+                        log(f"STARTUP PROTECTION: Silently marked {len(truly_new_uids)} emails. Next cycle will process only truly new emails.")
+                        _first_cycle_done = True
+                        return True
+                    _first_cycle_done = True
+
                 # QUOTA ERROR対策: 1サイクルで処理するメール数を制限する
                 batch = truly_new_uids[:MAX_EMAILS_PER_CYCLE]
                 if total_new > MAX_EMAILS_PER_CYCLE:
