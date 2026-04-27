@@ -44,7 +44,7 @@ LINE_MENTION_ID_1 = os.getenv("LINE_MENTION_ID_1")
 LINE_MENTION_ID_2 = os.getenv("LINE_MENTION_ID_2")
 
 # --- Polling Interval ---
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))  # デフォルト60秒（Gmail API制限対策）
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "20"))  # デフォルト20秒
 MAX_BACKOFF_SECONDS = int(os.getenv("MAX_BACKOFF_SECONDS", "900"))  # 最大15分のバックオフ
 
 # --- Search window for emails (days) ---
@@ -713,6 +713,11 @@ def process_mail_by_uid(
             # legacyIdが取得できた場合、管理画面URLを生成（engage URLより安定・短縮URL用）
             url = f"https://employers.indeed.com/candidates/view?id={legacy_id}"
             details = fetch_all_details(legacy_id)
+            if not details:
+                # 一時的なAPI障害対策: 3秒後に即リトライ（次サイクル待ちなし）
+                log(f"fetch_all_details empty, retrying in 3s...")
+                time.sleep(3)
+                details = fetch_all_details(legacy_id)
             if details:
                 phone = details.get("phone") or phone  # APIの方が正確
                 indeed_location = details.get("location")
@@ -720,7 +725,7 @@ def process_mail_by_uid(
                 indeed_answers = details.get("answers") or []
                 log(f"Indeed API details: phone={phone}, location={indeed_location}, answers={len(indeed_answers or [])}件")
             else:
-                log(f"Indeed API returned no details for legacyId={legacy_id} (CTK expired? API error?)")
+                log(f"Indeed API returned no details for legacyId={legacy_id} after retry (CTK expired?)")
 
         # フォールバック: phoneがない場合も名前検索で補完（GraphQL APIが電話番号を返さないことがある）
         if not phone:
@@ -736,24 +741,6 @@ def process_mail_by_uid(
 
     if phone:
         phone = normalize_phone_number(phone)
-
-    # Indeed: 連絡先情報が全く取れなかった場合はリトライ（最大2回）して重複送信を防止
-    # これにより「未登録」通知 → 内容あり通知の重複を回避できる
-    if source == "indeed" and not phone and not indeed_location and not indeed_email:
-        retry0 = f"retry0:{unique_id}"
-        retry1 = f"retry1:{unique_id}"
-        if retry0 not in processed_ids:
-            processed_ids.add(retry0)
-            save_processed_ids(processed_ids)
-            log(f"No contact info for {applicant_name}, will retry on next cycle (1/2)")
-            return None
-        elif retry1 not in processed_ids:
-            processed_ids.add(retry1)
-            save_processed_ids(processed_ids)
-            log(f"No contact info for {applicant_name}, will retry on next cycle (2/2)")
-            return None
-        else:
-            log(f"No contact info for {applicant_name} after 2 retries, sending with 未登録")
 
     log(f"Notify {source}: {applicant_name}, phone={phone}, url={url}, id={unique_id}")
 
