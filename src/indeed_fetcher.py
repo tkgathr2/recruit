@@ -17,7 +17,7 @@ INDEED_CTK = os.getenv("INDEED_CTK")
 INDEED_GRAPHQL_ENDPOINT = "https://apis.indeed.com/graphql?co=JP&locale=ja"
 
 
-def fetch_all_details(legacy_id: str, timeout: int = 10) -> Dict[str, Any]:
+def fetch_all_details(legacy_id: str, timeout: int = 5) -> Dict[str, Any]:
     """
     Fetch applicant's full details from Indeed API using legacy_id.
 
@@ -128,7 +128,7 @@ def fetch_all_details(legacy_id: str, timeout: int = 10) -> Dict[str, Any]:
         return {}
 
 
-def fetch_recent_candidates(limit: int = 30, timeout: int = 15) -> list:
+def fetch_recent_candidates(limit: int = 30, timeout: int = 5) -> list:
     """Indeed GraphQL APIから最近の応募者一覧を取得する（legacyId不要）。
 
     engage.indeed.comリダイレクトが使えない場合のフォールバック。
@@ -214,7 +214,7 @@ def fetch_recent_candidates(limit: int = 30, timeout: int = 15) -> list:
         return []
 
 
-def fetch_by_name(name: str, timeout: int = 15) -> Dict[str, Any]:
+def fetch_by_name(name: str, timeout: int = 5) -> Dict[str, Any]:
     """応募者名でIndeed APIを検索して連絡先を取得する。
 
     engage URLリダイレクトが失敗した場合のフォールバック。
@@ -292,7 +292,7 @@ def _extract_id_from_text(text: str) -> Optional[str]:
     return None
 
 
-def resolve_legacy_id_from_tracking_url(url: str, timeout: int = 15) -> Optional[str]:
+def resolve_legacy_id_from_tracking_url(url: str, timeout: int = 5) -> Optional[str]:
     """Follow Indeed email tracking URL redirect to extract legacyId.
 
     Indeed email tracking URLs (engage.indeed.com/f/a/...) redirect to
@@ -347,7 +347,7 @@ def resolve_legacy_id_from_tracking_url(url: str, timeout: int = 15) -> Optional
     # --- Strategy 2: manual hop-by-hop (allow_redirects=False) ---
     try:
         current_url = url
-        for hop in range(5):
+        for hop in range(3):
             resp = requests.get(
                 current_url,
                 allow_redirects=False,
@@ -387,7 +387,7 @@ def resolve_legacy_id_from_tracking_url(url: str, timeout: int = 15) -> Optional
     return None
 
 
-def fetch_applicant_details_safe(legacy_id: str, timeout: int = 10) -> Dict[str, Any]:
+def fetch_applicant_details_safe(legacy_id: str, timeout: int = 5) -> Dict[str, Any]:
     """
     Safely fetch applicant details with graceful error handling.
 
