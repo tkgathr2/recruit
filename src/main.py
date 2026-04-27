@@ -403,7 +403,7 @@ def shorten_url(url: str) -> str:
         return url
     try:
         api = "https://tinyurl.com/api-create.php" + "?url=" + quote(url, safe="")
-        resp = requests.get(api, timeout=5)
+        resp = requests.get(api, timeout=3)
         if resp.status_code == 200 and resp.text.strip().startswith("http"):
             return resp.text.strip()
     except Exception:
@@ -736,6 +736,25 @@ def process_mail_by_uid(
 
     if phone:
         phone = normalize_phone_number(phone)
+
+    # Indeed: 連絡先情報が全く取れなかった場合はリトライ（最大2回）して重複送信を防止
+    # これにより「未登録」通知 → 内容あり通知の重複を回避できる
+    if source == "indeed" and not phone and not indeed_location and not indeed_email:
+        retry0 = f"retry0:{unique_id}"
+        retry1 = f"retry1:{unique_id}"
+        if retry0 not in processed_ids:
+            processed_ids.add(retry0)
+            save_processed_ids(processed_ids)
+            log(f"No contact info for {applicant_name}, will retry on next cycle (1/2)")
+            return None
+        elif retry1 not in processed_ids:
+            processed_ids.add(retry1)
+            save_processed_ids(processed_ids)
+            log(f"No contact info for {applicant_name}, will retry on next cycle (2/2)")
+            return None
+        else:
+            log(f"No contact info for {applicant_name} after 2 retries, sending with 未登録")
+
     log(f"Notify {source}: {applicant_name}, phone={phone}, url={url}, id={unique_id}")
 
     slack_ok = notify_slack_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
