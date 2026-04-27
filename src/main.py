@@ -22,6 +22,10 @@ _startup_time = datetime.now()
 _first_cycle_done = False
 _first_cycle_lock = RLock()  # Protect _first_cycle_done from race conditions
 
+# --- CTK Expiry Notification (GLOBAL STATE) ---
+_ctk_expired_notified = False
+_ctk_expired_notified_lock = RLock()  # Prevent duplicate notifications
+
 # --- Env Vars (Railway Variables) ---
 GMAIL_IMAP_HOST = os.getenv("GMAIL_IMAP_HOST", "imap.gmail.com")
 GMAIL_IMAP_USER = os.getenv("GMAIL_IMAP_USER")
@@ -35,7 +39,9 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_TO_ID_TEST = os.getenv("LINE_TO_ID_TEST")
 LINE_TO_ID_PROD = os.getenv("LINE_TO_ID_PROD")
 COWORK_WEBHOOK_TOKEN = os.getenv("COWORK_WEBHOOK_TOKEN", "")
+
 _processed_ids_lock = RLock()  # Thread-safe access to processed_ids
+
 LOG_DIR = os.getenv("LOG_DIR", "/tmp")
 SLACK_ERROR_WEBHOOK_URL = os.getenv("SLACK_ERROR_WEBHOOK_URL")
 
@@ -58,7 +64,6 @@ SEARCH_DAYS = int(os.getenv("SEARCH_DAYS", "1"))  # デフォルト1日間（Gma
 # --- Batch limit per cycle (QUOTA ERROR対策) ---
 MAX_EMAILS_PER_CYCLE = int(os.getenv("MAX_EMAILS_PER_CYCLE", "10"))  # 1サイクルで処理する最大メール数
 
-
 # --- Logging ---
 def log(msg: str) -> None:
     """Log message to file and stdout."""
@@ -68,24 +73,21 @@ def log(msg: str) -> None:
         f.write(line + "\n")
     print(line, flush=True)
 
-
 def ensure_processed_ids_dir() -> bool:
     """Ensure the directory for processed IDs file exists. Returns True if successful."""
     try:
         parent_dir = Path(PROCESSED_IDS_FILE).parent
         if not parent_dir.exists():
             parent_dir.mkdir(parents=True, exist_ok=True)
-            log(f"Created directory: {parent_dir}")
+        log(f"Created directory: {parent_dir}")
         return True
     except OSError as e:
         log(f"ERROR: Failed to create directory for processed IDs: {e}")
         notify_error_to_slack(f"Failed to create directory for processed IDs: {e}")
         return False
 
-
 def migrate_old_id_format(ids: Set[str]) -> Set[str]:
     """Migrate old ID format (raw numbers) to new format (gm:xxx prefix).
-
     Old format: "12345678901234567890"
     New format: "gm:12345678901234567890" or "mid:<message-id@example.com>"
     """
@@ -106,14 +108,10 @@ def migrate_old_id_format(ids: Set[str]) -> Set[str]:
         log(f"Migrated {migration_count} IDs from old format to new format")
     return migrated
 
-
 def load_processed_ids() -> Tuple[Set[str], bool]:
     """Load processed message IDs from file.
-
-    Returns:
-        Tuple of (processed_ids set, success flag).
-        If file exists but can't be read, returns (empty set, False)
-        to prevent mass re-processing.
+    Returns: Tuple of (processed_ids set, success flag).
+    If file exists but can't be read, returns (empty set, False) to prevent mass re-processing.
     """
     if os.path.exists(PROCESSED_IDS_FILE):
         try:
@@ -136,10 +134,8 @@ def load_processed_ids() -> Tuple[Set[str], bool]:
         log(f"Processed IDs file does not exist: {PROCESSED_IDS_FILE} (first run)")
         return set(), True
 
-
 def save_processed_ids(processed_ids: Set[str]) -> bool:
     """Save processed message IDs to file atomically. Returns True if successful.
-
     Uses tempfile + os.replace() for atomic write to prevent JSON corruption on crash.
     Note: uid: entries are session-only cache and are NOT persisted to disk.
     Only gm: and mid: entries (which provide deduplication correctness) are saved.
@@ -163,6 +159,48 @@ def save_processed_ids(processed_ids: Set[str]) -> bool:
         notify_error_to_slack(f"Failed to save processed IDs: {e}")
         return False
 
+def notify_ctk_expired() -> None:
+    """Indeed CTK 期限切れを LINE と Slack で通知する（1サービス起動中に1度だけ）。"""
+    global _ctk_expired_notified
+    with _ctk_expired_notified_lock:
+        if _ctk_expired_notified:
+            return  # すでに通知済み
+        _ctk_expired_notified = True
+    log("ALERT: Indeed CTK が期限切れです。LINE/Slack に通知します。")
+    message = (
+        "⚠️ Indeed CTK が期限切れです\n\n"
+        "Indeed からの応募者詳細（電話番号・住所）を取得できません。\n"
+        "※ 応募通知自体は届き続けます。\n\n"
+        "【更新手順】\n"
+        "1. Chrome で jp.indeed.com にログイン\n"
+        "2. F12 → Application → Cookies → jp.indeed.com\n"
+        "3. 「CTK」の値をコピー\n"
+        "4. Railway の INDEED_CTK を更新して再デプロイ"
+    )
+    # Slack通知
+    notify_error_to_slack(message)
+    # LINE通知（メッセージのみ、@all メンションなし）
+    line_to_id = get_line_to_id()
+    if LINE_CHANNEL_ACCESS_TOKEN and line_to_id:
+        body = {
+            "to": line_to_id,
+            "messages": [{"type": "text", "text": message}],
+        }
+        headers = {
+            "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        try:
+            resp = requests.post(
+                "https://api.line.me/v2/bot/message/push",
+                json=body,
+                headers=headers,
+                timeout=10,
+            )
+            log(f"CTK期限切れ LINE通知: status={resp.status_code}")
+        except Exception as e:
+            log(f"ERROR: CTK期限切れ LINE通知 失敗: {e}")
+
 
 def notify_error_to_slack(message: str) -> None:
     """重大なエラーを Slack Webhook に通知する"""
@@ -183,12 +221,10 @@ def notify_error_to_slack(message: str) -> None:
         # 通知時のエラーでさらに例外を投げるとループするのでログのみ
         log(f"ERROR: exception while sending error notification to Slack: {e}")
 
-
 # --- MODE management ---
 def is_test_mode() -> bool:
     """Check if running in test mode."""
     return (MODE.lower() if MODE else "prod") == "test"
-
 
 def get_slack_webhook_url() -> Optional[str]:
     """Get Slack Webhook URL based on current mode."""
@@ -197,7 +233,6 @@ def get_slack_webhook_url() -> Optional[str]:
         log(f"WARNING: SLACK_WEBHOOK_URL_{'TEST' if is_test_mode() else 'PROD'} is not set")
     return url
 
-
 def get_line_to_id() -> Optional[str]:
     """Get LINE TO ID based on current mode."""
     to_id = LINE_TO_ID_TEST if is_test_mode() else LINE_TO_ID_PROD
@@ -205,11 +240,9 @@ def get_line_to_id() -> Optional[str]:
         log(f"WARNING: LINE_TO_ID_{'TEST' if is_test_mode() else 'PROD'} is not set")
     return to_id
 
-
 def add_test_prefix(message: str) -> str:
     """Add test version prefix if in test mode."""
     return f"【テストバージョン】\n{message}" if is_test_mode() else message
-
 
 # --- Email Parsing ---
 def decode_header_value(value: Optional[str]) -> str:
@@ -222,7 +255,6 @@ def decode_header_value(value: Optional[str]) -> str:
         for text, enc in parts
     )
 
-
 def extract_name(from_header: Optional[str]) -> str:
     """Extract applicant name from From header."""
     if not from_header:
@@ -231,7 +263,6 @@ def extract_name(from_header: Optional[str]) -> str:
         return from_header.split("<")[0].replace('"', "").strip()
     except (IndexError, AttributeError):
         return from_header
-
 
 def extract_html(msg: email.message.Message) -> str:
     """Extract HTML content from email message."""
@@ -249,7 +280,6 @@ def extract_html(msg: email.message.Message) -> str:
             return payload.decode(charset, errors="replace")
     return ""
 
-
 def extract_indeed_url(html: str) -> str:
     """Extract application URL from Indeed email HTML."""
     if not html:
@@ -264,14 +294,12 @@ def extract_indeed_url(html: str) -> str:
             return href
     return ""
 
-
 def extract_indeed_legacy_id(html: str) -> Optional[str]:
     """Indeed通知メールのHTMLからlegacyId（hex）を抽出する。
-
     Indeed通知メールには以下のURLパターンが含まれる:
     - https://employers.indeed.com/candidates/view?id=<legacyId>
-    - https://engage.indeed.com/f/a/<legacyId>~~/...  (旧形式: hex)
-    - https://engage.indeed.com/f/a/<base64url>~~...  (新形式: base64url 22文字)
+    - https://engage.indeed.com/f/a/<legacyId>~~/... (旧形式: hex)
+    - https://engage.indeed.com/f/a/<base64url>~~... (新形式: base64url 22文字)
     legacyId は hex文字列（8〜20桁）。
     """
     if not html:
@@ -290,10 +318,8 @@ def extract_indeed_legacy_id(html: str) -> Optional[str]:
         return any_id.group(1)
     return None
 
-
 def extract_indeed_engage_urls(html: str) -> list:
     """Indeed通知メールのHTMLからengage.indeed.comトラッキングURLを全て抽出する。
-
     新形式(base64url)・旧形式(hex)問わず engage.indeed.com/f/a/ URLを返す。
     これらURLはリダイレクトをたどると employers.indeed.com/candidates/view?id=<hex> に到達する。
     """
@@ -303,7 +329,6 @@ def extract_indeed_engage_urls(html: str) -> list:
     matches = re.findall(r'(https://engage\.indeed\.com/f/a/[A-Za-z0-9_\-]{10,}~~[^\s"\'<>]*)', html)
     return list(dict.fromkeys(matches))  # 重複除去（順序保持）
 
-
 def extract_phone_number(html: str) -> Optional[str]:
     """メール本文HTMLから電話番号を抽出する。"""
     if not html:
@@ -312,9 +337,9 @@ def extract_phone_number(html: str) -> Optional[str]:
     text = soup.get_text(separator="\n")
     # 日本の電話番号パターン（携帯・固定・フリーダイヤル）
     patterns = [
-        r'0[789]0[-\s]?\d{4}[-\s]?\d{4}',   # 携帯: 090/080/070
-        r'0\d{1,4}[-\s]?\d{1,4}[-\s]?\d{4}', # 固定: 03-xxxx-xxxx 等
-        r'0120[-\s]?\d{3}[-\s]?\d{3}',        # フリーダイヤル
+        r'0[789]0[-\s]?\d{4}[-\s]?\d{4}',  # 携帯: 090/080/070
+        r'0\d{1,4}[-\s]?\d{1,4}[-\s]?\d{4}',  # 固定: 03-xxxx-xxxx 等
+        r'0120[-\s]?\d{3}[-\s]?\d{3}',  # フリーダイヤル
     ]
     for pattern in patterns:
         match = re.search(pattern, text)
@@ -322,22 +347,20 @@ def extract_phone_number(html: str) -> Optional[str]:
             return match.group(0).strip()
     return None
 
-
 def normalize_phone_number(phone: str) -> str:
-    """+81形式を日本国内形式(0XX-XXXX-XXXX)に変換する。""" 
+    """+81形式を日本国内形式(0XX-XXXX-XXXX)に変換する。"""
     if not phone:
         return phone
     digits = re.sub(r'[\s\-\(\)]', '', phone)
     if digits.startswith('+81'):
         digits = '0' + digits[3:]
-    if re.match(r'^0[789]0\d{8}$', digits):   # 携帯 090/080/070
+    if re.match(r'^0[789]0\d{8}$', digits):  # 携帯 090/080/070
         return f"{digits[:3]}-{digits[3:7]}-{digits[7:]}"
-    if re.match(r'^0\d{9}$', digits):           # 固定10桁
+    if re.match(r'^0\d{9}$', digits):  # 固定10桁
         return f"{digits[:2]}-{digits[2:6]}-{digits[6:]}"
-    if re.match(r'^0120\d{6}$', digits):        # フリーダイヤル
+    if re.match(r'^0120\d{6}$', digits):  # フリーダイヤル
         return f"{digits[:4]}-{digits[4:7]}-{digits[7:]}"
     return phone
-
 
 def extract_body_text(html: str, max_chars: int = 500) -> str:
     """メール本文HTMLからプレーンテキストを抽出する（最大max_chars文字）。"""
@@ -355,10 +378,8 @@ def extract_body_text(html: str, max_chars: int = 500) -> str:
         result = result[:max_chars] + "…"
     return result
 
-
 def format_phone_for_slack(phone: str) -> str:
     """Format phone number as a Slack tel: link.
-
     Converts '+81 80 2478 7813' → '<tel:+818024787813|080-2478-7813>'
     so it becomes a tappable link in Slack mobile.
     """
@@ -381,10 +402,8 @@ def format_phone_for_slack(phone: str) -> str:
         display = phone
     return f"<tel:{tel_uri}|{display}>"
 
-
 def format_phone_for_line(phone: str) -> str:
     """Format phone number for LINE tap-to-call.
-
     Converts '+81 80 2478 7813' → '080-2478-7813'
     LINE automatically turns hyphen-formatted Japanese numbers into tappable links.
     """
@@ -415,13 +434,10 @@ def shorten_url(url: str) -> str:
         log("WARNING: shorten_url failed, using original URL")
     return url
 
-
 def extract_applicant_name_from_html(html: str) -> Optional[str]:
     """IndeedメールのHTML本文から応募者名を抽出する。
-
     Indeedのメールはfrom_headerが「Indeed <noreply@indeed.com>」のため
     ヘッダーからは応募者名を取得できない。代わりにメール本文HTMLから取得する。
-
     試みるパターン:
     1. 「○○さんからの応募」「○○ さんが応募しました」等のテキスト
     2. 件名「新しい応募者のお知らせ: ○○」のパターン
@@ -431,13 +447,12 @@ def extract_applicant_name_from_html(html: str) -> Optional[str]:
         return None
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(separator="\n")
-
     # パターン1: 「○○さんからの応募」「○○さんが応募しました」
     for pattern in [
-        r"([^\s　\n]+(?:\s[^\s　\n]+)?)\s*さん(?:から(?:の)?応募|が応募)",
+        r"([^\s \n]+(?:\s[^\s \n]+)?)\s*さん(?:から(?:の)?応募|が応募)",
         r"新しい応募者(?:のお知らせ)?[:：]\s*([^\n\r]+)",
         r"応募者(?:名)?[:：]\s*([^\n\r]+)",
-        r"([^\s　\n]{1,20})\s*(?:様|さん)(?:\s|$|が|から|の)",
+        r"([^\s \n]{1,20})\s*(?:様|さん)(?:\s|$|が|から|の)",
     ]:
         match = re.search(pattern, text)
         if match:
@@ -445,12 +460,21 @@ def extract_applicant_name_from_html(html: str) -> Optional[str]:
             # 明らかに名前ではないものを除外（URLや長すぎる文字列）
             if name and len(name) <= 30 and "http" not in name and "@" not in name:
                 return name
-
     return None
 
-
 # --- Notification Functions ---
-def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optional[str] = None, phone: Optional[str] = None, body_text: Optional[str] = None, max_retries: int = 3, location: Optional[str] = None, email_addr: Optional[str] = None, answers: Optional[list] = None) -> bool:
+def notify_slack_with_retry(
+    source: str,
+    name: str,
+    url: str,
+    job_title: Optional[str] = None,
+    phone: Optional[str] = None,
+    body_text: Optional[str] = None,
+    max_retries: int = 3,
+    location: Optional[str] = None,
+    email_addr: Optional[str] = None,
+    answers: Optional[list] = None,
+) -> bool:
     """Send notification to Slack with retry logic. Returns True if successful."""
     webhook_url = get_slack_webhook_url()
     if not webhook_url:
@@ -502,8 +526,18 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
     notify_error_to_slack(f"Slack notify failed after {max_retries} attempts for {name}")
     return False
 
-
-def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional[str] = None, phone: Optional[str] = None, body_text: Optional[str] = None, max_retries: int = 3, location: Optional[str] = None, email_addr: Optional[str] = None, answers: Optional[list] = None) -> bool:
+def notify_line_with_retry(
+    source: str,
+    name: str,
+    url: str,
+    job_title: Optional[str] = None,
+    phone: Optional[str] = None,
+    body_text: Optional[str] = None,
+    max_retries: int = 3,
+    location: Optional[str] = None,
+    email_addr: Optional[str] = None,
+    answers: Optional[list] = None,
+) -> bool:
     """Send notification to LINE with retry logic. Returns True if successful."""
     line_to_id = get_line_to_id()
     if not LINE_CHANNEL_ACCESS_TOKEN or not line_to_id:
@@ -571,7 +605,6 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
     notify_error_to_slack(f"LINE notify failed after {max_retries} attempts for {name}")
     return False
 
-
 # --- IMAP Connection ---
 @contextmanager
 def imap_connection():
@@ -591,7 +624,6 @@ def imap_connection():
         except Exception:
             pass
 
-
 # --- Mail Processing ---
 def parse_fetch_response(data: list) -> Tuple[Optional[str], Optional[bytes]]:
     """Parse IMAP fetch response to extract X-GM-MSGID and body."""
@@ -609,7 +641,6 @@ def parse_fetch_response(data: list) -> Tuple[Optional[str], Optional[bytes]]:
                 body_data = item[1]
     return gm_msgid, body_data
 
-
 def determine_source(subject: str) -> Tuple[Optional[str], Optional[str]]:
     """Determine email source and default URL based on subject."""
     if "新しい応募者のお知らせ" in subject:
@@ -617,7 +648,6 @@ def determine_source(subject: str) -> Tuple[Optional[str], Optional[str]]:
     elif "ジモティー" in subject:
         return "jimoty", "https://jmty.jp/web_mail/posts"
     return None, None
-
 
 def get_unique_id(gm_msgid: Optional[str], msg: email.message.Message) -> Optional[str]:
     """Get unique identifier for email. Prefers X-GM-MSGID, falls back to Message-ID."""
@@ -628,49 +658,37 @@ def get_unique_id(gm_msgid: Optional[str], msg: email.message.Message) -> Option
         return f"mid:{message_id}"
     return None
 
-
 def process_mail_by_uid(
-    mail: imaplib.IMAP4_SSL,
-    uid: bytes,
-    processed_ids: Set[str]
+    mail: imaplib.IMAP4_SSL, uid: bytes, processed_ids: Set[str]
 ) -> Optional[str]:
     """Process a single mail by UID. Returns unique ID if processed, None otherwise."""
     uid_str = uid.decode() if isinstance(uid, bytes) else uid
-
     # Use UID FETCH instead of regular FETCH
     status, data = mail.uid("fetch", uid_str, "(X-GM-MSGID BODY.PEEK[])")
     if status != "OK":
         log(f"ERROR: Failed to fetch uid={uid_str}, status={status}")
         return None
-
     gm_msgid, body_data = parse_fetch_response(data)
     if not body_data:
         log(f"ERROR: Failed to fetch body for uid={uid_str}")
         return None
-
     msg = email.message_from_bytes(body_data)
-
     # Get unique identifier (X-GM-MSGID or Message-ID)
     unique_id = get_unique_id(gm_msgid, msg)
     if not unique_id:
         log(f"ERROR: No unique ID found for uid={uid_str}, skipping to prevent duplicates")
         return None
-
     # Double-check with X-GM-MSGID/Message-ID (in case UID tracking missed it)
     if unique_id in processed_ids:
         return None  # Already processed, skip silently
-
     subject = decode_header_value(msg.get("Subject", ""))
     from_header = decode_header_value(msg.get("From", ""))
-
     source, default_url = determine_source(subject)
     if not source:
         log(f"Skip non-target mail: {subject[:50]}...")
         return unique_id  # Mark as processed to avoid re-checking
-
     html = extract_html(msg)
     url = extract_indeed_url(html) if source == "indeed" else default_url
-
     # IndeedメールはFrom=「Indeed <noreply@indeed.com>」なので
     # メール本文HTMLから応募者名を取得する。取れなければFromヘッダーの名前を使う。
     if source == "indeed":
@@ -679,10 +697,8 @@ def process_mail_by_uid(
             applicant_name = extract_name(from_header)
     else:
         applicant_name = extract_name(from_header)
-
     # 電話番号・本文テキストを抽出
     phone = extract_phone_number(html)
-
     # Indeed応募の場合: URLからlegacyIdを抽出してAPIで全詳細を取得
     indeed_location: Optional[str] = None
     indeed_email: Optional[str] = None
@@ -709,11 +725,8 @@ def process_mail_by_uid(
                     legacy_id = resolve_legacy_id_from_tracking_url(url)
                     if legacy_id:
                         log(f"Indeed legacyId resolved via fallback URL redirect: {legacy_id}")
-                    else:
-                        log("Indeed legacyId not found via any tracking URL")
                 else:
                     log(f"Indeed legacyId not found (no valid engage URL)")
-
         if legacy_id:
             # legacyIdが取得できた場合、管理画面URLを生成（engage URLより安定・短縮URL用）
             url = f"https://employers.indeed.com/candidates/view?id={legacy_id}"
@@ -731,27 +744,29 @@ def process_mail_by_uid(
                 log(f"Indeed API details: phone={phone}, location={indeed_location}, answers={len(indeed_answers or [])}件")
             else:
                 log(f"Indeed API returned no details for legacyId={legacy_id} after retry (CTK expired?)")
-
-        # フォールバック: phoneがない場合も名前検索で補完（GraphQL APIが電話番号を返さないことがある）
-        if not phone:
-            log(f"Trying name-based search for '{applicant_name}'...")
-            name_details = fetch_by_name(applicant_name)
-            if name_details:
-                phone = name_details.get("phone") or phone
-                indeed_location = name_details.get("location") or indeed_location
-                indeed_email = name_details.get("email") or indeed_email
-                log(f"Name-search details: phone={phone}, location={indeed_location}, email={indeed_email}")
-            else:
-                log(f"Name-search: no match for '{applicant_name}'")
-
+                # CTK期限切れ検知 → LINE/Slack で通知（1回のみ）
+                try:
+                    from indeed_fetcher import is_ctk_expired
+                    if is_ctk_expired():
+                        notify_ctk_expired()
+                except ImportError:
+                    pass
+            # フォールバック: phoneがない場合も名前検索で補完（GraphQL APIが電話番号を返さないことがある）
+            if not phone:
+                log(f"Trying name-based search for '{applicant_name}'...")
+                name_details = fetch_by_name(applicant_name)
+                if name_details:
+                    phone = name_details.get("phone") or phone
+                    indeed_location = name_details.get("location") or indeed_location
+                    indeed_email = name_details.get("email") or indeed_email
+                    log(f"Name-search details: phone={phone}, location={indeed_location}, email={indeed_email}")
+                else:
+                    log(f"Name-search: no match for '{applicant_name}'")
     if phone:
         phone = normalize_phone_number(phone)
-
     log(f"Notify {source}: {applicant_name}, phone={phone}, url={url}, id={unique_id}")
-
     slack_ok = notify_slack_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
     line_ok = notify_line_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
-
     if not slack_ok:
         log(f"WARNING: Slack notification failed for {applicant_name} ({unique_id})")
     if not line_ok:
@@ -759,9 +774,7 @@ def process_mail_by_uid(
     if not slack_ok and not line_ok:
         log(f"ERROR: All notifications failed for {applicant_name} ({unique_id}), will retry next cycle")
         return None
-
     return unique_id
-
 
 def get_gm_msgid_lightweight(mail: imaplib.IMAP4_SSL, uid: str) -> Optional[str]:
     """Fetch only X-GM-MSGID for a single email (lightweight, no body)."""
@@ -781,22 +794,18 @@ def get_gm_msgid_lightweight(mail: imaplib.IMAP4_SSL, uid: str) -> Optional[str]
             return f"gm:{match.group(1)}"
     return None
 
-
 def check_mail_with_status() -> bool:
     """Check mailbox for new applications. Returns True if successful, False if quota/error."""
     try:
         global _first_cycle_done
 
         processed_ids, load_success = load_processed_ids()
-
         # If file exists but is corrupted, skip processing to prevent mass re-notifications
         if not load_success:
             log("ERROR: Skipping mail check due to corrupted processed IDs file")
             return True  # Not a quota error, don't backoff
-
         with imap_connection() as mail:
             since_date = (datetime.now() - timedelta(days=SEARCH_DAYS)).strftime("%d-%b-%Y")
-
             # Use UID SEARCH for stable identifiers
             status, data = mail.uid("search", None, "SINCE", since_date)
             if status != "OK" or not data or not data[0]:
@@ -804,24 +813,19 @@ def check_mail_with_status() -> bool:
                 return True  # Not a quota error
             uid_list = data[0].split()
             log(f"Emails in last {SEARCH_DAYS} days: {len(uid_list)}")
-
             # Phase 1: Quick filter by UID (for emails we've seen before)
             uids_to_check = []
             for uid in uid_list:
                 uid_str = uid.decode() if isinstance(uid, bytes) else uid
                 if f"uid:{uid_str}" not in processed_ids:
                     uids_to_check.append(uid)
-
             if not uids_to_check:
                 return True  # All emails already processed
-
             log(f"UIDs not in cache: {len(uids_to_check)}")
-
             # Phase 2: Lightweight check - fetch only X-GM-MSGID to filter by gm: prefix
             # This avoids full FETCH for emails that are already processed but missing uid: entry
             truly_new_uids = []
             uids_to_mark = []  # UIDs that are already processed but need uid: entry added
-
             for uid in uids_to_check:
                 uid_str = uid.decode() if isinstance(uid, bytes) else uid
                 gm_id = get_gm_msgid_lightweight(mail, uid_str)
@@ -831,7 +835,6 @@ def check_mail_with_status() -> bool:
                 else:
                     # Truly new email, needs full processing
                     truly_new_uids.append(uid)
-
             # Add uid: entries for already-processed emails (bootstrap)
             if uids_to_mark:
                 log(f"Bootstrapping {len(uids_to_mark)} UIDs for already-processed emails")
@@ -845,13 +848,14 @@ def check_mail_with_status() -> bool:
                 total_new = len(truly_new_uids)
 
                 # === STARTUP PROTECTION: Detect restart with lost state ===
-                # 起動直後の安全チェック: processed_ids が空の場合、
+                # 起動直後の安全チェック: processed_ids が空 or 少ない場合、
                 # 既存メールを "seen" としてサイレントマークする（通知しない）
                 # これにより再起動時の二重通知を防ぐ
                 with _first_cycle_lock:
                     if not _first_cycle_done and len(processed_ids) == 0 and len(truly_new_uids) > 3:
                         log(f"STARTUP PROTECTION: processed_ids is empty and {len(truly_new_uids)} 'new' emails found.")
                         log(f"This likely means a restart with lost state. Silently marking existing emails as processed...")
+                        # 全件を軽量取得してgm:IDのみ記録（通知なし）
                         for uid in truly_new_uids:
                             uid_str = uid.decode() if isinstance(uid, bytes) else uid
                             gm_id = get_gm_msgid_lightweight(mail, uid_str)
@@ -870,7 +874,6 @@ def check_mail_with_status() -> bool:
                     log(f"Truly new emails to process: {total_new} (processing {MAX_EMAILS_PER_CYCLE} this cycle, {total_new - MAX_EMAILS_PER_CYCLE} deferred)")
                 else:
                     log(f"Truly new emails to process: {total_new}")
-
                 # Phase 3: Full processing for truly new emails only (batch limited)
                 for uid in batch:
                     uid_str = uid.decode() if isinstance(uid, bytes) else uid
@@ -884,9 +887,7 @@ def check_mail_with_status() -> bool:
                             # If save fails, stop processing to prevent more potential duplicates
                             log("ERROR: Stopping mail processing due to save failure")
                             return True  # Not a quota error
-
-        return True  # Success
-
+            return True  # Success
     except imaplib.IMAP4.abort as e:
         error_msg = str(e)
         if "OVERQUOTA" in error_msg:
@@ -906,7 +907,6 @@ def check_mail_with_status() -> bool:
         notify_error_to_slack(f"Gmail polling error: {e}")
         return True  # Non-quota error, don't backoff excessively
 
-
 def verify_storage() -> bool:
     """Verify that storage is working correctly at startup."""
     log(f"=== Storage Verification ===")
@@ -914,7 +914,6 @@ def verify_storage() -> bool:
     parent_dir = Path(PROCESSED_IDS_FILE).parent
     log(f"Parent directory: {parent_dir}")
     log(f"Parent directory exists: {parent_dir.exists()}")
-
     if parent_dir.exists():
         try:
             # Try to list directory contents
@@ -922,12 +921,10 @@ def verify_storage() -> bool:
             log(f"Directory contents: {[str(f) for f in contents]}")
         except OSError as e:
             log(f"ERROR: Cannot list directory: {e}")
-
     # Ensure directory exists
     if not ensure_processed_ids_dir():
         log("ERROR: Failed to ensure storage directory exists")
         return False
-
     # Test write
     test_file = parent_dir / ".write_test"
     try:
@@ -938,21 +935,17 @@ def verify_storage() -> bool:
         log(f"ERROR: Storage write test FAILED: {e}")
         notify_error_to_slack(f"Storage write test failed: {e}")
         return False
-
     # Load existing processed IDs
     processed_ids, load_success = load_processed_ids()
     if not load_success:
         log("ERROR: Processed IDs file is corrupted")
         return False
-
     log(f"Currently tracking {len(processed_ids)} processed emails")
     log(f"=== Storage Verification Complete ===")
     return True
 
-
-# --- Flask Webhook Server (Cowork LINE�() ---
+# --- Flask Webhook Server (Cowork LINE compatible) ---
 flask_app = Flask(__name__)
-
 
 @flask_app.after_request
 def add_cors(response):
@@ -960,15 +953,13 @@ def add_cors(response):
     origin = flask_request.headers.get("Origin", "")
     if origin in allowed_origins:
         response.headers["Access-Control-Allow-Origin"] = origin
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Cowork-Token"
-    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS, GET"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Cowork-Token"
+        response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS, GET"
     return response
-
 
 @flask_app.route("/health", methods=["GET"])
 def health_check():
     return jsonify({"status": "ok"})
-
 
 @flask_app.route("/notify-line", methods=["POST", "OPTIONS"])
 def notify_line_webhook():
@@ -980,20 +971,18 @@ def notify_line_webhook():
     if flask_request.headers.get("X-Cowork-Token", "") != COWORK_WEBHOOK_TOKEN:
         return jsonify({"error": "Unauthorized"}), 401
     data = flask_request.get_json(force=True) or {}
-    name    = data.get("name", "")
-    phone   = data.get("phone") or None
+    name = data.get("name", "")
+    phone = data.get("phone") or None
     email_addr = data.get("email") or None
     address = data.get("address") or None
     log(f"[webhook] notify-line: name={name}, phone={phone}, email={email_addr}")
     ok = notify_line_with_retry("indeed", name, "", phone=phone, email_addr=email_addr, location=address)
     return jsonify({"ok": ok})
 
-
 def run_flask_server() -> None:
     port = int(os.getenv("PORT", "8080"))
     log(f"Starting Flask webhook server on port {port}")
     flask_app.run(host="0.0.0.0", port=port, use_reloader=False)
-
 
 # --- Main loop ---
 def main() -> None:
@@ -1001,16 +990,13 @@ def main() -> None:
     # Start Flask webhook server in background thread
     flask_thread = Thread(target=run_flask_server, daemon=True)
     flask_thread.start()
-
     log(f"Starting Gmail polling with POLL_INTERVAL_SECONDS={POLL_INTERVAL_SECONDS}")
     log(f"MODE={MODE}, SEARCH_DAYS={SEARCH_DAYS}, MAX_BACKOFF_SECONDS={MAX_BACKOFF_SECONDS}, MAX_EMAILS_PER_CYCLE={MAX_EMAILS_PER_CYCLE}")
-
     # Verify storage is working
     if not verify_storage():
         log("CRITICAL: Storage verification failed. Exiting to prevent duplicate notifications.")
         notify_error_to_slack("CRITICAL: Storage verification failed at startup. Service stopped.")
         return
-
     consecutive_errors = 0
     quota_notified = False
     while True:
@@ -1035,7 +1021,6 @@ def main() -> None:
             consecutive_errors += 1
             backoff = min(POLL_INTERVAL_SECONDS * (2 ** consecutive_errors), MAX_BACKOFF_SECONDS)
             time.sleep(backoff)
-
 
 if __name__ == "__main__":
     main()
