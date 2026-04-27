@@ -1142,6 +1142,41 @@ def update_ctk_endpoint():
     log("CTK flags reset. System will resume normal operation on next poll.")
     return _CTK_UPDATE_SUCCESS_HTML
 
+@flask_app.route("/send-setup-msg", methods=["GET"])
+def send_setup_msg():
+    """LINEグループにCTKセットアップURLを送信する（初回設定用・GET呼び出し可）。"""
+    token = flask_request.args.get("token", "")
+    if not COWORK_WEBHOOK_TOKEN or token != COWORK_WEBHOOK_TOKEN:
+        return "Unauthorized", 401
+    setup_url = f"{RAILWAY_SERVICE_URL}/update-ctk-setup?token={COWORK_WEBHOOK_TOKEN}"
+    msg = (
+        "【CTK更新 初回設定のお願い】\n\n"
+        "IndeedのCTKが期限切れになったとき、\n"
+        "ワンタップで更新できるブックマークレットを設定してください。\n\n"
+        "① 下のURLをChromeで開く\n"
+        "② 表示された手順に従ってブックマークを追加\n"
+        "③ 次回CTK切れ通知が来たらブックマークをタップするだけ\n\n"
+        f"{setup_url}"
+    )
+    line_to_id = LINE_TO_ID_PROD if MODE == "prod" else LINE_TO_ID_TEST
+    if not line_to_id or not LINE_CHANNEL_ACCESS_TOKEN:
+        return "LINE not configured", 500
+    try:
+        resp = requests.post(
+            "https://api.line.me/v2/bot/message/push",
+            json={"to": line_to_id, "messages": [{"type": "text", "text": msg}]},
+            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"},
+            timeout=10,
+        )
+        log(f"[send-setup-msg] LINE status={resp.status_code}")
+        if resp.status_code < 400:
+            return "✅ LINEに送信しました", 200
+        return f"LINE API error: {resp.status_code} {resp.text}", 500
+    except Exception as e:
+        log(f"[send-setup-msg] error: {e}")
+        return f"Error: {e}", 500
+
+
 @flask_app.route("/notify-line", methods=["POST", "OPTIONS"])
 def notify_line_webhook():
     if flask_request.method == "OPTIONS":
