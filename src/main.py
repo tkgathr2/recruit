@@ -170,18 +170,17 @@ def notify_ctk_expired() -> None:
             return  # すでに通知済み
         _ctk_expired_notified = True
     log("ALERT: Indeed CTK が期限切れです。LINE/Slack に通知します。")
-    update_url = f"{RAILWAY_SERVICE_URL}/update-ctk?token={COWORK_WEBHOOK_TOKEN}"
+    setup_url = f"{RAILWAY_SERVICE_URL}/update-ctk-setup?token={COWORK_WEBHOOK_TOKEN}"
     message = (
         "⚠️ Indeed CTK が期限切れです\n\n"
-        "Indeed からの応募者詳細（電話番号・住所）を取得できません。\n"
+        "電話番号・住所の取得ができません。\n"
         "※ 応募通知自体は届き続けます。\n\n"
-        "【👇 CTK更新フォーム（タップで開く）】\n"
-        f"{update_url}\n\n"
-        "【手順】\n"
-        "1. Chrome で jp.indeed.com にログイン\n"
-        "2. F12 → Application → Cookies → jp.indeed.com\n"
-        "3. 「CTK」の値をコピー\n"
-        "4. 上のURLを開いて貼り付け → 送信"
+        "【ワンタップ更新手順】\n"
+        "① Chrome で jp.indeed.com を開く\n"
+        "② お気に入り →「CTK更新」をタップ\n"
+        "③ 完了！\n\n"
+        "※ まだ設定していない場合は👇\n"
+        f"{setup_url}"
     )
     # Slack通知
     notify_error_to_slack(message)
@@ -1033,6 +1032,85 @@ _CTK_UPDATE_SUCCESS_HTML = """<!DOCTYPE html>
   <p>Indeed APIの認証が再開されました。<br>次回の応募通知から電話番号・住所が届きます。</p>
 </body>
 </html>"""
+
+@flask_app.route("/update-ctk-setup", methods=["GET"])
+def update_ctk_setup():
+    """ブックマークレット設定ページ。ワンタップCTK更新の初回セットアップ用。"""
+    token = flask_request.args.get("token", "")
+    if not COWORK_WEBHOOK_TOKEN or token != COWORK_WEBHOOK_TOKEN:
+        return "Unauthorized", 401
+    # ブックマークレットJS（jp.indeed.comのCTKを自動読み取りしてPOST送信）
+    post_url = f"{RAILWAY_SERVICE_URL}/update-ctk?token={COWORK_WEBHOOK_TOKEN}"
+    bookmarklet_js = (
+        "javascript:(function(){{"
+        "var c=document.cookie.split(';').map(function(x){{return x.trim()}}).find(function(x){{return x.startsWith('CTK=')}});"
+        "if(!c){{alert('CTKが見つかりません。jp.indeed.comにログインしてください。');return;}}"
+        "var v=c.slice(4);"
+        "var f=document.createElement('form');"
+        "f.method='POST';"
+        "f.action='{url}';"
+        "var i=document.createElement('input');"
+        "i.type='hidden';i.name='ctk';i.value=v;"
+        "f.appendChild(i);document.body.appendChild(f);f.submit();"
+        "}})();"
+    ).format(url=post_url)
+    html = f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <title>CTK更新 ワンタップ設定</title>
+  <style>
+    *{{box-sizing:border-box;}}
+    body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:20px;max-width:540px;margin:0 auto;background:#f8f9fa;color:#222;}}
+    h1{{font-size:21px;margin-bottom:4px;}}
+    .sub{{color:#666;font-size:14px;margin-bottom:24px;}}
+    .step{{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:16px 18px;margin-bottom:14px;}}
+    .step-num{{display:inline-block;background:#2563eb;color:#fff;border-radius:50%;width:26px;height:26px;text-align:center;line-height:26px;font-size:13px;font-weight:bold;margin-right:8px;}}
+    .step-title{{font-size:16px;font-weight:bold;}}
+    .step-body{{color:#555;font-size:14px;margin-top:8px;line-height:1.7;}}
+    .bm-link{{display:block;background:#f59e0b;color:#fff;text-align:center;padding:14px;border-radius:10px;font-size:17px;font-weight:bold;text-decoration:none;margin-top:10px;}}
+    .bm-link:active{{background:#d97706;}}
+    .after{{background:#dcfce7;border:1px solid #86efac;border-radius:12px;padding:16px 18px;margin-top:6px;}}
+    .after-title{{font-size:15px;font-weight:bold;color:#16a34a;}}
+    .after-body{{color:#166534;font-size:14px;margin-top:6px;line-height:1.7;}}
+    .note{{font-size:12px;color:#9ca3af;margin-top:20px;text-align:center;}}
+  </style>
+</head>
+<body>
+  <h1>⚡ CTK更新 ワンタップ設定</h1>
+  <p class="sub">一度設定すれば、次回からボタン1つでCTKを更新できます。</p>
+
+  <div class="step">
+    <span class="step-num">1</span><span class="step-title">ブックマークレットを保存する</span>
+    <div class="step-body">
+      下のボタンを<b>長押し（または右クリック）→「リンクをブックマークに追加」</b>で保存してください。<br>
+      名前は <b>「CTK更新」</b> にしておくと便利です。
+      <a class="bm-link" href="{bookmarklet_js}">⭐ CTK更新（ブックマーク用ボタン）</a>
+    </div>
+  </div>
+
+  <div class="step">
+    <span class="step-num">2</span><span class="step-title">CTKが切れたら…</span>
+    <div class="step-body">
+      ① Chromeで <b>jp.indeed.com</b> を開く（ログイン済みであればOK）<br>
+      ② ブラウザの <b>☆ お気に入り → 「CTK更新」</b> をタップ<br>
+      ③ 自動で更新完了！
+    </div>
+  </div>
+
+  <div class="after">
+    <div class="after-title">✅ 設定完了後の手順はこれだけ</div>
+    <div class="after-body">
+      jp.indeed.com を開く → お気に入りから「CTK更新」をタップ → 完了
+    </div>
+  </div>
+
+  <p class="note">このページのURLは保管してください。次回のセットアップ時に必要です。</p>
+</body>
+</html>"""
+    return html
+
 
 @flask_app.route("/update-ctk", methods=["GET", "POST"])
 def update_ctk_endpoint():
