@@ -40,6 +40,9 @@ LINE_TO_ID_TEST = os.getenv("LINE_TO_ID_TEST")
 LINE_TO_ID_PROD = os.getenv("LINE_TO_ID_PROD")
 COWORK_WEBHOOK_TOKEN = os.getenv("COWORK_WEBHOOK_TOKEN", "")
 
+# CTK更新フォームのベースURL（Railway のサービスURL）
+RAILWAY_SERVICE_URL = os.getenv("RAILWAY_SERVICE_URL", "https://recruit-production-f2dc.up.railway.app")
+
 _processed_ids_lock = RLock()  # Thread-safe access to processed_ids
 
 LOG_DIR = os.getenv("LOG_DIR", "/tmp")
@@ -167,15 +170,18 @@ def notify_ctk_expired() -> None:
             return  # すでに通知済み
         _ctk_expired_notified = True
     log("ALERT: Indeed CTK が期限切れです。LINE/Slack に通知します。")
+    update_url = f"{RAILWAY_SERVICE_URL}/update-ctk?token={COWORK_WEBHOOK_TOKEN}"
     message = (
         "⚠️ Indeed CTK が期限切れです\n\n"
         "Indeed からの応募者詳細（電話番号・住所）を取得できません。\n"
         "※ 応募通知自体は届き続けます。\n\n"
-        "【更新手順】\n"
+        "【👇 CTK更新フォーム（タップで開く）】\n"
+        f"{update_url}\n\n"
+        "【手順】\n"
         "1. Chrome で jp.indeed.com にログイン\n"
         "2. F12 → Application → Cookies → jp.indeed.com\n"
         "3. 「CTK」の値をコピー\n"
-        "4. Railway の INDEED_CTK を更新して再デプロイ"
+        "4. 上のURLを開いて貼り付け → 送信"
     )
     # Slack通知
     notify_error_to_slack(message)
@@ -960,6 +966,103 @@ def add_cors(response):
 @flask_app.route("/health", methods=["GET"])
 def health_check():
     return jsonify({"status": "ok"})
+
+# --- CTK更新フォーム（モバイル対応） ---
+_CTK_UPDATE_FORM_HTML = """<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <title>Indeed CTK 更新</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+           padding: 24px 20px; max-width: 520px; margin: 0 auto; background: #f8f9fa; color: #222; }
+    h1 { font-size: 22px; margin-bottom: 6px; }
+    .sub { color: #666; font-size: 14px; margin-bottom: 20px; }
+    textarea { width: 100%; height: 130px; font-size: 13px; padding: 12px;
+               border: 2px solid #d1d5db; border-radius: 10px; resize: vertical;
+               font-family: monospace; background: #fff; }
+    textarea:focus { outline: none; border-color: #2563eb; }
+    button { width: 100%; padding: 16px; background: #2563eb; color: #fff;
+             border: none; border-radius: 10px; font-size: 17px; font-weight: bold;
+             margin-top: 14px; cursor: pointer; letter-spacing: 0.5px; }
+    button:active { background: #1d4ed8; }
+    .howto { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px;
+             padding: 14px 16px; margin-top: 20px; font-size: 13px; color: #555; }
+    .howto b { color: #222; display: block; margin-bottom: 6px; }
+    .howto ol { margin: 0; padding-left: 18px; line-height: 1.8; }
+  </style>
+</head>
+<body>
+  <h1>⚙️ Indeed CTK 更新</h1>
+  <p class="sub">新しいCTK値を貼り付けて「更新する」を押してください。再デプロイ不要で即反映されます。</p>
+  <form method="POST">
+    <textarea name="ctk" placeholder="CTK値をここに貼り付け..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+    <button type="submit">✅ 更新する</button>
+  </form>
+  <div class="howto">
+    <b>📋 CTKの取得手順（PCのChromeで）</b>
+    <ol>
+      <li>jp.indeed.com にログイン</li>
+      <li>F12 → Application タブ → Cookies → jp.indeed.com</li>
+      <li>「CTK」の値をコピー</li>
+      <li>このページに貼り付けて送信</li>
+    </ol>
+  </div>
+</body>
+</html>"""
+
+_CTK_UPDATE_SUCCESS_HTML = """<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CTK更新完了</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; padding: 40px 24px;
+           text-align: center; max-width: 400px; margin: 0 auto; }
+    .icon { font-size: 60px; margin-bottom: 16px; }
+    h1 { font-size: 24px; color: #16a34a; margin-bottom: 10px; }
+    p { color: #555; font-size: 15px; line-height: 1.6; }
+  </style>
+</head>
+<body>
+  <div class="icon">✅</div>
+  <h1>CTK更新完了</h1>
+  <p>Indeed APIの認証が再開されました。<br>次回の応募通知から電話番号・住所が届きます。</p>
+</body>
+</html>"""
+
+@flask_app.route("/update-ctk", methods=["GET", "POST"])
+def update_ctk_endpoint():
+    """CTK更新フォーム（モバイル対応）。COWORK_WEBHOOK_TOKENで認証。"""
+    token = flask_request.args.get("token", "")
+    if not COWORK_WEBHOOK_TOKEN or token != COWORK_WEBHOOK_TOKEN:
+        return "Unauthorized", 401
+
+    if flask_request.method == "GET":
+        return _CTK_UPDATE_FORM_HTML
+
+    # POST: CTKを更新してフラグをリセット
+    new_ctk = flask_request.form.get("ctk", "").strip()
+    if not new_ctk:
+        return "CTK is required", 400
+    try:
+        from indeed_fetcher import reset_ctk_expired, _CTK_FILE
+        with open(_CTK_FILE, "w", encoding="utf-8") as f:
+            f.write(new_ctk)
+        reset_ctk_expired()
+        log(f"CTK updated via web form (length={len(new_ctk)})")
+    except Exception as e:
+        log(f"ERROR: CTK update via web form failed: {e}")
+        return f"Error: {e}", 500
+    # CTK期限切れ通知フラグもリセット（次回期限切れ時に再通知できるように）
+    global _ctk_expired_notified
+    with _ctk_expired_notified_lock:
+        _ctk_expired_notified = False
+    log("CTK flags reset. System will resume normal operation on next poll.")
+    return _CTK_UPDATE_SUCCESS_HTML
 
 @flask_app.route("/notify-line", methods=["POST", "OPTIONS"])
 def notify_line_webhook():

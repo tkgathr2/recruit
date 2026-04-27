@@ -7,8 +7,24 @@ from datetime import datetime
 
 # Environment variables
 INDEED_API_KEY = os.getenv("INDEED_API_KEY", "0f2b0de1b8ff96890172eeeba0816aaab662605e3efebbc0450745798c4b35ae")
-INDEED_CTK = os.getenv("INDEED_CTK")
 INDEED_GRAPHQL_ENDPOINT = "https://apis.indeed.com/graphql?co=JP&locale=ja"
+
+# CTK override file path (Webフォームからの更新を再デプロイなしで反映するため)
+_CTK_FILE = os.path.join(os.getenv("LOG_DIR", "/tmp"), "indeed_ctk_override.txt")
+
+
+def get_ctk() -> str:
+    """CTKを取得する。Webフォームで更新されたファイルを優先し、なければ環境変数を使う。"""
+    try:
+        if os.path.exists(_CTK_FILE):
+            with open(_CTK_FILE, "r") as f:
+                val = f.read().strip()
+                if val:
+                    return val
+    except Exception:
+        pass
+    return os.getenv("INDEED_CTK", "")
+
 
 # --- CTK Expiry Detection (GLOBAL STATE) ---
 _ctk_expired = False
@@ -17,6 +33,12 @@ _ctk_expired = False
 def is_ctk_expired() -> bool:
     """CTKが期限切れかどうかを返す。"""
     return _ctk_expired
+
+
+def reset_ctk_expired() -> None:
+    """CTK期限切れフラグをリセットする（CTK更新後に呼び出す）。"""
+    global _ctk_expired
+    _ctk_expired = False
 
 
 def fetch_all_details(legacy_id: str, timeout: int = 5) -> Dict[str, Any]:
@@ -39,7 +61,8 @@ def fetch_all_details(legacy_id: str, timeout: int = 5) -> Dict[str, Any]:
         Returns empty dict if fetch fails or legacy_id is invalid.
     """
     global _ctk_expired
-    if not legacy_id or not INDEED_CTK:
+    ctk = get_ctk()
+    if not legacy_id or not ctk:
         return {}
     # GraphQL query - profile details only (answers field not available in this API version)
     query = """
@@ -66,12 +89,12 @@ def fetch_all_details(legacy_id: str, timeout: int = 5) -> Dict[str, Any]:
     headers = {
         "content-type": "application/json",
         "indeed-api-key": INDEED_API_KEY,
-        "indeed-ctk": INDEED_CTK,
+        "indeed-ctk": ctk,
         "indeed-client-sub-app": "talent-management-experience",
         "indeed-client-sub-app-component": "./CandidateReviewPage",
         "Origin": "https://employers.indeed.com",
         "Referer": "https://employers.indeed.com/",
-        "Cookie": f"CTK={INDEED_CTK}",
+        "Cookie": f"CTK={ctk}",
     }
     payload = {
         "query": query,
@@ -149,7 +172,8 @@ def fetch_recent_candidates(limit: int = 30, timeout: int = 5) -> list:
         空リストの場合はAPI呼び出し失敗または応募者なし
     """
     global _ctk_expired
-    if not INDEED_CTK:
+    ctk = get_ctk()
+    if not ctk:
         return []
     # legacyIds を指定しない（全件取得を試みる）
     query = """
@@ -177,12 +201,12 @@ def fetch_recent_candidates(limit: int = 30, timeout: int = 5) -> list:
     headers = {
         "content-type": "application/json",
         "indeed-api-key": INDEED_API_KEY,
-        "indeed-ctk": INDEED_CTK,
+        "indeed-ctk": ctk,
         "indeed-client-sub-app": "talent-management-experience",
         "indeed-client-sub-app-component": "./CandidateReviewPage",
         "Origin": "https://employers.indeed.com",
         "Referer": "https://employers.indeed.com/",
-        "Cookie": f"CTK={INDEED_CTK}",
+        "Cookie": f"CTK={ctk}",
     }
     try:
         response = requests.post(
@@ -320,7 +344,7 @@ def resolve_legacy_id_from_tracking_url(url: str, timeout: int = 5) -> Optional[
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0.0.0 Safari/537.36"
         ),
-        "Cookie": f"CTK={INDEED_CTK}" if INDEED_CTK else "",
+        "Cookie": f"CTK={get_ctk()}" if get_ctk() else "",
     }
     # --- Strategy 1: allow_redirects=True (simplest, follows all redirects automatically) ---
     try:
