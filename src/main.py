@@ -1345,8 +1345,9 @@ def notify_line_webhook():
     phone = data.get("phone") or None
     email_addr = data.get("email") or None
     address = data.get("address") or None
-    log(f"[webhook] notify-line: name={name}, phone={phone}, email={email_addr}")
-    ok = notify_line_with_retry("indeed", name, "", phone=phone, email_addr=email_addr, location=address)
+    url = data.get("url") or None
+    log(f"[webhook] notify-line: name={name}, phone={phone}, email={email_addr}, url={'yes' if url else 'no'}")
+    ok = notify_line_with_retry("indeed", name, "", phone=phone, email_addr=email_addr, location=address, url=url)
     return jsonify({"ok": ok})
 
 @flask_app.route("/manage-processed", methods=["GET", "POST"])
