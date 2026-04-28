@@ -141,22 +141,25 @@ def load_processed_ids() -> Tuple[Set[str], bool]:
 def save_processed_ids(processed_ids: Set[str]) -> bool:
     """Save processed message IDs to file atomically. Returns True if successful.
     Uses tempfile + os.replace() for atomic write to prevent JSON corruption on crash.
-    Note: uid: entries are session-only cache and are NOT persisted to disk.
-    Only gm: and mid: entries (which provide deduplication correctness) are saved.
-    This prevents unbounded file growth from uid: cache accumulation.
+    All entry types (uid:, gm:, mid:) are persisted to ensure deduplication correctness.
+    Cap at MAX_PROCESSED_IDS to prevent unbounded file growth.
     """
     if not ensure_processed_ids_dir():
         return False
     try:
-        # Exclude uid: entries - they are session-only cache, gm:/mid: entries handle dedup
-        persistent_ids = [id for id in processed_ids if not id.startswith("uid:")]
+        persistent_ids = list(processed_ids)
+        # Cap at 10000 entries to prevent unbounded file growth
+        MAX_PROCESSED_IDS = 10000
+        if len(persistent_ids) > MAX_PROCESSED_IDS:
+            persistent_ids = persistent_ids[-MAX_PROCESSED_IDS:]
+            log(f"Trimmed processed IDs from {len(processed_ids)} to {MAX_PROCESSED_IDS}")
         # Atomic write: write to temp file then replace to prevent partial writes on crash
         target_path = Path(PROCESSED_IDS_FILE)
         tmp_path = target_path.with_suffix(".tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(persistent_ids, f)
         tmp_path.replace(target_path)
-        log(f"Saved {len(persistent_ids)} processed IDs to {PROCESSED_IDS_FILE} (excluded {len(processed_ids) - len(persistent_ids)} uid: cache entries)")
+        log(f"Saved {len(persistent_ids)} processed IDs to {PROCESSED_IDS_FILE}")
         return True
     except IOError as e:
         log(f"ERROR: Failed to save processed IDs: {e}")
