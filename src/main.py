@@ -1004,10 +1004,19 @@ _CTK_UPDATE_FORM_HTML = """<!DOCTYPE html>
     <b>📋 CTKの取得手順（PCのChromeで）</b>
     <ol>
       <li>jp.indeed.com にログイン</li>
-      <li>F12 → Application タブ → Cookies → jp.indeed.com</li>
+      <li>F12（またはCtrl+Shift+I）→ Application タブ → Cookies → jp.indeed.com</li>
       <li>「CTK」の値をコピー</li>
       <li>このページに貼り付けて送信</li>
     </ol>
+  </div>
+  <div class="howto" style="margin-top:10px;">
+    <b>📱 スマホの場合</b>
+    <ol>
+      <li>PCのChromeで上の手順でCTKを取得</li>
+      <li>自分にメール等でCTK値を送る</li>
+      <li>スマホでこのページを開き、貼り付けて送信</li>
+    </ol>
+    <p style="margin:8px 0 0;color:#888;font-size:12px;">※ スマホのブラウザではCookieを直接確認できないため、PCでの取得が必要です。</p>
   </div>
 </body>
 </html>"""
@@ -1041,19 +1050,28 @@ def update_ctk_setup():
         return "Unauthorized", 401
     # ブックマークレットJS（jp.indeed.comのCTKを自動読み取りしてPOST送信）
     post_url = f"{RAILWAY_SERVICE_URL}/update-ctk?token={COWORK_WEBHOOK_TOKEN}"
+    manual_url = f"{RAILWAY_SERVICE_URL}/update-ctk?token={COWORK_WEBHOOK_TOKEN}"
     bookmarklet_js = (
         "javascript:(function(){{"
-        "var c=document.cookie.split(';').map(function(x){{return x.trim()}}).find(function(x){{return x.startsWith('CTK=')}});"
-        "if(!c){{alert('CTKが見つかりません。jp.indeed.comにログインしてください。');return;}}"
-        "var v=c.slice(4);"
+        "var v='';"
+        "var cookies=document.cookie.split(';');"
+        "for(var i=0;i<cookies.length;i++){{"
+        "var t=cookies[i].trim();"
+        "if(t.toUpperCase().startsWith('CTK=')){{v=t.substring(4);break;}}"
+        "}};"
+        "if(!v&&window.mosaic&&window.mosaic.mos_ctk){{v=window.mosaic.mos_ctk;}};"
+        "if(!v){{"
+        "try{{var m=document.querySelector('meta[name=indeed-ctk]');if(m){{v=m.content;}}}}catch(e){{}}"
+        "}};"
+        "if(!v){{window.location.href='{manual_url}';return;}}"
         "var f=document.createElement('form');"
         "f.method='POST';"
-        "f.action='{url}';"
-        "var i=document.createElement('input');"
-        "i.type='hidden';i.name='ctk';i.value=v;"
-        "f.appendChild(i);document.body.appendChild(f);f.submit();"
+        "f.action='{post_url}';"
+        "var inp=document.createElement('input');"
+        "inp.type='hidden';inp.name='ctk';inp.value=v;"
+        "f.appendChild(inp);document.body.appendChild(f);f.submit();"
         "}})();"
-    ).format(url=post_url)
+    ).format(post_url=post_url, manual_url=manual_url)
     html = f"""<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -1095,14 +1113,17 @@ def update_ctk_setup():
     <div class="step-body">
       ① Chromeで <b>jp.indeed.com</b> を開く（ログイン済みであればOK）<br>
       ② ブラウザの <b>☆ お気に入り → 「CTK更新」</b> をタップ<br>
-      ③ 自動で更新完了！
+      ③ 自動で更新完了！<br><br>
+      <span style="color:#b45309;font-size:13px;">⚠ 自動取得できない場合は手動入力フォームに転送されます。<br>
+      その場合はPCのChromeで <b>F12 → Application → Cookies → CTK</b> の値をコピーして貼り付けてください。</span>
     </div>
   </div>
 
   <div class="after">
     <div class="after-title">✅ 設定完了後の手順はこれだけ</div>
     <div class="after-body">
-      jp.indeed.com を開く → お気に入りから「CTK更新」をタップ → 完了
+      jp.indeed.com を開く → お気に入りから「CTK更新」をタップ → 完了<br>
+      <span style="font-size:13px;color:#166534;">（自動取得できない場合は手動入力フォームで対応可）</span>
     </div>
   </div>
 
