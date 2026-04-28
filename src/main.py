@@ -68,6 +68,10 @@ SEARCH_DAYS = int(os.getenv("SEARCH_DAYS", "1"))  # デフォルト1日間（Gma
 # --- Batch limit per cycle (QUOTA ERROR対策) ---
 MAX_EMAILS_PER_CYCLE = int(os.getenv("MAX_EMAILS_PER_CYCLE", "10"))  # 1サイクルで処理する最大メール数
 
+# --- Startup Protection Threshold ---
+# 初回サイクルでこの数を超えるメールが見つかった場合、再起動後の重複通知を防ぐため静かにマーク
+STARTUP_NEW_EMAIL_THRESHOLD = int(os.getenv("STARTUP_NEW_EMAIL_THRESHOLD", "3"))
+
 # --- Logging ---
 def log(msg: str) -> None:
     """Log message to file and stdout."""
@@ -83,7 +87,7 @@ def ensure_processed_ids_dir() -> bool:
         parent_dir = Path(PROCESSED_IDS_FILE).parent
         if not parent_dir.exists():
             parent_dir.mkdir(parents=True, exist_ok=True)
-        log(f"Created directory: {parent_dir}")
+            log(f"Created directory: {parent_dir}")
         return True
     except OSError as e:
         log(f"ERROR: Failed to create directory for processed IDs: {e}")
@@ -142,37 +146,66 @@ def save_processed_ids(processed_ids: Set[str]) -> bool:
     """Save processed message IDs to file atomically. Returns True if successful.
     Uses tempfile + os.replace() for atomic write to prevent JSON corruption on crash.
     All entry types (uid:, gm:, mid:) are persisted to ensure deduplication correctness.
-    Cap at MAX_PROCESSED_IDS to prevent unbounded file growth.
+    Cap at MAX_PROCESSED_IDS, keeping NEWEST entries (sorted by numeric ID).
     """
     if not ensure_processed_ids_dir():
         return False
     try:
-        persistent_ids = list(processed_ids)
-        # Cap at 10000 entries to prevent unbounded file growth
         MAX_PROCESSED_IDS = 10000
-        if len(persistent_ids) > MAX_PROCESSED_IDS:
-            persistent_ids = persistent_ids[-MAX_PROCESSED_IDS:]
-            log(f"Trimmed processed IDs from {len(processed_ids)} to {MAX_PROCESSED_IDS}")
+        if len(processed_ids) > MAX_PROCESSED_IDS:
+            # Sort by recency: gm:/uid: have numeric IDs (larger = newer); mid: has no order
+            def _sort_key(msg_id: str) -> int:
+                if msg_id.startswith("gm:"):
+                    try:
+                        return int(msg_id[3:])
+                    except ValueError:
+                        return 0
+                elif msg_id.startswith("uid:"):
+                    try:
+                        return int(msg_id[4:])
+                    except ValueError:
+                        return 0
+                return 0  # mid: and unknown — treated as oldest, discarded first when trimming
+            # Sort ascending → take last MAX_PROCESSED_IDS (highest/newest numeric IDs)
+            persistent_ids = sorted(processed_ids, key=_sort_key)[-MAX_PROCESSED_IDS:]
+            log(f"Trimmed processed IDs from {len(processed_ids)} to {MAX_PROCESSED_IDS} (kept newest)")
+        else:
+            persistent_ids = list(processed_ids)
         # Atomic write: write to temp file then replace to prevent partial writes on crash
         target_path = Path(PROCESSED_IDS_FILE)
         tmp_path = target_path.with_suffix(".tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(persistent_ids, f)
         tmp_path.replace(target_path)
-        log(f"Saved {len(persistent_ids)} processed IDs to {PROCESSED_IDS_FILE}")
         return True
     except IOError as e:
         log(f"ERROR: Failed to save processed IDs: {e}")
         notify_error_to_slack(f"Failed to save processed IDs: {e}")
         return False
 
+
+def save_processed_ids_with_merge(new_ids: Set[str]) -> bool:
+    """Thread-safe save: reload file, merge new_ids, save atomically.
+    Use this from check_mail_with_status() to avoid race with Flask /manage-processed.
+    Lock hold time is ~milliseconds (file I/O only), not seconds (IMAP).
+    """
+    with _processed_ids_lock:
+        current_ids, load_success = load_processed_ids()
+        if not load_success:
+            log("ERROR: Could not reload processed IDs for merge-save")
+            return False
+        current_ids.update(new_ids)
+        return save_processed_ids(current_ids)
+
 def notify_ctk_expired() -> None:
-    """Indeed CTK 期限切れを LINE と Slack で通知する（1サービス起動中に1度だけ）。"""
+    """Indeed CTK 期限切れを LINE と Slack で通知する（1サービス起動中に1度だけ）。
+    フラグは少なくとも1つの通知成功後に設定する。全失敗時はフラグをリセットして次回リトライ可能に。
+    """
     global _ctk_expired_notified
     with _ctk_expired_notified_lock:
         if _ctk_expired_notified:
             return  # すでに通知済み
-        _ctk_expired_notified = True
+    # ← フラグはここでは設定しない（送信成功後に設定）
     log("ALERT: Indeed CTK が期限切れです。LINE/Slack に通知します。")
     setup_url = f"{RAILWAY_SERVICE_URL}/update-ctk-setup?token={COWORK_WEBHOOK_TOKEN}"
     message = (
@@ -187,49 +220,60 @@ def notify_ctk_expired() -> None:
         "※ まだ設定していない場合は👇\n"
         f"{setup_url}"
     )
-    # Slack通知
-    notify_error_to_slack(message)
+    notification_succeeded = False
+    # Slack通知（notify_error_to_slack は🚨エラープレフィックスが付くので直接送信）
+    if notify_slack_direct(message):
+        log("CTK期限切れ Slack通知: 送信成功")
+        notification_succeeded = True
+    else:
+        log("ERROR: CTK期限切れ Slack通知 失敗")
     # LINE通知（個人LINEに送信、未設定の場合はグループにフォールバック）
     line_to_id = LINE_TO_ID_PERSONAL or get_line_to_id()
     if LINE_CHANNEL_ACCESS_TOKEN and line_to_id:
-        body = {
-            "to": line_to_id,
-            "messages": [{"type": "text", "text": message}],
-        }
-        headers = {
-            "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
-            "Content-Type": "application/json",
-        }
         try:
             resp = requests.post(
                 "https://api.line.me/v2/bot/message/push",
-                json=body,
-                headers=headers,
+                json={"to": line_to_id, "messages": [{"type": "text", "text": message}]},
+                headers={
+                    "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+                    "Content-Type": "application/json",
+                },
                 timeout=10,
             )
             log(f"CTK期限切れ LINE通知: status={resp.status_code}")
+            if resp.status_code < 400:
+                notification_succeeded = True
         except Exception as e:
             log(f"ERROR: CTK期限切れ LINE通知 失敗: {e}")
+    # 少なくとも1つ成功した場合のみフラグを設定（失敗時はフラグをリセットして次回リトライ）
+    with _ctk_expired_notified_lock:
+        if notification_succeeded:
+            _ctk_expired_notified = True
+        else:
+            log("WARNING: CTK期限切れ通知が全て失敗。次回ポーリング時に再試行します。")
+
+
+def notify_slack_direct(message: str) -> bool:
+    """Slack Webhook にメッセージを送信する（エラープレフィックスなし）。Returns True if successful."""
+    webhook_url = SLACK_ERROR_WEBHOOK_URL or SLACK_WEBHOOK_URL_PROD
+    if not webhook_url:
+        log("ERROR: No Slack webhook URL configured; cannot send Slack message")
+        return False
+    try:
+        resp = requests.post(webhook_url, json={"text": message}, timeout=5)
+        if resp.status_code >= 400:
+            log(f"ERROR: Slack direct send failed (status={resp.status_code})")
+            return False
+        return True
+    except Exception as e:
+        log(f"ERROR: exception while sending Slack message: {e}")
+        return False
 
 
 def notify_error_to_slack(message: str) -> None:
-    """重大なエラーを Slack Webhook に通知する"""
-    webhook_url = SLACK_ERROR_WEBHOOK_URL or SLACK_WEBHOOK_URL_PROD
-    if not webhook_url:
-        log("ERROR: No Slack webhook URL configured; cannot notify error to Slack")
-        return
+    """重大なエラーを Slack Webhook に通知する（🚨エラープレフィックス付き）"""
     text = f"🚨 Indeed応募通知エラー発生\n{message}"
-    try:
-        resp = requests.post(
-            webhook_url,
-            json={"text": text},
-            timeout=5,
-        )
-        if resp.status_code >= 400:
-            log(f"ERROR: failed to send error notification to Slack (status={resp.status_code}, body={resp.text})")
-    except Exception as e:
-        # 通知時のエラーでさらに例外を投げるとループするのでログのみ
-        log(f"ERROR: exception while sending error notification to Slack: {e}")
+    notify_slack_direct(text)
 
 # --- MODE management ---
 def is_test_mode() -> bool:
@@ -256,14 +300,32 @@ def add_test_prefix(message: str) -> str:
 
 # --- Email Parsing ---
 def decode_header_value(value: Optional[str]) -> str:
-    """Decode email header value."""
+    """Decode email header value (RFC 2047).
+    For encoded words: use declared charset, then fall back through common Japanese charsets.
+    For unencoded bytes (enc=None): use us-ascii per RFC 2047, then fall back to utf-8.
+    """
     if not value:
         return ""
     parts = decode_header(value)
-    return "".join(
-        text.decode(enc or "utf-8", errors="replace") if isinstance(text, bytes) else text
-        for text, enc in parts
-    )
+    result = []
+    for text, enc in parts:
+        if isinstance(text, bytes):
+            # Try declared charset first, then common Japanese fallbacks
+            charsets = [enc] if enc else ["us-ascii"]
+            charsets += ["utf-8", "iso-2022-jp", "shift_jis"]
+            decoded = False
+            for charset in charsets:
+                try:
+                    result.append(text.decode(charset))
+                    decoded = True
+                    break
+                except (UnicodeDecodeError, LookupError):
+                    continue
+            if not decoded:
+                result.append(text.decode("utf-8", errors="replace"))
+        else:
+            result.append(text)
+    return "".join(result)
 
 def extract_name(from_header: Optional[str]) -> str:
     """Extract applicant name from From header."""
@@ -490,7 +552,7 @@ def notify_slack_with_retry(
     if not webhook_url:
         log("No Slack Webhook URL")
         return False
-    mention_prefix = "<!channel>\n"
+    mention_prefix = "<!channel>\n" if not is_test_mode() else ""
     if source == "indeed":
         lines = ["【Indeed 新着応募】"]
         lines.append(f"氏名：{name}")
@@ -583,18 +645,22 @@ def notify_line_with_retry(
         if url:
             lines.extend(["", "詳細はこちら:", shorten_url(url)])
     base_message = add_test_prefix("\n".join(lines))
-    # Use @all mention to notify all members in the group
-    substitution = {
-        "mention_all": {
-            "type": "mention",
-            "mentionee": {"type": "all"},
+    if is_test_mode():
+        # Test mode: no @all mention, plain text
+        body = {
+            "to": line_to_id,
+            "messages": [{"type": "text", "text": base_message}],
         }
-    }
-    text_v2 = "{mention_all} " + base_message
-    body = {
-        "to": line_to_id,
-        "messages": [{"type": "textV2", "text": text_v2, "substitution": substitution}],
-    }
+    else:
+        # Production mode: @all mention via textV2
+        substitution = {
+            "mention_all": {"type": "mention", "mentionee": {"type": "all"}}
+        }
+        text_v2 = "{mention_all} " + base_message
+        body = {
+            "to": line_to_id,
+            "messages": [{"type": "textV2", "text": text_v2, "substitution": substitution}],
+        }
     headers = {
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
         "Content-Type": "application/json",
@@ -618,16 +684,16 @@ def notify_line_with_retry(
 # --- IMAP Connection ---
 @contextmanager
 def imap_connection():
-    """Context manager for IMAP connection with timeout protection."""
-    old_timeout = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(30)
-    mail = imaplib.IMAP4_SSL(GMAIL_IMAP_HOST)
+    """Context manager for IMAP connection with per-connection timeout (not global).
+    Uses timeout= parameter on IMAP4_SSL (Python 3.9+) to avoid modifying global socket state.
+    This prevents thread-safety issues when Flask and polling threads run concurrently.
+    """
+    mail = imaplib.IMAP4_SSL(GMAIL_IMAP_HOST, timeout=30)
     try:
         mail.login(GMAIL_IMAP_USER, GMAIL_IMAP_PASSWORD)
         mail.select("INBOX", readonly=True)
         yield mail
     finally:
-        socket.setdefaulttimeout(old_timeout)
         try:
             mail.close()
             mail.logout()
@@ -782,8 +848,14 @@ def process_mail_by_uid(
     if not line_ok:
         log(f"WARNING: LINE notification failed for {applicant_name} ({unique_id})")
     if not slack_ok and not line_ok:
-        log(f"ERROR: All notifications failed for {applicant_name} ({unique_id}), will retry next cycle")
-        return None
+        # 全通知失敗時でも処理済みとしてマーク（20秒毎の無限リトライを防ぐ）
+        # エラーアラートを送信して手動確認を促す
+        phone_str = f"電話: {phone}" if phone else "電話: 未記入"
+        notify_error_to_slack(
+            f"【通知失敗】応募者: {applicant_name}\n{phone_str}\nUID: {unique_id}\n\n"
+            f"Slack/LINE通知に失敗しました。Gmailを手動確認してください。"
+        )
+        log(f"ERROR: All notifications failed for {applicant_name} ({unique_id}) - marked as processed, error alert sent")
     return unique_id
 
 def get_gm_msgid_lightweight(mail: imaplib.IMAP4_SSL, uid: str) -> Optional[str]:
@@ -846,11 +918,11 @@ def check_mail_with_status() -> bool:
                     # Truly new email, needs full processing
                     truly_new_uids.append(uid)
             # Add uid: entries for already-processed emails (bootstrap)
+            # Use merge-on-save to avoid race condition with Flask /manage-processed
             if uids_to_mark:
                 log(f"Bootstrapping {len(uids_to_mark)} UIDs for already-processed emails")
-                for uid_str, gm_id in uids_to_mark:
-                    processed_ids.add(f"uid:{uid_str}")
-                if not save_processed_ids(processed_ids):
+                bootstrap_ids = {f"uid:{uid_str}" for uid_str, _ in uids_to_mark}
+                if not save_processed_ids_with_merge(bootstrap_ids):
                     log("ERROR: Failed to save bootstrapped UIDs")
                     return True  # Not a quota error
 
@@ -858,22 +930,23 @@ def check_mail_with_status() -> bool:
                 total_new = len(truly_new_uids)
 
                 # === STARTUP PROTECTION: Detect restart with lost state ===
-                # 起動直後の安全チェック: processed_ids が空 or 少ない場合、
-                # 既存メールを "seen" としてサイレントマークする（通知しない）
-                # これにより再起動時の二重通知を防ぐ
+                # 初回サイクルで閾値を超えるメールが見つかった場合、再起動後の重複通知を防ぐ
+                # processed_ids の件数に関係なく（部分的なVolume復元も検知）
                 with _first_cycle_lock:
-                    if not _first_cycle_done and len(processed_ids) == 0 and len(truly_new_uids) > 3:
-                        log(f"STARTUP PROTECTION: processed_ids is empty and {len(truly_new_uids)} 'new' emails found.")
-                        log(f"This likely means a restart with lost state. Silently marking existing emails as processed...")
+                    if not _first_cycle_done and len(truly_new_uids) > STARTUP_NEW_EMAIL_THRESHOLD:
+                        log(f"STARTUP PROTECTION: {len(truly_new_uids)} new emails found on first cycle "
+                            f"(threshold={STARTUP_NEW_EMAIL_THRESHOLD}, existing processed_ids={len(processed_ids)}).")
+                        log("Silently marking as processed to prevent re-notification on restart...")
                         # 全件を軽量取得してgm:IDのみ記録（通知なし）
+                        startup_ids: Set[str] = set()
                         for uid in truly_new_uids:
                             uid_str = uid.decode() if isinstance(uid, bytes) else uid
                             gm_id = get_gm_msgid_lightweight(mail, uid_str)
                             if gm_id:
-                                processed_ids.add(gm_id)
-                                processed_ids.add(f"uid:{uid_str}")
-                        save_processed_ids(processed_ids)
-                        log(f"STARTUP PROTECTION: Silently marked {len(truly_new_uids)} emails. Next cycle will process only truly new emails.")
+                                startup_ids.add(gm_id)
+                                startup_ids.add(f"uid:{uid_str}")
+                        save_processed_ids_with_merge(startup_ids)
+                        log(f"STARTUP PROTECTION: Silently marked {len(truly_new_uids)} emails. Next cycle processes only truly new emails.")
                         _first_cycle_done = True
                         return True
                     _first_cycle_done = True
@@ -885,18 +958,20 @@ def check_mail_with_status() -> bool:
                 else:
                     log(f"Truly new emails to process: {total_new}")
                 # Phase 3: Full processing for truly new emails only (batch limited)
+                # Collect new IDs for this cycle, then merge-save once per batch (not per email)
+                # This minimizes lock contention while preventing race with Flask endpoints
+                new_ids_this_cycle: Set[str] = set()
                 for uid in batch:
                     uid_str = uid.decode() if isinstance(uid, bytes) else uid
-                    unique_id = process_mail_by_uid(mail, uid, processed_ids)
+                    unique_id = process_mail_by_uid(mail, uid, processed_ids | new_ids_this_cycle)
                     if unique_id:
-                        # Store both the unique_id (gm: or mid:) and the uid for efficient filtering
-                        processed_ids.add(unique_id)
-                        processed_ids.add(f"uid:{uid_str}")
-                        # Save immediately after each email to prevent duplicates on crash
-                        if not save_processed_ids(processed_ids):
-                            # If save fails, stop processing to prevent more potential duplicates
-                            log("ERROR: Stopping mail processing due to save failure")
-                            return True  # Not a quota error
+                        new_ids_this_cycle.add(unique_id)
+                        new_ids_this_cycle.add(f"uid:{uid_str}")
+                # Save all new IDs at once with atomic merge (prevents race with Flask)
+                if new_ids_this_cycle:
+                    if not save_processed_ids_with_merge(new_ids_this_cycle):
+                        log("ERROR: Failed to save processed IDs after batch")
+                        return True  # Not a quota error
             return True  # Success
     except imaplib.IMAP4.abort as e:
         error_msg = str(e)
@@ -1306,7 +1381,8 @@ def manage_processed():
 def run_flask_server() -> None:
     port = int(os.getenv("PORT", "8080"))
     log(f"Starting Flask webhook server on port {port}")
-    flask_app.run(host="0.0.0.0", port=port, use_reloader=False)
+    # threaded=True: allows concurrent requests (health check not blocked by long-running endpoints)
+    flask_app.run(host="0.0.0.0", port=port, use_reloader=False, threaded=True)
 
 # --- Main loop ---
 def main() -> None:
