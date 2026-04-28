@@ -1068,6 +1068,29 @@ def add_cors(response):
 def health_check():
     return jsonify({"status": "ok"})
 
+@flask_app.route("/test-ctk", methods=["GET"])
+def test_ctk():
+    """診断用: CTKの有効性とIndeed API接続をテストする。legacyIdを指定すると詳細も取得。"""
+    token = flask_request.args.get("token", "")
+    if not COWORK_WEBHOOK_TOKEN or not hmac.compare_digest(token, COWORK_WEBHOOK_TOKEN):
+        return "Unauthorized", 401
+    legacy_id = flask_request.args.get("id", "")
+    from indeed_fetcher import get_ctk, fetch_all_details
+    ctk = get_ctk()
+    result = {
+        "ctk_set": bool(ctk),
+        "ctk_prefix": ctk[:8] + "..." if len(ctk) > 8 else ctk,
+    }
+    if legacy_id:
+        details = fetch_all_details(legacy_id)
+        result["legacy_id"] = legacy_id
+        result["details_empty"] = not bool(details)
+        result["phone"] = details.get("phone") if details else None
+        result["name"] = details.get("name") if details else None
+        result["location"] = details.get("location") if details else None
+        result["email"] = details.get("email") if details else None
+    return jsonify(result)
+
 # --- CTK更新フォーム（モバイル対応） ---
 _CTK_UPDATE_FORM_HTML = """<!DOCTYPE html>
 <html lang="ja">
