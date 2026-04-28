@@ -124,6 +124,8 @@ def fetch_all_details(legacy_id: str, timeout: int = 5) -> Dict[str, Any]:
             return {}
         response.raise_for_status()
         data = response.json()
+        # 診断ログ（応答の構造を確認）
+        print(f"[indeed_fetcher] fetch_all_details({legacy_id}): HTTP {response.status_code}, data_keys={list((data.get('data') or {}).keys())}, errors={bool(data.get('errors'))}", flush=True)
         # CTK期限切れ検知: GraphQL errors に認証関連メッセージが含まれる場合
         errors = data.get("errors", [])
         if errors:
@@ -139,18 +141,25 @@ def fetch_all_details(legacy_id: str, timeout: int = 5) -> Dict[str, Any]:
         # Parse GraphQL response
         if "data" not in data or "candidateSubmissions" not in data["data"]:
             return {}
-        results = data["data"]["candidateSubmissions"].get("results", [])
+        candidate_submissions = data["data"]["candidateSubmissions"]
+        if candidate_submissions is None:
+            # API returned null for candidateSubmissions (session auth issue or unknown error)
+            print(f"[indeed_fetcher] candidateSubmissions is null for legacyId={legacy_id}", flush=True)
+            return {}
+        results = candidate_submissions.get("results", [])
         if not results or len(results) == 0:
             return {}
         submission = results[0]
-        submission_data = submission.get("data", {})
-        profile = submission_data.get("profile", {})
+        if submission is None:
+            return {}
+        submission_data = (submission.get("data") or {})
+        profile = (submission_data.get("profile") or {})
         # Extract profile fields
-        name = profile.get("name", {}).get("displayName")
-        contact = profile.get("contact", {})
+        name = (profile.get("name") or {}).get("displayName")
+        contact = (profile.get("contact") or {})
         phone = contact.get("phoneNumber")
         email = contact.get("email") or contact.get("aliasedEmail")
-        location = profile.get("location", {}).get("location")
+        location = (profile.get("location") or {}).get("location")
         return {
             "name": name,
             "phone": phone,
@@ -168,8 +177,8 @@ def fetch_all_details(legacy_id: str, timeout: int = 5) -> Dict[str, Any]:
     except requests.exceptions.RequestException:
         # Silently return empty dict on network errors
         return {}
-    except (KeyError, ValueError):
-        # Silently return empty dict on JSON parsing errors
+    except (KeyError, ValueError, AttributeError):
+        # Silently return empty dict on JSON parsing or attribute errors
         return {}
 
 
