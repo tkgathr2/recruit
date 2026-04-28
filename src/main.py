@@ -38,6 +38,7 @@ SLACK_WEBHOOK_URL_PROD = os.getenv("SLACK_WEBHOOK_URL_PROD")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_TO_ID_TEST = os.getenv("LINE_TO_ID_TEST")
 LINE_TO_ID_PROD = os.getenv("LINE_TO_ID_PROD")
+LINE_TO_ID_PERSONAL = os.getenv("LINE_TO_ID_PERSONAL")  # CTK通知用（個人LINE）
 COWORK_WEBHOOK_TOKEN = os.getenv("COWORK_WEBHOOK_TOKEN", "")
 
 # CTK更新フォームのベースURL（Railway のサービスURL）
@@ -175,17 +176,18 @@ def notify_ctk_expired() -> None:
         "⚠️ Indeed CTK が期限切れです\n\n"
         "電話番号・住所の取得ができません。\n"
         "※ 応募通知自体は届き続けます。\n\n"
-        "【ワンタップ更新手順】\n"
+        "【更新手順】\n"
         "① Chrome で jp.indeed.com を開く\n"
         "② お気に入り →「CTK更新」をタップ\n"
-        "③ 完了！\n\n"
+        "③ CTK値が自動入力されたページが開く\n"
+        "④「更新する」ボタンを押して完了\n\n"
         "※ まだ設定していない場合は👇\n"
         f"{setup_url}"
     )
     # Slack通知
     notify_error_to_slack(message)
-    # LINE通知（メッセージのみ、@all メンションなし）
-    line_to_id = get_line_to_id()
+    # LINE通知（個人LINEに送信、未設定の場合はグループにフォールバック）
+    line_to_id = LINE_TO_ID_PERSONAL or get_line_to_id()
     if LINE_CHANNEL_ACCESS_TOKEN and line_to_id:
         body = {
             "to": line_to_id,
@@ -1018,6 +1020,15 @@ _CTK_UPDATE_FORM_HTML = """<!DOCTYPE html>
     </ol>
     <p style="margin:8px 0 0;color:#888;font-size:12px;">※ スマホのブラウザではCookieを直接確認できないため、PCでの取得が必要です。</p>
   </div>
+  <script>
+    (function() {
+      var params = new URLSearchParams(window.location.search);
+      var ctk = params.get('ctk');
+      if (ctk) {
+        document.querySelector('textarea[name="ctk"]').value = decodeURIComponent(ctk);
+      }
+    })();
+  </script>
 </body>
 </html>"""
 
@@ -1064,12 +1075,7 @@ def update_ctk_setup():
         "try{{var m=document.querySelector('meta[name=indeed-ctk]');if(m){{v=m.content;}}}}catch(e){{}}"
         "}};"
         "if(!v){{window.location.href='{manual_url}';return;}}"
-        "var f=document.createElement('form');"
-        "f.method='POST';"
-        "f.action='{post_url}';"
-        "var inp=document.createElement('input');"
-        "inp.type='hidden';inp.name='ctk';inp.value=v;"
-        "f.appendChild(inp);document.body.appendChild(f);f.submit();"
+        "window.location.href='{manual_url}'+'&ctk='+encodeURIComponent(v);"
         "}})();"
     ).format(post_url=post_url, manual_url=manual_url)
     html = f"""<!DOCTYPE html>
@@ -1113,7 +1119,8 @@ def update_ctk_setup():
     <div class="step-body">
       ① Chromeで <b>jp.indeed.com</b> を開く（ログイン済みであればOK）<br>
       ② ブラウザの <b>☆ お気に入り → 「CTK更新」</b> をタップ<br>
-      ③ 自動で更新完了！<br><br>
+      ③ CTK値が自動入力されたページが開く<br>
+      ④ 「更新する」ボタンを押して完了！<br><br>
       <span style="color:#b45309;font-size:13px;">⚠ 自動取得できない場合は手動入力フォームに転送されます。<br>
       その場合はPCのChromeで <b>F12 → Application → Cookies → CTK</b> の値をコピーして貼り付けてください。</span>
     </div>
@@ -1122,7 +1129,7 @@ def update_ctk_setup():
   <div class="after">
     <div class="after-title">✅ 設定完了後の手順はこれだけ</div>
     <div class="after-body">
-      jp.indeed.com を開く → お気に入りから「CTK更新」をタップ → 完了<br>
+      jp.indeed.com を開く → お気に入りから「CTK更新」をタップ → CTK自動入力 → 「更新する」を押す<br>
       <span style="font-size:13px;color:#166534;">（自動取得できない場合は手動入力フォームで対応可）</span>
     </div>
   </div>
