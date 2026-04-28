@@ -2,6 +2,7 @@
 import os
 import re
 import requests
+from threading import RLock
 from typing import Optional, Dict, Any
 from datetime import datetime
 
@@ -28,17 +29,27 @@ def get_ctk() -> str:
 
 # --- CTK Expiry Detection (GLOBAL STATE) ---
 _ctk_expired = False
+_ctk_expired_lock = RLock()
 
 
 def is_ctk_expired() -> bool:
     """CTKが期限切れかどうかを返す。"""
-    return _ctk_expired
+    with _ctk_expired_lock:
+        return _ctk_expired
 
 
 def reset_ctk_expired() -> None:
     """CTK期限切れフラグをリセットする（CTK更新後に呼び出す）。"""
     global _ctk_expired
-    _ctk_expired = False
+    with _ctk_expired_lock:
+        _ctk_expired = False
+
+
+def _set_ctk_expired() -> None:
+    """CTK期限切れフラグをセットする（スレッドセーフ）。"""
+    global _ctk_expired
+    with _ctk_expired_lock:
+        _ctk_expired = True
 
 
 def fetch_all_details(legacy_id: str, timeout: int = 5) -> Dict[str, Any]:
@@ -60,7 +71,6 @@ def fetch_all_details(legacy_id: str, timeout: int = 5) -> Dict[str, Any]:
         - raw_data: Complete GraphQL response for debugging
         Returns empty dict if fetch fails or legacy_id is invalid.
     """
-    global _ctk_expired
     ctk = get_ctk()
     if not legacy_id or not ctk:
         return {}
@@ -109,7 +119,7 @@ def fetch_all_details(legacy_id: str, timeout: int = 5) -> Dict[str, Any]:
         )
         # CTK期限切れ検知: HTTP 401/403 は認証エラーの明確なサイン
         if response.status_code in (401, 403):
-            _ctk_expired = True
+            _set_ctk_expired()
             print(f"[indeed_fetcher] CTK期限切れ検知 (HTTP {response.status_code})", flush=True)
             return {}
         response.raise_for_status()
@@ -123,7 +133,7 @@ def fetch_all_details(legacy_id: str, timeout: int = 5) -> Dict[str, Any]:
                     "unauthorized", "unauthenticated", "authentication",
                     "forbidden", "invalid token", "expired", "ctk"
                 ]):
-                    _ctk_expired = True
+                    _set_ctk_expired()
                     print(f"[indeed_fetcher] CTK期限切れ検知 (GraphQL error: {error.get('message')})", flush=True)
                     return {}
         # Parse GraphQL response
@@ -152,7 +162,7 @@ def fetch_all_details(legacy_id: str, timeout: int = 5) -> Dict[str, Any]:
     except requests.exceptions.HTTPError as e:
         # HTTPErrorのステータスコードでもCTK期限切れを検知
         if hasattr(e, 'response') and e.response is not None and e.response.status_code in (401, 403):
-            _ctk_expired = True
+            _set_ctk_expired()
             print(f"[indeed_fetcher] CTK期限切れ検知 (HTTPError {e.response.status_code})", flush=True)
         return {}
     except requests.exceptions.RequestException:
@@ -171,7 +181,6 @@ def fetch_recent_candidates(limit: int = 30, timeout: int = 5) -> list:
         list of dicts: [{name, phone, email, location, legacy_id}, ...]
         空リストの場合はAPI呼び出し失敗または応募者なし
     """
-    global _ctk_expired
     ctk = get_ctk()
     if not ctk:
         return []
@@ -216,7 +225,7 @@ def fetch_recent_candidates(limit: int = 30, timeout: int = 5) -> list:
             timeout=timeout
         )
         if response.status_code in (401, 403):
-            _ctk_expired = True
+            _set_ctk_expired()
             print(f"[indeed_fetcher] CTK期限切れ検知 fetch_recent_candidates (HTTP {response.status_code})", flush=True)
             return []
         response.raise_for_status()

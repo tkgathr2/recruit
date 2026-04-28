@@ -7,6 +7,7 @@ import socket
 import time
 import json
 import re
+import hmac
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Set, Tuple
@@ -59,18 +60,31 @@ LINE_MENTION_ID_1 = os.getenv("LINE_MENTION_ID_1")
 LINE_MENTION_ID_2 = os.getenv("LINE_MENTION_ID_2")
 
 # --- Polling Interval ---
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "20"))  # デフォルト20秒
-MAX_BACKOFF_SECONDS = int(os.getenv("MAX_BACKOFF_SECONDS", "900"))  # 最大15分のバックオフ
+def _safe_int(env_var: str, default: int) -> int:
+    """環境変数を安全にintに変換する。不正値の場合はデフォルト値を使用。"""
+    raw = os.getenv(env_var)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        # Cannot use log() here (not yet defined), use print
+        print(f"WARNING: {env_var}='{raw}' is not a valid integer, using default={default}", flush=True)
+        return default
+
+
+POLL_INTERVAL_SECONDS = _safe_int("POLL_INTERVAL_SECONDS", 20)  # デフォルト20秒
+MAX_BACKOFF_SECONDS = _safe_int("MAX_BACKOFF_SECONDS", 900)  # 最大15分のバックオフ
 
 # --- Search window for emails (days) ---
-SEARCH_DAYS = int(os.getenv("SEARCH_DAYS", "1"))  # デフォルト1日間（Gmail API制限対策）
+SEARCH_DAYS = _safe_int("SEARCH_DAYS", 1)  # デフォルト1日間（Gmail API制限対策）
 
 # --- Batch limit per cycle (QUOTA ERROR対策) ---
-MAX_EMAILS_PER_CYCLE = int(os.getenv("MAX_EMAILS_PER_CYCLE", "10"))  # 1サイクルで処理する最大メール数
+MAX_EMAILS_PER_CYCLE = _safe_int("MAX_EMAILS_PER_CYCLE", 10)  # 1サイクルで処理する最大メール数
 
 # --- Startup Protection Threshold ---
 # 初回サイクルでこの数を超えるメールが見つかった場合、再起動後の重複通知を防ぐため静かにマーク
-STARTUP_NEW_EMAIL_THRESHOLD = int(os.getenv("STARTUP_NEW_EMAIL_THRESHOLD", "3"))
+STARTUP_NEW_EMAIL_THRESHOLD = _safe_int("STARTUP_NEW_EMAIL_THRESHOLD", 3)
 
 # --- Logging ---
 def log(msg: str) -> None:
@@ -174,9 +188,17 @@ def save_processed_ids(processed_ids: Set[str]) -> bool:
         # Atomic write: write to temp file then replace to prevent partial writes on crash
         target_path = Path(PROCESSED_IDS_FILE)
         tmp_path = target_path.with_suffix(".tmp")
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(persistent_ids, f)
-        tmp_path.replace(target_path)
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(persistent_ids, f)
+            tmp_path.replace(target_path)
+        except Exception:
+            # Clean up .tmp file on failure to avoid stale file accumulation
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
         return True
     except IOError as e:
         log(f"ERROR: Failed to save processed IDs: {e}")
@@ -1135,7 +1157,7 @@ _CTK_UPDATE_SUCCESS_HTML = """<!DOCTYPE html>
 def update_ctk_setup():
     """ブックマークレット設定ページ。ワンタップCTK更新の初回セットアップ用。"""
     token = flask_request.args.get("token", "")
-    if not COWORK_WEBHOOK_TOKEN or token != COWORK_WEBHOOK_TOKEN:
+    if not COWORK_WEBHOOK_TOKEN or not hmac.compare_digest(token, COWORK_WEBHOOK_TOKEN):
         return "Unauthorized", 401
     # ブックマークレットJS（jp.indeed.comのCTKを自動読み取りしてPOST送信）
     post_url = f"{RAILWAY_SERVICE_URL}/update-ctk?token={COWORK_WEBHOOK_TOKEN}"
@@ -1222,7 +1244,7 @@ def update_ctk_setup():
 def update_ctk_endpoint():
     """CTK更新フォーム（モバイル対応）。COWORK_WEBHOOK_TOKENで認証。"""
     token = flask_request.args.get("token", "")
-    if not COWORK_WEBHOOK_TOKEN or token != COWORK_WEBHOOK_TOKEN:
+    if not COWORK_WEBHOOK_TOKEN or not hmac.compare_digest(token, COWORK_WEBHOOK_TOKEN):
         return "Unauthorized", 401
 
     if flask_request.method == "GET":
@@ -1252,7 +1274,7 @@ def update_ctk_endpoint():
 def send_setup_msg():
     """LINEグループにCTKセットアップURLを送信する（初回設定用・GET呼び出し可）。"""
     token = flask_request.args.get("token", "")
-    if not COWORK_WEBHOOK_TOKEN or token != COWORK_WEBHOOK_TOKEN:
+    if not COWORK_WEBHOOK_TOKEN or not hmac.compare_digest(token, COWORK_WEBHOOK_TOKEN):
         return "Unauthorized", 401
     setup_url = f"{RAILWAY_SERVICE_URL}/update-ctk-setup?token={COWORK_WEBHOOK_TOKEN}"
     msg = (
@@ -1264,7 +1286,7 @@ def send_setup_msg():
         "③ 次回CTK切れ通知が来たらブックマークをタップするだけ\n\n"
         f"{setup_url}"
     )
-    line_to_id = LINE_TO_ID_PROD if MODE == "prod" else LINE_TO_ID_TEST
+    line_to_id = get_line_to_id()  # is_test_mode() 経由で統一（直接 MODE 参照を廃止）
     if not line_to_id or not LINE_CHANNEL_ACCESS_TOKEN:
         return "LINE not configured", 500
     try:
@@ -1287,7 +1309,7 @@ def send_setup_msg():
 def send_test_personal():
     """個人LINEにテストメッセージを送信する（GETで呼び出し可）"""
     token = flask_request.args.get("token", "")
-    if not COWORK_WEBHOOK_TOKEN or token != COWORK_WEBHOOK_TOKEN:
+    if not COWORK_WEBHOOK_TOKEN or not hmac.compare_digest(token, COWORK_WEBHOOK_TOKEN):
         return "Unauthorized", 401
     personal_id = LINE_TO_ID_PERSONAL
     if not personal_id or not LINE_CHANNEL_ACCESS_TOKEN:
@@ -1316,7 +1338,7 @@ def notify_line_webhook():
     if not COWORK_WEBHOOK_TOKEN:
         log("ERROR: COWORK_WEBHOOK_TOKEN not configured - rejecting all requests for security")
         return jsonify({"error": "Service not configured"}), 503
-    if flask_request.headers.get("X-Cowork-Token", "") != COWORK_WEBHOOK_TOKEN:
+    if not hmac.compare_digest(flask_request.headers.get("X-Cowork-Token", ""), COWORK_WEBHOOK_TOKEN):
         return jsonify({"error": "Unauthorized"}), 401
     data = flask_request.get_json(force=True) or {}
     name = data.get("name", "")
@@ -1331,7 +1353,7 @@ def notify_line_webhook():
 def manage_processed():
     """Utility endpoint to view/delete processed IDs. Auth via COWORK_WEBHOOK_TOKEN."""
     token = flask_request.args.get("token", "")
-    if not COWORK_WEBHOOK_TOKEN or token != COWORK_WEBHOOK_TOKEN:
+    if not COWORK_WEBHOOK_TOKEN or not hmac.compare_digest(token, COWORK_WEBHOOK_TOKEN):
         return jsonify({"error": "unauthorized"}), 403
 
     action = flask_request.args.get("action", "info")
@@ -1349,7 +1371,10 @@ def manage_processed():
         return jsonify({"matches": sorted(matches), "count": len(matches)})
 
     elif action == "list_recent":
-        count = int(flask_request.args.get("count", "20"))
+        try:
+            count = int(flask_request.args.get("count", "20"))
+        except (ValueError, TypeError):
+            count = 20
         processed_ids, ok = load_processed_ids()
         sorted_ids = sorted(processed_ids, reverse=True)
         return jsonify({"ids": sorted_ids[:count], "total": len(processed_ids)})
