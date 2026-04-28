@@ -297,6 +297,39 @@ def notify_error_to_slack(message: str) -> None:
     text = f"🚨 Indeed応募通知エラー発生\n{message}"
     notify_slack_direct(text)
 
+
+def notify_url_missing(applicant_name: str, unique_id: str) -> None:
+    """短縮URLが取得できなかった場合に LINE と Slack でアラートを送信する。
+    URL未取得は重大エラー → 手動確認を促す。
+    """
+    log(f"ALERT: URL missing for {applicant_name} ({unique_id}) — sending alert")
+    message = (
+        f"⚠️ 【URL未取得アラート】\n\n"
+        f"応募者: {applicant_name}\n"
+        f"ID: {unique_id}\n\n"
+        f"Indeed管理画面のURLが取得できませんでした。\n"
+        f"手動でIndeed管理画面を確認してください。\n"
+        f"https://employers.indeed.com/candidates"
+    )
+    # Slackアラート
+    notify_slack_direct(message)
+    # LINEアラート（個人LINEに送信）
+    line_to_id = LINE_TO_ID_PERSONAL or get_line_to_id()
+    if LINE_CHANNEL_ACCESS_TOKEN and line_to_id:
+        try:
+            resp = requests.post(
+                "https://api.line.me/v2/bot/message/push",
+                json={"to": line_to_id, "messages": [{"type": "text", "text": message}]},
+                headers={
+                    "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                timeout=10,
+            )
+            log(f"URL missing LINE alert: status={resp.status_code}")
+        except Exception as e:
+            log(f"ERROR: URL missing LINE alert failed: {e}")
+
 # --- MODE management ---
 def is_test_mode() -> bool:
     """Check if running in test mode."""
@@ -860,6 +893,26 @@ def process_mail_by_uid(
                     log(f"Name-search details: phone={phone}, location={indeed_location}, email={indeed_email}")
                 else:
                     log(f"Name-search: no match for '{applicant_name}'")
+    # ── URL不在チェック（Indeed限定）──────────────────────────────────────
+    # URLが取れていない場合は内部リトライを行い、それでもダメならアラートを発報する。
+    # 電話番号がない場合は許容（"未登録"表示）だが、URLなしは手動確認が必要。
+    if source == "indeed" and not url:
+        log(f"URL not found for {applicant_name}, retrying engage URL resolution in 5s...")
+        time.sleep(5)
+        # engage URLからlegacyIdを再試行
+        retry_engage_urls = extract_indeed_engage_urls(html)
+        for engage_url in retry_engage_urls:
+            from indeed_fetcher import resolve_legacy_id_from_tracking_url as _resolve
+            retry_legacy_id = _resolve(engage_url)
+            if retry_legacy_id:
+                url = f"https://employers.indeed.com/candidates/view?id={retry_legacy_id}"
+                log(f"URL resolved on retry: {url[:60]}")
+                break
+        if not url:
+            log(f"URL still not found after retry for {applicant_name} ({unique_id}) — sending alert")
+            notify_url_missing(applicant_name, unique_id)
+        else:
+            log(f"URL obtained on retry for {applicant_name}")
     if phone:
         phone = normalize_phone_number(phone)
     log(f"Notify {source}: {applicant_name}, phone={phone}, url={url}, id={unique_id}")
