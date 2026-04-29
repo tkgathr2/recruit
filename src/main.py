@@ -230,17 +230,23 @@ def notify_ctk_expired() -> None:
     # ← フラグはここでは設定しない（送信成功後に設定）
     log("ALERT: Indeed CTK が期限切れです。LINE/Slack に通知します。")
     setup_url = f"{RAILWAY_SERVICE_URL}/update-ctk-setup?token={COWORK_WEBHOOK_TOKEN}"
+    session_setup_url = f"{RAILWAY_SERVICE_URL}/update-session-setup?token={COWORK_WEBHOOK_TOKEN}"
     message = (
         "⚠️ Indeed CTK が期限切れです\n\n"
         "電話番号・住所の取得ができません。\n"
         "※ 応募通知自体は届き続けます。\n\n"
-        "【更新手順】\n"
+        "【CTK更新手順】\n"
         "① Chrome で jp.indeed.com を開く\n"
         "② お気に入り →「CTK更新」をタップ\n"
         "③ CTK値が自動入力されたページが開く\n"
         "④「更新する」ボタンを押して完了\n\n"
-        "※ まだ設定していない場合は👇\n"
-        f"{setup_url}"
+        "【セッションCookie更新（電話番号取得）】\n"
+        "① employers.indeed.com/candidates を開く\n"
+        "② お気に入り →「Indeed セッション更新」をタップ\n\n"
+        "※ CTK更新ブックマークがまだの場合は👇\n"
+        f"{setup_url}\n\n"
+        "※ セッション更新ブックマークがまだの場合は👇\n"
+        f"{session_setup_url}"
     )
     notification_succeeded = False
     # Slack通知（notify_error_to_slack は🚨エラープレフィックスが付くので直接送信）
@@ -1345,6 +1351,128 @@ def update_ctk_endpoint():
         _ctk_expired_notified = False
     log("CTK flags reset. System will resume normal operation on next poll.")
     return _CTK_UPDATE_SUCCESS_HTML
+
+
+# ── セッションCookie更新（電話番号取得に必要） ──────────────────────────────
+@flask_app.route("/update-session-setup", methods=["GET"])
+def update_session_setup():
+    """セッションCookieブックマークレット設定ページ。
+    employers.indeed.com 上で実行するとCookie一式をRailwayに送信する。
+    """
+    token = flask_request.args.get("token", "")
+    if not COWORK_WEBHOOK_TOKEN or not hmac.compare_digest(token, COWORK_WEBHOOK_TOKEN):
+        return "Unauthorized", 401
+    post_url = f"{RAILWAY_SERVICE_URL}/update-session?token={COWORK_WEBHOOK_TOKEN}"
+    # ブックマークレットJS: employers.indeed.comで実行 → 全Cookieを送信
+    bookmarklet_js = (
+        "javascript:(function(){{"
+        "var c=document.cookie;"
+        "if(!c){{alert('Cookieが取得できません。employers.indeed.comで実行してください。');return;}}"
+        "var url='{post_url}&cookies='+encodeURIComponent(c);"
+        "window.location.href=url;"
+        "}})();"
+    ).format(post_url=post_url)
+    html = f"""<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <title>セッション更新 設定</title>
+  <style>
+    *{{box-sizing:border-box;}}
+    body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:20px;max-width:540px;margin:0 auto;background:#f8f9fa;color:#222;}}
+    h1{{font-size:21px;margin-bottom:4px;}}
+    .sub{{color:#666;font-size:14px;margin-bottom:24px;}}
+    .step{{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:16px 18px;margin-bottom:14px;}}
+    .step-num{{display:inline-block;background:#059669;color:#fff;border-radius:50%;width:26px;height:26px;text-align:center;line-height:26px;font-size:13px;font-weight:bold;margin-right:8px;}}
+    .step-title{{font-size:16px;font-weight:bold;}}
+    .step-body{{color:#555;font-size:14px;margin-top:8px;line-height:1.7;}}
+    .bm-link{{display:block;background:#059669;color:#fff;text-align:center;padding:14px;border-radius:10px;font-size:17px;font-weight:bold;text-decoration:none;margin-top:10px;}}
+    .bm-link:active{{background:#047857;}}
+    .warn{{background:#fef3c7;border:1px solid #fcd34d;border-radius:10px;padding:12px 16px;font-size:13px;color:#92400e;margin-bottom:16px;}}
+    .after{{background:#dcfce7;border:1px solid #86efac;border-radius:12px;padding:16px 18px;margin-top:6px;}}
+    .after-title{{font-size:15px;font-weight:bold;color:#16a34a;}}
+    .after-body{{color:#166534;font-size:14px;margin-top:6px;line-height:1.7;}}
+  </style>
+</head>
+<body>
+  <h1>📱 セッション更新 設定</h1>
+  <p class="sub">電話番号を取得するためのCookieをRailwayに登録します。</p>
+
+  <div class="warn">
+    ⚠️ <b>employers.indeed.com</b> を開いた状態でこのブックマークを実行してください。<br>
+    jp.indeed.comでは動作しません。
+  </div>
+
+  <div class="step">
+    <span class="step-num">1</span><span class="step-title">ブックマークレットを保存する</span>
+    <div class="step-body">
+      下のボタンを<b>長押し（または右クリック）→「リンクをブックマークに追加」</b>で保存してください。<br>
+      名前は <b>「Indeed セッション更新」</b> にしてください。
+      <a class="bm-link" href="{bookmarklet_js}">🔑 Indeed セッション更新（ブックマーク用）</a>
+    </div>
+  </div>
+
+  <div class="step">
+    <span class="step-num">2</span><span class="step-title">定期的に実行する（月1〜2回）</span>
+    <div class="step-body">
+      ① Chromeで <b>employers.indeed.com/candidates</b> を開く（ログイン済みであればOK）<br>
+      ② ブラウザの <b>☆ お気に入り → 「Indeed セッション更新」</b> をタップ<br>
+      ③ 「セッション更新完了」と表示されれば完了！<br><br>
+      <span style="color:#b45309;font-size:13px;">
+        💡 電話番号が「未登録」と表示される場合や、URLアラートが来た場合に実行してください。
+      </span>
+    </div>
+  </div>
+
+  <div class="after">
+    <div class="after-title">✅ 設定後の効果</div>
+    <div class="after-body">
+      応募通知に電話番号・住所が含まれるようになります。<br>
+      セッションが切れた場合は同じ手順で再実行してください（月1〜2回程度）。
+    </div>
+  </div>
+</body>
+</html>"""
+    return html
+
+
+@flask_app.route("/update-session", methods=["GET"])
+def update_session_endpoint():
+    """セッションCookieを受け取って保存する。ブックマークレットから呼ばれる。"""
+    token = flask_request.args.get("token", "")
+    if not COWORK_WEBHOOK_TOKEN or not hmac.compare_digest(token, COWORK_WEBHOOK_TOKEN):
+        return "Unauthorized", 401
+    cookies_str = flask_request.args.get("cookies", "").strip()
+    if not cookies_str:
+        return "cookies parameter is required", 400
+    try:
+        from indeed_fetcher import save_session_cookies
+        save_session_cookies(cookies_str)
+        log(f"Session cookies updated via bookmarklet (length={len(cookies_str)})")
+        # CTK expired フラグもリセット（セッション更新で一緒にCTKも更新される可能性あり）
+        try:
+            from indeed_fetcher import reset_ctk_expired
+            reset_ctk_expired()
+        except Exception:
+            pass
+        global _ctk_expired_notified
+        with _ctk_expired_notified_lock:
+            _ctk_expired_notified = False
+    except Exception as e:
+        log(f"ERROR: Session cookies update failed: {e}")
+        return f"Error: {e}", 500
+    return """<!DOCTYPE html>
+<html lang="ja"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>セッション更新完了</title>
+<style>body{{font-family:-apple-system,sans-serif;padding:40px 24px;text-align:center;max-width:400px;margin:0 auto;}}.icon{{font-size:64px;margin-bottom:16px;}}</style>
+</head><body>
+<div class="icon">✅</div>
+<h1>セッション更新完了</h1>
+<p>Cookieが登録されました。<br>次回の応募通知から電話番号が届きます。</p>
+</body></html>"""
+
 
 @flask_app.route("/send-setup-msg", methods=["GET"])
 def send_setup_msg():

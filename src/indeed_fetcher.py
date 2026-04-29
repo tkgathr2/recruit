@@ -12,6 +12,8 @@ INDEED_GRAPHQL_ENDPOINT = "https://apis.indeed.com/graphql?co=JP&locale=ja"
 
 # CTK override file path (Webフォームからの更新を再デプロイなしで反映するため)
 _CTK_FILE = os.path.join(os.getenv("LOG_DIR", "/tmp"), "indeed_ctk_override.txt")
+# セッションCookieファイル (employers.indeed.comのCookie文字列を保存)
+_SESSION_COOKIES_FILE = os.path.join(os.getenv("LOG_DIR", "/tmp"), "indeed_session_cookies.txt")
 
 
 def get_ctk() -> str:
@@ -25,6 +27,51 @@ def get_ctk() -> str:
     except Exception:
         pass
     return os.getenv("INDEED_CTK", "")
+
+
+def get_session_cookies() -> str:
+    """employers.indeed.com のセッションCookie文字列を取得する。
+    ブックマークレット経由で保存されたCookieを返す。
+    セッションCookieがあると candidateSubmissions で電話番号が取得できる。
+    """
+    try:
+        if os.path.exists(_SESSION_COOKIES_FILE):
+            with open(_SESSION_COOKIES_FILE, "r") as f:
+                val = f.read().strip()
+                if val:
+                    return val
+    except Exception:
+        pass
+    return ""
+
+
+def save_session_cookies(cookies_str: str) -> None:
+    """セッションCookie文字列を保存する（/update-session エンドポイントから呼ばれる）。"""
+    try:
+        with open(_SESSION_COOKIES_FILE, "w", encoding="utf-8") as f:
+            f.write(cookies_str.strip())
+        print(f"[indeed_fetcher] session cookies saved (length={len(cookies_str)})", flush=True)
+    except Exception as e:
+        print(f"[indeed_fetcher] save_session_cookies error: {e}", flush=True)
+
+
+def build_cookie_header(ctk: str) -> str:
+    """APIリクエスト用のCookieヘッダー文字列を構築する。
+    セッションCookieが保存されていればそれを優先使用し、
+    CTKが含まれていない場合は先頭に追加する。
+    セッションCookieがなければ CTK=xxx のみを返す。
+    """
+    session_cookies = get_session_cookies()
+    if not session_cookies:
+        return f"CTK={ctk}"
+    # CTKがセッションCookieに含まれているか確認
+    has_ctk = any(
+        part.strip().upper().startswith("CTK=")
+        for part in session_cookies.split(";")
+    )
+    if has_ctk:
+        return session_cookies
+    return f"CTK={ctk}; {session_cookies}"
 
 
 # --- CTK Expiry Detection (GLOBAL STATE) ---
@@ -104,8 +151,10 @@ def fetch_all_details(legacy_id: str, timeout: int = 5) -> Dict[str, Any]:
         "indeed-client-sub-app-component": "./CandidateReviewPage",
         "Origin": "https://employers.indeed.com",
         "Referer": "https://employers.indeed.com/",
-        "Cookie": f"CTK={ctk}",
+        "Cookie": build_cookie_header(ctk),
     }
+    session_used = bool(get_session_cookies())
+    print(f"[indeed_fetcher] fetch_all_details({legacy_id}): using_session_cookies={session_used}", flush=True)
     payload = {
         "query": query,
         "variables": variables
@@ -224,7 +273,7 @@ def fetch_recent_candidates(limit: int = 30, timeout: int = 5) -> list:
         "indeed-client-sub-app-component": "./CandidateReviewPage",
         "Origin": "https://employers.indeed.com",
         "Referer": "https://employers.indeed.com/",
-        "Cookie": f"CTK={ctk}",
+        "Cookie": build_cookie_header(ctk),
     }
     try:
         response = requests.post(
