@@ -49,9 +49,16 @@ _processed_ids_lock = RLock()  # Thread-safe access to processed_ids
 
 LOG_DIR = os.getenv("LOG_DIR", "/tmp")
 SLACK_ERROR_WEBHOOK_URL = os.getenv("SLACK_ERROR_WEBHOOK_URL")
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+COWORK_QUEUE_CHANNEL = os.getenv("COWORK_QUEUE_CHANNEL", "C0B1D2757FS")
 
 # --- Processed IDs file for duplicate prevention ---
 PROCESSED_IDS_FILE = os.getenv("PROCESSED_IDS_FILE", os.path.join(LOG_DIR, "processed_ids.json"))
+
+# --- CAS State Store (v2: Indeed応募信号管理) ---
+CAS_STATE_FILE = os.path.join(LOG_DIR, "cas_state.json")
+_cas_store = {}  # {signal_id: {"status": ..., "detected_at": ..., ...}}
+_cas_store_lock = RLock()
 
 # --- Mention IDs (generic slots: set as many as needed) ---
 SLACK_MENTION_ID_1 = os.getenv("SLACK_MENTION_ID_1")
@@ -85,6 +92,8 @@ MAX_EMAILS_PER_CYCLE = _safe_int("MAX_EMAILS_PER_CYCLE", 10)  # 1サイクルで
 # --- Startup Protection Threshold ---
 # 初回サイクルでこの数を超えるメールが見つかった場合、再起動後の重複通知を防ぐため静かにマーク
 STARTUP_NEW_EMAIL_THRESHOLD = _safe_int("STARTUP_NEW_EMAIL_THRESHOLD", 3)
+FALLBACK_TIMEOUT_SECONDS = _safe_int("FALLBACK_TIMEOUT_SECONDS", 300)
+FALLBACK_CHECK_INTERVAL = _safe_int("FALLBACK_CHECK_INTERVAL", 30)
 
 # --- Logging ---
 def log(msg: str) -> None:
@@ -921,22 +930,37 @@ def process_mail_by_uid(
             log(f"URL obtained on retry for {applicant_name}")
     if phone:
         phone = normalize_phone_number(phone)
-    log(f"Notify {source}: {applicant_name}, phone={phone}, url={url}, id={unique_id}")
-    slack_ok = notify_slack_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
-    line_ok = notify_line_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
-    if not slack_ok:
-        log(f"WARNING: Slack notification failed for {applicant_name} ({unique_id})")
-    if not line_ok:
-        log(f"WARNING: LINE notification failed for {applicant_name} ({unique_id})")
-    if not slack_ok and not line_ok:
-        # 全通知失敗時でも処理済みとしてマーク（20秒毎の無限リトライを防ぐ）
-        # エラーアラートを送信して手動確認を促す
-        phone_str = f"電話: {phone}" if phone else "電話: 未記入"
-        notify_error_to_slack(
-            f"【通知失敗】応募者: {applicant_name}\n{phone_str}\nUID: {unique_id}\n\n"
-            f"Slack/LINE通知に失敗しました。Gmailを手動確認してください。"
-        )
-        log(f"ERROR: All notifications failed for {applicant_name} ({unique_id}) - marked as processed, error alert sent")
+    # --- v2: Indeed応募でphone未取得の場合、Coworkに委譲 ---
+    if source == "indeed" and not phone:
+        signal_id = f"gm:{uid_str}"
+        engage_url_for_signal = ""
+        try:
+            engage_urls_list = extract_indeed_engage_urls(html)
+            if engage_urls_list:
+                engage_url_for_signal = engage_urls_list[0]
+        except Exception:
+            pass
+        position = subject or ""
+        short_url = shorten_url(url) if url else ""
+        signal_ok = post_signal_to_slack(signal_id, applicant_name, position, url, engage_url_for_signal, legacy_id or "", short_url)
+        if signal_ok:
+            record_cas_entry(signal_id, "PENDING", detected_at=datetime.now().astimezone().isoformat(), applicant_name=applicant_name, indeed_url=url or "", short_url=short_url, owner="railway")
+            log(f"Signal posted, waiting for Cowork: {signal_id}")
+        else:
+            send_fallback_notification(applicant_name, url, short_url or url or "")
+            record_cas_entry(signal_id, "FALLBACK", detected_at=datetime.now().astimezone().isoformat(), fallback_at=datetime.now().astimezone().isoformat(), applicant_name=applicant_name, indeed_url=url or "", short_url=short_url, owner="railway")
+    else:
+        log(f"Notify {source}: {applicant_name}, phone={phone}, url={url}, id={unique_id}")
+        slack_ok = notify_slack_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
+        line_ok = notify_line_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
+        if not slack_ok:
+            log(f"WARNING: Slack notification failed for {applicant_name} ({unique_id})")
+        if not line_ok:
+            log(f"WARNING: LINE notification failed for {applicant_name} ({unique_id})")
+        if not slack_ok and not line_ok:
+            phone_str = f"電話: {phone}" if phone else "電話: 未記入"
+            notify_error_to_slack(f"【通知失敗】応募者: {applicant_name}\n{phone_str}\nUID: {unique_id}\n\nSlack/LINE通知に失敗しました。Gmailを手動確認してください。")
+            log(f"ERROR: All notifications failed for {applicant_name} ({unique_id}) - marked as processed, error alert sent")
     return unique_id
 
 def get_gm_msgid_lightweight(mail: imaplib.IMAP4_SSL, uid: str) -> Optional[str]:
@@ -1111,6 +1135,126 @@ def verify_storage() -> bool:
     return True
 
 # --- Flask Webhook Server (Cowork LINE compatible) ---
+
+def load_cas_store() -> dict:
+    try:
+        if os.path.exists(CAS_STATE_FILE):
+            with open(CAS_STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        log(f"ERROR: Failed to load CAS store: {e}")
+    return {}
+
+def save_cas_store(store: dict) -> bool:
+    try:
+        with open(CAS_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(store, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        log(f"ERROR: Failed to save CAS store: {e}")
+        return False
+
+def record_cas_entry(signal_id: str, status: str, **kwargs) -> None:
+    with _cas_store_lock:
+        store = load_cas_store()
+        entry = store.get(signal_id, {})
+        entry["status"] = status
+        for k, v in kwargs.items():
+            entry[k] = v
+        store[signal_id] = entry
+        save_cas_store(store)
+
+def get_cas_entry(signal_id: str) -> Optional[dict]:
+    with _cas_store_lock:
+        store = load_cas_store()
+        return store.get(signal_id)
+
+def post_signal_to_slack(signal_id, applicant_name, position, indeed_url, engage_url, legacy_id, short_url=""):
+    channel = COWORK_QUEUE_CHANNEL
+    bot_token = SLACK_BOT_TOKEN
+    if not bot_token:
+        log("ERROR: SLACK_BOT_TOKEN not set, cannot post signal")
+        return False
+    jst = datetime.now().astimezone()
+    payload = {"type": "indeed_application", "id": signal_id, "applicant_name": applicant_name, "position": position or "", "indeed_url": indeed_url or "", "engage_url": engage_url or "", "legacy_id": legacy_id or "", "short_url": short_url, "detected_at": jst.isoformat(), "status": "PENDING"}
+    for attempt in range(3):
+        try:
+            resp = requests.post("https://slack.com/api/chat.postMessage", headers={"Authorization": f"Bearer {bot_token}"}, json={"channel": channel, "text": json.dumps(payload, ensure_ascii=False)}, timeout=10)
+            if resp.ok and resp.json().get("ok"):
+                log(f"Signal posted to Slack: {signal_id}")
+                return True
+            else:
+                log(f"Signal post failed (attempt {attempt+1}): {resp.text[:200]}")
+        except Exception as e:
+            log(f"Signal post attempt {attempt+1} error: {e}")
+            time.sleep(2)
+    log(f"Signal post failed after 3 attempts: {signal_id}")
+    return False
+
+
+def send_fallback_notification(applicant_name, indeed_url, short_url=None):
+    url = short_url or indeed_url or ""
+    log(f"Sending fallback notification for {applicant_name}")
+    mention = "<!channel>\n" if not is_test_mode() else ""
+    slack_text = f"{mention}【Indeed 新着応募（速報）】\n氏名：{applicant_name}\n電話：⚠ 手動確認が必要\nURL：{url}\n※ Indeed管理画面で電話番号を確認してください"
+    webhook_url = get_slack_webhook_url()
+    if webhook_url:
+        try:
+            resp = requests.post(webhook_url, json={"text": slack_text}, timeout=10)
+            if resp.status_code < 400:
+                log(f"Fallback Slack sent for {applicant_name}")
+            else:
+                log(f"ERROR: Fallback Slack failed: {resp.status_code}")
+        except Exception as e:
+            log(f"ERROR: Fallback Slack error: {e}")
+    line_to_id = get_line_to_id()
+    if LINE_CHANNEL_ACCESS_TOKEN and line_to_id:
+        line_text = f"@all\n【Indeed 新着応募（速報）】\n氏名：{applicant_name}\n電話：⚠ 手動確認が必要\nURL：{url}\n※ Indeed管理画面で電話番号を確認してください"
+        try:
+            resp = requests.post("https://api.line.me/v2/bot/message/push", json={"to": line_to_id, "messages": [{"type": "text", "text": line_text}]}, headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}, timeout=10)
+            if resp.status_code < 400:
+                log(f"Fallback LINE sent for {applicant_name}")
+            else:
+                log(f"ERROR: Fallback LINE failed: {resp.status_code}")
+        except Exception as e:
+            log(f"ERROR: Fallback LINE error: {e}")
+
+def check_fallback_timers():
+    now = datetime.now().astimezone()
+    timeout = timedelta(seconds=FALLBACK_TIMEOUT_SECONDS)
+    with _cas_store_lock:
+        store = load_cas_store()
+        changed = False
+        for signal_id, entry in list(store.items()):
+            status = entry.get("status")
+            if status not in ("PENDING", "LOCKED"):
+                continue
+            detected_str = entry.get("detected_at", "")
+            if not detected_str:
+                continue
+            try:
+                detected_at = datetime.fromisoformat(detected_str)
+            except (ValueError, TypeError):
+                continue
+            if now - detected_at > timeout:
+                entry["status"] = "FALLBACK"
+                entry["fallback_at"] = now.isoformat()
+                entry["owner"] = "railway"
+                store[signal_id] = entry
+                changed = True
+                send_fallback_notification(applicant_name=entry.get("applicant_name", "不明"), indeed_url=entry.get("indeed_url", ""), short_url=entry.get("short_url", ""))
+                log(f"Fallback triggered for {signal_id} (status was {status})")
+        if changed:
+            save_cas_store(store)
+
+def start_fallback_checker():
+    while True:
+        try:
+            check_fallback_timers()
+        except Exception as e:
+            log(f"Fallback checker error: {e}")
+        time.sleep(FALLBACK_CHECK_INTERVAL)
+
 flask_app = Flask(__name__)
 
 @flask_app.after_request
@@ -1126,6 +1270,50 @@ def add_cors(response):
 @flask_app.route("/health", methods=["GET"])
 def health_check():
     return jsonify({"status": "ok"})
+
+@flask_app.route("/api/cas", methods=["POST", "OPTIONS"])
+def api_cas():
+    if flask_request.method == "OPTIONS":
+        return "", 200
+    token = os.environ.get("COWORK_WEBHOOK_TOKEN", "")
+    if not token:
+        return jsonify({"ok": False, "error": "server_misconfigured"}), 500
+    auth_header = flask_request.headers.get("Authorization", "")
+    provided_token = auth_header.replace("Bearer ", "") if auth_header.startswith("Bearer ") else ""
+    if not hmac.compare_digest(provided_token, token):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    data = flask_request.get_json()
+    if not data:
+        return jsonify({"ok": False, "error": "invalid_json"}), 400
+    signal_id = data.get("id")
+    expected_from = data.get("from")
+    target_to = data.get("to")
+    owner = data.get("owner", "unknown")
+    if not all([signal_id, expected_from, target_to]):
+        return jsonify({"ok": False, "error": "missing_fields"}), 400
+    valid_transitions = {("PENDING", "LOCKED"), ("LOCKED", "NOTIFIED"), ("LOCKED", "FALLBACK"), ("PENDING", "FALLBACK")}
+    if (expected_from, target_to) not in valid_transitions:
+        return jsonify({"ok": False, "error": "invalid_transition"}), 400
+    jst_now = datetime.now().astimezone().isoformat()
+    with _cas_store_lock:
+        store = load_cas_store()
+        entry = store.get(signal_id, {})
+        current_status = entry.get("status", "UNKNOWN")
+        if current_status != expected_from:
+            return jsonify({"ok": False, "error": "state_mismatch", "id": signal_id, "expected": expected_from, "actual": current_status}), 409
+        entry["status"] = target_to
+        entry["owner"] = owner
+        if target_to == "LOCKED":
+            entry["locked_at"] = jst_now
+        elif target_to == "NOTIFIED":
+            entry["notified_at"] = jst_now
+        elif target_to == "FALLBACK":
+            entry["fallback_at"] = jst_now
+        store[signal_id] = entry
+        save_cas_store(store)
+    log(f"CAS: {signal_id} {expected_from} -> {target_to} (owner={owner})")
+    return jsonify({"ok": True, "id": signal_id, "previous": expected_from, "current": target_to, "locked_at": entry.get("locked_at", "")}), 200
+
 
 @flask_app.route("/test-ctk", methods=["GET"])
 def test_ctk():
@@ -1620,6 +1808,9 @@ def main() -> None:
     # Start Flask webhook server in background thread
     flask_thread = Thread(target=run_flask_server, daemon=True)
     flask_thread.start()
+    fb_thread = Thread(target=start_fallback_checker, daemon=True)
+    fb_thread.start()
+    log(f"Fallback checker started (timeout={FALLBACK_TIMEOUT_SECONDS}s, interval={FALLBACK_CHECK_INTERVAL}s)")
     log(f"Starting Gmail polling with POLL_INTERVAL_SECONDS={POLL_INTERVAL_SECONDS}")
     log(f"MODE={MODE}, SEARCH_DAYS={SEARCH_DAYS}, MAX_BACKOFF_SECONDS={MAX_BACKOFF_SECONDS}, MAX_EMAILS_PER_CYCLE={MAX_EMAILS_PER_CYCLE}")
     # Verify storage is working
