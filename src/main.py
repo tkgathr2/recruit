@@ -1010,15 +1010,15 @@ def process_mail_by_uid(
         short_url = shorten_url(url) if url else ""
         signal_ok = post_signal_to_slack(signal_id, applicant_name, position, url, engage_url_for_signal, legacy_id or "", short_url)
         if signal_ok:
-            record_cas_entry(signal_id, "PENDING", detected_at=datetime.now().astimezone().isoformat(), applicant_name=applicant_name, indeed_url=url or "", short_url=short_url, owner="railway")
+            record_cas_entry(signal_id, "PENDING", detected_at=datetime.now().astimezone().isoformat(), applicant_name=applicant_name, position=position, indeed_url=url or "", short_url=short_url, owner="railway")
             log(f"Signal posted, waiting for Cowork: {signal_id}")
         else:
-            send_fallback_notification(applicant_name, url, short_url or url or "")
-            record_cas_entry(signal_id, "FALLBACK", detected_at=datetime.now().astimezone().isoformat(), fallback_at=datetime.now().astimezone().isoformat(), applicant_name=applicant_name, indeed_url=url or "", short_url=short_url, owner="railway")
+            send_fallback_notification(applicant_name, url, short_url or url or "", position=position)
+            record_cas_entry(signal_id, "FALLBACK", detected_at=datetime.now().astimezone().isoformat(), fallback_at=datetime.now().astimezone().isoformat(), applicant_name=applicant_name, position=position, indeed_url=url or "", short_url=short_url, owner="railway")
     else:
         log(f"Notify {source}: {applicant_name}, phone={phone}, url={url}, id={unique_id}")
-        slack_ok = notify_slack_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
-        line_ok = notify_line_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
+        slack_ok = notify_slack_with_retry(source, applicant_name, url, job_title=subject, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
+        line_ok = notify_line_with_retry(source, applicant_name, url, job_title=subject, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
         if not slack_ok:
             log(f"WARNING: Slack notification failed for {applicant_name} ({unique_id})")
         if not line_ok:
@@ -1258,11 +1258,12 @@ def post_signal_to_slack(signal_id, applicant_name, position, indeed_url, engage
     return False
 
 
-def send_fallback_notification(applicant_name, indeed_url, short_url=None):
+def send_fallback_notification(applicant_name, indeed_url, short_url=None, position=None):
     url = short_url or indeed_url or ""
     log(f"Sending fallback notification for {applicant_name}")
     mention = "<!channel>\n" if not is_test_mode() else ""
-    slack_text = f"{mention}【Indeed 新着応募（速報）】\n氏名：{applicant_name}\n電話：⚠ 手動確認が必要\nURL：{url}\n※ Indeed管理画面で電話番号を確認してください"
+    position_line = f"\n求人：{position}" if position else ""
+    slack_text = f"{mention}【Indeed 新着応募（速報）】\n氏名：{applicant_name}{position_line}\n電話：⚠ 手動確認が必要\nURL：{url}\n※ Indeed管理画面で電話番号を確認してください"
     webhook_url = get_slack_webhook_url()
     if webhook_url:
         try:
@@ -1275,9 +1276,10 @@ def send_fallback_notification(applicant_name, indeed_url, short_url=None):
             log(f"ERROR: Fallback Slack error: {e}")
     line_to_id = get_line_to_id()
     if LINE_CHANNEL_ACCESS_TOKEN and line_to_id:
-        line_text = f"@all\n【Indeed 新着応募（速報）】\n氏名：{applicant_name}\n電話：⚠ 手動確認が必要\nURL：{url}\n※ Indeed管理画面で電話番号を確認してください"
+        position_line_l = f"\n求人：{position}" if position else ""
+        line_text = f"@all\n【Indeed 新着応募（速報）】\n氏名：{applicant_name}{position_line_l}\n電話：⚠ 手動確認が必要\nURL：{url}\n※ Indeed管理画面で電話番号を確認してください"
         try:
-            resp = requests.post("https://api.line.me/v2/bot/message/push", json={"to": line_to_id, "messages": [{"type": "text", "text": line_text}]}, headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}, timeout=10)
+            resp = requests.post("https://api.line.me/v2/bot/message/push", json={"to": line_to_id, "messages": [{"type": "textV2", "text": line_text, "sender": {}, "mentionees": [{"type": "all", "index": 0, "length": 4}]}]}, headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}, timeout=10)
             if resp.status_code < 400:
                 log(f"Fallback LINE sent for {applicant_name}")
             else:
@@ -1308,7 +1310,7 @@ def check_fallback_timers():
                 entry["owner"] = "railway"
                 store[signal_id] = entry
                 changed = True
-                send_fallback_notification(applicant_name=entry.get("applicant_name", "不明"), indeed_url=entry.get("indeed_url", ""), short_url=entry.get("short_url", ""))
+                send_fallback_notification(applicant_name=entry.get("applicant_name", "不明"), indeed_url=entry.get("indeed_url", ""), short_url=entry.get("short_url", ""), position=entry.get("position", ""))
                 log(f"Fallback triggered for {signal_id} (status was {status})")
         if changed:
             save_cas_store(store)
