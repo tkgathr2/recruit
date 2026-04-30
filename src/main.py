@@ -1278,8 +1278,15 @@ def api_cas():
     token = os.environ.get("COWORK_WEBHOOK_TOKEN", "")
     if not token:
         return jsonify({"ok": False, "error": "server_misconfigured"}), 500
+    # Support both Authorization: Bearer header and ?token= query parameter
     auth_header = flask_request.headers.get("Authorization", "")
-    provided_token = auth_header.replace("Bearer ", "") if auth_header.startswith("Bearer ") else ""
+    query_token = flask_request.args.get("token", "")
+    if auth_header.startswith("Bearer "):
+        provided_token = auth_header.replace("Bearer ", "")
+    elif query_token:
+        provided_token = query_token
+    else:
+        provided_token = ""
     if not hmac.compare_digest(provided_token, token):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     data = flask_request.get_json()
@@ -1298,7 +1305,7 @@ def api_cas():
     with _cas_store_lock:
         store = load_cas_store()
         entry = store.get(signal_id, {})
-        current_status = entry.get("status", "UNKNOWN")
+        current_status = entry.get("status", "PENDING")
         if current_status != expected_from:
             return jsonify({"ok": False, "error": "state_mismatch", "id": signal_id, "expected": expected_from, "actual": current_status}), 409
         entry["status"] = target_to
