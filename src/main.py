@@ -630,16 +630,30 @@ def format_phone_for_line(phone: str) -> str:
     return phone
 
 def shorten_url(url: str) -> str:
-    """Shorten URL using TinyURL API. Returns original URL if shortening fails."""
+    """Shorten URL using multiple services with fallback. Returns original URL if all fail."""
     if not url:
         return url
+    # Try is.gd first (fast, no auth required)
     try:
-        api = "https://tinyurl.com/api-create.php" + "?url=" + quote(url, safe="")
-        resp = requests.get(api, timeout=3)
+        api = "https://is.gd/create.php?format=simple&url=" + quote(url, safe="")
+        resp = requests.get(api, timeout=5)
         if resp.status_code == 200 and resp.text.strip().startswith("http"):
+            log(f"shorten_url: is.gd success -> {resp.text.strip()}")
             return resp.text.strip()
-    except Exception:
-        log("WARNING: shorten_url failed, using original URL")
+        log(f"WARNING: is.gd returned status={resp.status_code}")
+    except Exception as e:
+        log(f"WARNING: is.gd failed: {e}")
+    # Fallback: TinyURL
+    try:
+        api = "https://tinyurl.com/api-create.php?url=" + quote(url, safe="")
+        resp = requests.get(api, timeout=5)
+        if resp.status_code == 200 and resp.text.strip().startswith("http"):
+            log(f"shorten_url: tinyurl success -> {resp.text.strip()}")
+            return resp.text.strip()
+        log(f"WARNING: tinyurl returned status={resp.status_code}")
+    except Exception as e:
+        log(f"WARNING: tinyurl failed: {e}")
+    log(f"WARNING: All URL shortening services failed for {url}")
     return url
 
 def extract_applicant_name_from_html(html: str) -> Optional[str]:
