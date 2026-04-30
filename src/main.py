@@ -10,7 +10,7 @@ import re
 import hmac
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional, Set, Tuple
+from typing import Dict, Optional, Set, Tuple
 import requests
 from urllib.parse import quote
 from bs4 import BeautifulSoup
@@ -55,6 +55,9 @@ COWORK_QUEUE_CHANNEL = os.getenv("COWORK_QUEUE_CHANNEL", "C0B1D2757FS")
 # --- Processed IDs file for duplicate prevention ---
 PROCESSED_IDS_FILE = os.getenv("PROCESSED_IDS_FILE", os.path.join(LOG_DIR, "processed_ids.json"))
 
+# --- Processed IDs cleanup settings ---
+_processed_ids_timestamps: Dict[str, str] = {}  # {id: "YYYY-MM-DD"} — 登録日を追跡
+
 # --- CAS State Store (v2: Indeed応募信号管理) ---
 CAS_STATE_FILE = os.path.join(LOG_DIR, "cas_state.json")
 _cas_store = {}  # {signal_id: {"status": ..., "detected_at": ..., ...}}
@@ -94,6 +97,7 @@ MAX_EMAILS_PER_CYCLE = _safe_int("MAX_EMAILS_PER_CYCLE", 10)  # 1サイクルで
 STARTUP_NEW_EMAIL_THRESHOLD = _safe_int("STARTUP_NEW_EMAIL_THRESHOLD", 3)
 FALLBACK_TIMEOUT_SECONDS = _safe_int("FALLBACK_TIMEOUT_SECONDS", 300)
 FALLBACK_CHECK_INTERVAL = _safe_int("FALLBACK_CHECK_INTERVAL", 30)
+PROCESSED_IDS_MAX_AGE_DAYS = _safe_int("PROCESSED_IDS_MAX_AGE_DAYS", 30)  # 30日超のIDを自動削除
 
 # --- Logging ---
 def log(msg: str) -> None:
@@ -143,40 +147,100 @@ def load_processed_ids() -> Tuple[Set[str], bool]:
     """Load processed message IDs from file.
     Returns: Tuple of (processed_ids set, success flag).
     If file exists but can't be read, returns (empty set, False) to prevent mass re-processing.
+
+    Supports two on-disk formats:
+      - Legacy list: ["gm:123", "uid:456", ...]
+      - Timestamped dict: {"gm:123": "2026-04-30", "uid:456": "2026-04-29", ...}
+    Legacy format is auto-migrated to dict on first load.
     """
+    global _processed_ids_timestamps
     if os.path.exists(PROCESSED_IDS_FILE):
         try:
             with open(PROCESSED_IDS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            log(f"Loaded {len(data)} processed IDs from {PROCESSED_IDS_FILE}")
-            # Migrate old format IDs to new format
-            original_set = set(data)
+
+            today_str = datetime.now().strftime("%Y-%m-%d")
+
+            if isinstance(data, dict):
+                # New timestamped dict format
+                _processed_ids_timestamps = data
+                id_set = set(data.keys())
+                log(f"Loaded {len(id_set)} processed IDs (timestamped format) from {PROCESSED_IDS_FILE}")
+            elif isinstance(data, list):
+                # Legacy list format → migrate to dict with today's date
+                id_set = set(data)
+                _processed_ids_timestamps = {id_val: today_str for id_val in id_set}
+                log(f"Loaded {len(id_set)} processed IDs (legacy list format, migrating to timestamped)")
+            else:
+                raise ValueError(f"Unexpected JSON type: {type(data).__name__}")
+
+            # Migrate old ID format (raw numbers → gm: prefix)
+            original_set = set(id_set)
             migrated = migrate_old_id_format(original_set)
-            # Save immediately if migration occurred to prevent re-migration on crash
             if migrated != original_set:
+                # Update timestamps for migrated IDs
+                new_ts = {}
+                for old_id in original_set:
+                    new_id = f"gm:{old_id}" if old_id.isdigit() else old_id
+                    ts = _processed_ids_timestamps.get(old_id, today_str)
+                    new_ts[new_id] = ts
+                # Keep non-migrated entries
+                for mid in migrated - {f"gm:{x}" for x in original_set if x.isdigit()}:
+                    if mid in _processed_ids_timestamps:
+                        new_ts[mid] = _processed_ids_timestamps[mid]
+                _processed_ids_timestamps = new_ts
                 save_processed_ids(migrated)
+
             return migrated, True
-        except (json.JSONDecodeError, IOError) as e:
+        except (json.JSONDecodeError, IOError, ValueError) as e:
             log(f"ERROR: Failed to load processed IDs (file exists but corrupted): {e}")
             notify_error_to_slack(f"CRITICAL: Failed to load processed IDs - file corrupted: {e}")
-            # Return False to prevent mass re-processing of all emails
             return set(), False
     else:
         log(f"Processed IDs file does not exist: {PROCESSED_IDS_FILE} (first run)")
+        _processed_ids_timestamps = {}
         return set(), True
 
 def save_processed_ids(processed_ids: Set[str]) -> bool:
     """Save processed message IDs to file atomically. Returns True if successful.
     Uses tempfile + os.replace() for atomic write to prevent JSON corruption on crash.
     All entry types (uid:, gm:, mid:) are persisted to ensure deduplication correctness.
-    Cap at MAX_PROCESSED_IDS, keeping NEWEST entries (sorted by numeric ID).
+
+    Cleanup strategy (applied in order):
+      1. Age-based pruning: remove entries older than PROCESSED_IDS_MAX_AGE_DAYS
+      2. Cap at MAX_PROCESSED_IDS, keeping NEWEST entries (sorted by numeric ID)
+
+    File format: JSON dict {"id": "YYYY-MM-DD", ...} with registration dates.
     """
+    global _processed_ids_timestamps
     if not ensure_processed_ids_dir():
         return False
     try:
-        MAX_PROCESSED_IDS = 10000
+        MAX_PROCESSED_IDS = 5000
+        today_str = datetime.now().strftime("%Y-%m-%d")
+
+        # --- Step 1: Sync timestamps with the id set ---
+        # Assign today's date to any new IDs not yet tracked
+        for msg_id in processed_ids:
+            if msg_id not in _processed_ids_timestamps:
+                _processed_ids_timestamps[msg_id] = today_str
+        # Remove timestamps for IDs no longer in the set (e.g. manually deleted)
+        stale_keys = set(_processed_ids_timestamps.keys()) - processed_ids
+        for k in stale_keys:
+            del _processed_ids_timestamps[k]
+
+        # --- Step 2: Age-based pruning (remove entries older than N days) ---
+        if PROCESSED_IDS_MAX_AGE_DAYS > 0:
+            cutoff = (datetime.now() - timedelta(days=PROCESSED_IDS_MAX_AGE_DAYS)).strftime("%Y-%m-%d")
+            expired = {k for k, v in _processed_ids_timestamps.items() if v < cutoff}
+            if expired:
+                log(f"Pruning {len(expired)} processed IDs older than {PROCESSED_IDS_MAX_AGE_DAYS} days")
+                for k in expired:
+                    _processed_ids_timestamps.pop(k, None)
+                processed_ids = processed_ids - expired
+
+        # --- Step 3: Cap at MAX_PROCESSED_IDS (keep newest) ---
         if len(processed_ids) > MAX_PROCESSED_IDS:
-            # Sort by recency: gm:/uid: have numeric IDs (larger = newer); mid: has no order
             def _sort_key(msg_id: str) -> int:
                 if msg_id.startswith("gm:"):
                     try:
@@ -189,20 +253,22 @@ def save_processed_ids(processed_ids: Set[str]) -> bool:
                     except ValueError:
                         return 0
                 return 0  # mid: and unknown — treated as oldest, discarded first when trimming
-            # Sort ascending → take last MAX_PROCESSED_IDS (highest/newest numeric IDs)
-            persistent_ids = sorted(processed_ids, key=_sort_key)[-MAX_PROCESSED_IDS:]
-            log(f"Trimmed processed IDs from {len(processed_ids)} to {MAX_PROCESSED_IDS} (kept newest)")
-        else:
-            persistent_ids = list(processed_ids)
-        # Atomic write: write to temp file then replace to prevent partial writes on crash
+            kept = set(sorted(processed_ids, key=_sort_key)[-MAX_PROCESSED_IDS:])
+            removed = processed_ids - kept
+            for k in removed:
+                _processed_ids_timestamps.pop(k, None)
+            processed_ids = kept
+            log(f"Trimmed processed IDs to {MAX_PROCESSED_IDS} (kept newest)")
+
+        # --- Step 4: Build timestamped dict and write atomically ---
+        output = {mid: _processed_ids_timestamps.get(mid, today_str) for mid in processed_ids}
         target_path = Path(PROCESSED_IDS_FILE)
         tmp_path = target_path.with_suffix(".tmp")
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(persistent_ids, f)
+                json.dump(output, f, ensure_ascii=False)
             tmp_path.replace(target_path)
         except Exception:
-            # Clean up .tmp file on failure to avoid stale file accumulation
             try:
                 tmp_path.unlink(missing_ok=True)
             except OSError:
