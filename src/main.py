@@ -39,7 +39,6 @@ SLACK_WEBHOOK_URL_PROD = os.getenv("SLACK_WEBHOOK_URL_PROD")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_TO_ID_TEST = os.getenv("LINE_TO_ID_TEST")
 LINE_TO_ID_PROD = os.getenv("LINE_TO_ID_PROD")
-LINE_TO_ID_PERSONAL = os.getenv("LINE_TO_ID_PERSONAL")  # CTK通知用（個人LINE）
 COWORK_WEBHOOK_TOKEN = os.getenv("COWORK_WEBHOOK_TOKEN", "")
 
 # CTK更新フォームのベースURL（Railway のサービスURL）
@@ -331,7 +330,7 @@ def notify_ctk_expired() -> None:
     else:
         log("ERROR: CTK期限切れ Slack通知 失敗")
     # LINE通知（個人LINEに送信、未設定の場合はグループにフォールバック）
-    line_to_id = LINE_TO_ID_PERSONAL or get_line_to_id()
+    line_to_id = get_line_to_id()
     if LINE_CHANNEL_ACCESS_TOKEN and line_to_id:
         try:
             resp = requests.post(
@@ -395,7 +394,7 @@ def notify_url_missing(applicant_name: str, unique_id: str) -> None:
     # Slackアラート
     notify_slack_direct(message)
     # LINEアラート（個人LINEに送信）
-    line_to_id = LINE_TO_ID_PERSONAL or get_line_to_id()
+    line_to_id = get_line_to_id()
     if LINE_CHANNEL_ACCESS_TOKEN and line_to_id:
         try:
             resp = requests.post(
@@ -1784,35 +1783,6 @@ def send_setup_msg():
     except Exception as e:
         log(f"[send-setup-msg] error: {e}")
         return f"Error: {e}", 500
-
-
-@flask_app.route("/send-test-personal", methods=["GET"])
-def send_test_personal():
-    """個人LINEにテストメッセージを送信する（GETで呼び出し可）"""
-    token = flask_request.args.get("token", "")
-    if not COWORK_WEBHOOK_TOKEN or not hmac.compare_digest(token, COWORK_WEBHOOK_TOKEN):
-        return "Unauthorized", 401
-    personal_id = LINE_TO_ID_PERSONAL
-    if not personal_id or not LINE_CHANNEL_ACCESS_TOKEN:
-        return "LINE_TO_ID_PERSONAL not configured", 500
-    msg = flask_request.args.get("msg", "【テスト】個人LINE通知テストです。このメッセージが届いていれば設定成功です。")
-    try:
-        resp = requests.post(
-            "https://api.line.me/v2/bot/message/push",
-            json={"to": personal_id, "messages": [{"type": "text", "text": msg}]},
-            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"},
-            timeout=10,
-        )
-        log(f"[send-test-personal] LINE status={resp.status_code}")
-        if resp.status_code < 400:
-            return "✅ 個人LINEに送信しました", 200
-        return f"LINE API error: {resp.status_code} {resp.text}", 500
-    except Exception as e:
-        log(f"[send-test-personal] error: {e}")
-        return f"Error: {e}", 500
-
-
-
 @flask_app.route("/send-test-all", methods=["GET"])
 def send_test_all():
     """Slack + LINEグループ + LINE個人にテストメッセージを送信する。URL短縮テスト付き。"""
@@ -1821,7 +1791,7 @@ def send_test_all():
         return "Unauthorized", 401
     msg = flask_request.args.get("msg", "")
     raw_url = flask_request.args.get("url", "")
-    results = {"shorten": None, "slack": None, "line_group": None, "line_personal": None}
+    results = {"shorten": None, "slack": None, "line_group": None}
     # URL短縮テスト
     short_url = ""
     if raw_url:
@@ -1859,25 +1829,6 @@ def send_test_all():
             log(f"[send-test-all] LINE group error: {e}")
     else:
         results["line_group"] = {"error": "LINE_CHANNEL_ACCESS_TOKEN or LINE_TO_ID_PROD not set"}
-    # LINE個人送信
-    personal_id = LINE_TO_ID_PERSONAL
-    if LINE_CHANNEL_ACCESS_TOKEN and personal_id:
-        try:
-            resp = requests.post(
-                "https://api.line.me/v2/bot/message/push",
-                json={"to": personal_id, "messages": [{"type": "text", "text": final_msg}]},
-                headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"},
-                timeout=10,
-            )
-            results["line_personal"] = {"status": resp.status_code, "ok": resp.status_code < 400, "to": personal_id[:8] + "..."}
-            log(f"[send-test-all] LINE personal status={resp.status_code}")
-            if resp.status_code >= 400:
-                results["line_personal"]["body"] = resp.text[:200]
-        except Exception as e:
-            results["line_personal"] = {"error": str(e)}
-            log(f"[send-test-all] LINE personal error: {e}")
-    else:
-        results["line_personal"] = {"error": "LINE_CHANNEL_ACCESS_TOKEN or LINE_TO_ID_PERSONAL not set"}
     return jsonify(results), 200
 
 @flask_app.route("/notify-line", methods=["POST", "OPTIONS"])
