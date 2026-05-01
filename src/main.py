@@ -1036,10 +1036,10 @@ def process_mail_by_uid(
                 short_url=short_url,
                 owner="railway"
             )
-            log(f"v4: Signal posted, polling CAS for phone (max 120s): {signal_id}")
-            # Poll CAS store for up to 120 seconds at 10-second intervals
-            poll_timeout = 120
-            poll_interval = 10
+            log(f"v5: Signal posted, polling CAS for phone (max 40s): {signal_id}")
+            # Poll CAS store for up to 40 seconds at 5-second intervals
+            poll_timeout = 40
+            poll_interval = 5
             elapsed = 0
             while elapsed < poll_timeout:
                 time.sleep(poll_interval)
@@ -1049,10 +1049,10 @@ def process_mail_by_uid(
                     phone = normalize_phone_number(entry["phone"])
                     indeed_location = entry.get("location") or indeed_location
                     indeed_email = entry.get("email") or indeed_email
-                    log(f"v4: Phone obtained via CAS polling after {elapsed}s: {phone}")
+                    log(f"v5: Phone obtained via CAS polling after {elapsed}s: {phone}")
                     break
             if not phone:
-                log(f"v4: CAS polling timed out after {poll_timeout}s, sending notification without phone")
+                log(f"v5: CAS polling timed out after {poll_timeout}s, sending notification without phone")
             record_cas_entry(signal_id, "NOTIFIED",
                 notified_at=datetime.now().astimezone().isoformat(),
                 owner="railway"
@@ -1060,7 +1060,7 @@ def process_mail_by_uid(
         else:
             log(f"WARNING: v4 Signal post failed for {signal_id}, proceeding without phone")
         # 1通だけ通知（電話番号あり/なし）
-        log(f"v4: Notify indeed (1-shot): {applicant_name}, phone={phone}, url={url}, id={unique_id}")
+        log(f"v5: Notify indeed (1-shot): {applicant_name}, phone={phone}, url={url}, id={unique_id}")
         slack_ok = notify_slack_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
         line_ok = notify_line_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
         if not slack_ok:
@@ -1995,10 +1995,10 @@ def main() -> None:
     # Start Flask webhook server in background thread
     flask_thread = Thread(target=run_flask_server, daemon=True)
     flask_thread.start()
-    # v4: 1通だけ方式 — フォールバックタイマー不要（120秒CASポーリングで完結）
+    # v5: 1通だけ方式 — フォールバックタイマー不要（40秒CASポーリングで完結）
     # fb_thread = Thread(target=start_fallback_checker, daemon=True)
     # fb_thread.start()
-    log(f"v4: 1-shot notification mode (120s CAS polling, no fallback checker)")
+    log(f"v5: 1-shot notification mode (40s CAS polling, no fallback checker)")
     log(f"Starting Gmail polling with POLL_INTERVAL_SECONDS={POLL_INTERVAL_SECONDS}")
     log(f"MODE={MODE}, SEARCH_DAYS={SEARCH_DAYS}, MAX_BACKOFF_SECONDS={MAX_BACKOFF_SECONDS}, MAX_EMAILS_PER_CYCLE={MAX_EMAILS_PER_CYCLE}")
     # Verify storage is working
@@ -3072,10 +3072,10 @@ def process_mail_by_uid(
                 short_url=short_url,
                 owner="railway"
             )
-            log(f"v4: Signal posted, polling CAS for phone (max 120s): {signal_id}")
-            # Poll CAS store for up to 120 seconds at 10-second intervals
-            poll_timeout = 120
-            poll_interval = 10
+            log(f"v5: Signal posted, polling CAS for phone (max 40s): {signal_id}")
+            # Poll CAS store for up to 40 seconds at 5-second intervals
+            poll_timeout = 40
+            poll_interval = 5
             elapsed = 0
             while elapsed < poll_timeout:
                 time.sleep(poll_interval)
@@ -3085,10 +3085,10 @@ def process_mail_by_uid(
                     phone = normalize_phone_number(entry["phone"])
                     indeed_location = entry.get("location") or indeed_location
                     indeed_email = entry.get("email") or indeed_email
-                    log(f"v4: Phone obtained via CAS polling after {elapsed}s: {phone}")
+                    log(f"v5: Phone obtained via CAS polling after {elapsed}s: {phone}")
                     break
             if not phone:
-                log(f"v4: CAS polling timed out after {poll_timeout}s, sending notification without phone")
+                log(f"v5: CAS polling timed out after {poll_timeout}s, sending notification without phone")
             record_cas_entry(signal_id, "NOTIFIED",
                 notified_at=datetime.now().astimezone().isoformat(),
                 owner="railway"
@@ -3096,7 +3096,7 @@ def process_mail_by_uid(
         else:
             log(f"WARNING: v4 Signal post failed for {signal_id}, proceeding without phone")
         # 1通だけ通知（電話番号あり/なし）
-        log(f"v4: Notify indeed (1-shot): {applicant_name}, phone={phone}, url={url}, id={unique_id}")
+        log(f"v5: Notify indeed (1-shot): {applicant_name}, phone={phone}, url={url}, id={unique_id}")
         slack_ok = notify_slack_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
         line_ok = notify_line_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
         if not slack_ok:
@@ -4006,10 +4006,10 @@ def main() -> None:
     # Start Flask webhook server in background thread
     flask_thread = Thread(target=run_flask_server, daemon=True)
     flask_thread.start()
-    # v4: 1通だけ方式 — フォールバックタイマー不要（120秒CASポーリングで完結）
+    # v5: 1通だけ方式 — フォールバックタイマー不要（40秒CASポーリングで完結）
     # fb_thread = Thread(target=start_fallback_checker, daemon=True)
     # fb_thread.start()
-    log(f"v4: 1-shot notification mode (120s CAS polling, no fallback checker)")
+    log(f"v5: 1-shot notification mode (40s CAS polling, no fallback checker)")
     log(f"Starting Gmail polling with POLL_INTERVAL_SECONDS={POLL_INTERVAL_SECONDS}")
     log(f"MODE={MODE}, SEARCH_DAYS={SEARCH_DAYS}, MAX_BACKOFF_SECONDS={MAX_BACKOFF_SECONDS}, MAX_EMAILS_PER_CYCLE={MAX_EMAILS_PER_CYCLE}")
     # Verify storage is working
