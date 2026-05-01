@@ -15,6 +15,7 @@ import requests
 from urllib.parse import quote
 from bs4 import BeautifulSoup
 from flask import Flask, request as flask_request, jsonify
+import fcntl
 from threading import Thread, RLock
 from datetime import datetime, timedelta
 
@@ -41,10 +42,28 @@ LINE_TO_ID_TEST = os.getenv("LINE_TO_ID_TEST")
 LINE_TO_ID_PROD = os.getenv("LINE_TO_ID_PROD")
 COWORK_WEBHOOK_TOKEN = os.getenv("COWORK_WEBHOOK_TOKEN", "")
 
-# CTK更新フォームのベースURL（Railway のサービスURL）
+# CTKæ´æ°ãã©ã¼ã ã®ãã¼ã¹URLï¼Railway ã®ãµã¼ãã¹URLï¼
 RAILWAY_SERVICE_URL = os.getenv("RAILWAY_SERVICE_URL", "https://recruit-production-f2dc.up.railway.app")
 
 _processed_ids_lock = RLock()  # Thread-safe access to processed_ids
+
+# --- File-level Lock for Atomic Dedup (prevents cross-process/restart races) ---
+_DEDUP_LOCK_FILE = os.path.join(os.getenv("LOG_DIR", "/tmp"), ".dedup.lock")
+
+@contextmanager
+def dedup_file_lock():
+    """Acquire an exclusive file lock for atomic dedup check-and-register.
+    Prevents duplicate notifications even across process restarts or concurrent
+    Flask webhook handlers. Uses fcntl.flock for advisory locking on Linux.
+    """
+    os.makedirs(os.path.dirname(_DEDUP_LOCK_FILE) or ".", exist_ok=True)
+    fd = open(_DEDUP_LOCK_FILE, "w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield fd
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        fd.close()
 
 LOG_DIR = os.getenv("LOG_DIR", "/tmp")
 SLACK_ERROR_WEBHOOK_URL = os.getenv("SLACK_ERROR_WEBHOOK_URL")
@@ -55,9 +74,9 @@ COWORK_QUEUE_CHANNEL = os.getenv("COWORK_QUEUE_CHANNEL", "C0B1D2757FS")
 PROCESSED_IDS_FILE = os.getenv("PROCESSED_IDS_FILE", os.path.join(LOG_DIR, "processed_ids.json"))
 
 # --- Processed IDs cleanup settings ---
-_processed_ids_timestamps: Dict[str, str] = {}  # {id: "YYYY-MM-DD"} — 登録日を追跡
+_processed_ids_timestamps: Dict[str, str] = {}  # {id: "YYYY-MM-DD"} â ç»é²æ¥ãè¿½è·¡
 
-# --- CAS State Store (v2: Indeed応募信号管理) ---
+# --- CAS State Store (v2: Indeedå¿åä¿¡å·ç®¡ç) ---
 CAS_STATE_FILE = os.path.join(LOG_DIR, "cas_state.json")
 _cas_store = {}  # {signal_id: {"status": ..., "detected_at": ..., ...}}
 _cas_store_lock = RLock()
@@ -70,7 +89,7 @@ LINE_MENTION_ID_2 = os.getenv("LINE_MENTION_ID_2")
 
 # --- Polling Interval ---
 def _safe_int(env_var: str, default: int) -> int:
-    """環境変数を安全にintに変換する。不正値の場合はデフォルト値を使用。"""
+    """ç°å¢å¤æ°ãå®å¨ã«intã«å¤æãããä¸æ­£å¤ã®å ´åã¯ããã©ã«ãå¤ãä½¿ç¨ã"""
     raw = os.getenv(env_var)
     if raw is None:
         return default
@@ -82,21 +101,21 @@ def _safe_int(env_var: str, default: int) -> int:
         return default
 
 
-POLL_INTERVAL_SECONDS = _safe_int("POLL_INTERVAL_SECONDS", 20)  # デフォルト20秒
-MAX_BACKOFF_SECONDS = _safe_int("MAX_BACKOFF_SECONDS", 900)  # 最大15分のバックオフ
+POLL_INTERVAL_SECONDS = _safe_int("POLL_INTERVAL_SECONDS", 20)  # ããã©ã«ã20ç§
+MAX_BACKOFF_SECONDS = _safe_int("MAX_BACKOFF_SECONDS", 900)  # æå¤§15åã®ããã¯ãªã
 
 # --- Search window for emails (days) ---
-SEARCH_DAYS = _safe_int("SEARCH_DAYS", 1)  # デフォルト1日間（Gmail API制限対策）
+SEARCH_DAYS = _safe_int("SEARCH_DAYS", 1)  # ããã©ã«ã1æ¥éï¼Gmail APIå¶éå¯¾ç­ï¼
 
-# --- Batch limit per cycle (QUOTA ERROR対策) ---
-MAX_EMAILS_PER_CYCLE = _safe_int("MAX_EMAILS_PER_CYCLE", 10)  # 1サイクルで処理する最大メール数
+# --- Batch limit per cycle (QUOTA ERRORå¯¾ç­) ---
+MAX_EMAILS_PER_CYCLE = _safe_int("MAX_EMAILS_PER_CYCLE", 10)  # 1ãµã¤ã¯ã«ã§å¦çããæå¤§ã¡ã¼ã«æ°
 
 # --- Startup Protection Threshold ---
-# 初回サイクルでこの数を超えるメールが見つかった場合、再起動後の重複通知を防ぐため静かにマーク
+# ååãµã¤ã¯ã«ã§ãã®æ°ãè¶ããã¡ã¼ã«ãè¦ã¤ãã£ãå ´åãåèµ·åå¾ã®éè¤éç¥ãé²ãããéãã«ãã¼ã¯
 STARTUP_NEW_EMAIL_THRESHOLD = _safe_int("STARTUP_NEW_EMAIL_THRESHOLD", 3)
 FALLBACK_TIMEOUT_SECONDS = _safe_int("FALLBACK_TIMEOUT_SECONDS", 300)
 FALLBACK_CHECK_INTERVAL = _safe_int("FALLBACK_CHECK_INTERVAL", 30)
-PROCESSED_IDS_MAX_AGE_DAYS = _safe_int("PROCESSED_IDS_MAX_AGE_DAYS", 30)  # 30日超のIDを自動削除
+PROCESSED_IDS_MAX_AGE_DAYS = _safe_int("PROCESSED_IDS_MAX_AGE_DAYS", 30)  # 30æ¥è¶ã®IDãèªååé¤
 
 # --- Logging ---
 def log(msg: str) -> None:
@@ -166,14 +185,14 @@ def load_processed_ids() -> Tuple[Set[str], bool]:
                 id_set = set(data.keys())
                 log(f"Loaded {len(id_set)} processed IDs (timestamped format) from {PROCESSED_IDS_FILE}")
             elif isinstance(data, list):
-                # Legacy list format → migrate to dict with today's date
+                # Legacy list format â migrate to dict with today's date
                 id_set = set(data)
                 _processed_ids_timestamps = {id_val: today_str for id_val in id_set}
                 log(f"Loaded {len(id_set)} processed IDs (legacy list format, migrating to timestamped)")
             else:
                 raise ValueError(f"Unexpected JSON type: {type(data).__name__}")
 
-            # Migrate old ID format (raw numbers → gm: prefix)
+            # Migrate old ID format (raw numbers â gm: prefix)
             original_set = set(id_set)
             migrated = migrate_old_id_format(original_set)
             if migrated != original_set:
@@ -251,7 +270,7 @@ def save_processed_ids(processed_ids: Set[str]) -> bool:
                         return int(msg_id[4:])
                     except ValueError:
                         return 0
-                return 0  # mid: and unknown — treated as oldest, discarded first when trimming
+                return 0  # mid: and unknown â treated as oldest, discarded first when trimming
             kept = set(sorted(processed_ids, key=_sort_key)[-MAX_PROCESSED_IDS:])
             removed = processed_ids - kept
             for k in removed:
@@ -284,52 +303,54 @@ def save_processed_ids_with_merge(new_ids: Set[str]) -> bool:
     """Thread-safe save: reload file, merge new_ids, save atomically.
     Use this from check_mail_with_status() to avoid race with Flask /manage-processed.
     Lock hold time is ~milliseconds (file I/O only), not seconds (IMAP).
+    Now also protected by dedup_file_lock for cross-process safety.
     """
-    with _processed_ids_lock:
-        current_ids, load_success = load_processed_ids()
-        if not load_success:
-            log("ERROR: Could not reload processed IDs for merge-save")
-            return False
-        current_ids.update(new_ids)
-        return save_processed_ids(current_ids)
+    with dedup_file_lock():
+        with _processed_ids_lock:
+            current_ids, load_success = load_processed_ids()
+            if not load_success:
+                log("ERROR: Could not reload processed IDs for merge-save")
+                return False
+            current_ids.update(new_ids)
+            return save_processed_ids(current_ids)
 
 def notify_ctk_expired() -> None:
-    """Indeed CTK 期限切れを LINE と Slack で通知する（1サービス起動中に1度だけ）。
-    フラグは少なくとも1つの通知成功後に設定する。全失敗時はフラグをリセットして次回リトライ可能に。
+    """Indeed CTK æéåãã LINE ã¨ Slack ã§éç¥ããï¼1ãµã¼ãã¹èµ·åä¸­ã«1åº¦ã ãï¼ã
+    ãã©ã°ã¯å°ãªãã¨ã1ã¤ã®éç¥æåå¾ã«è¨­å®ãããå¨å¤±ææã¯ãã©ã°ããªã»ãããã¦æ¬¡åãªãã©ã¤å¯è½ã«ã
     """
     global _ctk_expired_notified
     with _ctk_expired_notified_lock:
         if _ctk_expired_notified:
-            return  # すでに通知済み
-    # ← フラグはここでは設定しない（送信成功後に設定）
-    log("ALERT: Indeed CTK が期限切れです。LINE/Slack に通知します。")
+            return  # ãã§ã«éç¥æ¸ã¿
+    # â ãã©ã°ã¯ããã§ã¯è¨­å®ããªãï¼éä¿¡æåå¾ã«è¨­å®ï¼
+    log("ALERT: Indeed CTK ãæéåãã§ããLINE/Slack ã«éç¥ãã¾ãã")
     setup_url = f"{RAILWAY_SERVICE_URL}/update-ctk-setup?token={COWORK_WEBHOOK_TOKEN}"
     session_setup_url = f"{RAILWAY_SERVICE_URL}/update-session-setup?token={COWORK_WEBHOOK_TOKEN}"
     message = (
-        "⚠️ Indeed CTK が期限切れです\n\n"
-        "電話番号・住所の取得ができません。\n"
-        "※ 応募通知自体は届き続けます。\n\n"
-        "【CTK更新手順】\n"
-        "① Chrome で jp.indeed.com を開く\n"
-        "② お気に入り →「CTK更新」をタップ\n"
-        "③ CTK値が自動入力されたページが開く\n"
-        "④「更新する」ボタンを押して完了\n\n"
-        "【セッションCookie更新（電話番号取得）】\n"
-        "① employers.indeed.com/candidates を開く\n"
-        "② お気に入り →「Indeed セッション更新」をタップ\n\n"
-        "※ CTK更新ブックマークがまだの場合は👇\n"
+        "â ï¸ Indeed CTK ãæéåãã§ã\n\n"
+        "é»è©±çªå·ã»ä½æã®åå¾ãã§ãã¾ããã\n"
+        "â» å¿åéç¥èªä½ã¯å±ãç¶ãã¾ãã\n\n"
+        "ãCTKæ´æ°æé ã\n"
+        "â  Chrome ã§ jp.indeed.com ãéã\n"
+        "â¡ ãæ°ã«å¥ã âãCTKæ´æ°ããã¿ãã\n"
+        "â¢ CTKå¤ãèªåå¥åããããã¼ã¸ãéã\n"
+        "â£ãæ´æ°ããããã¿ã³ãæ¼ãã¦å®äº\n\n"
+        "ãã»ãã·ã§ã³Cookieæ´æ°ï¼é»è©±çªå·åå¾ï¼ã\n"
+        "â  employers.indeed.com/candidates ãéã\n"
+        "â¡ ãæ°ã«å¥ã âãIndeed ã»ãã·ã§ã³æ´æ°ããã¿ãã\n\n"
+        "â» CTKæ´æ°ããã¯ãã¼ã¯ãã¾ã ã®å ´åã¯ð\n"
         f"{setup_url}\n\n"
-        "※ セッション更新ブックマークがまだの場合は👇\n"
+        "â» ã»ãã·ã§ã³æ´æ°ããã¯ãã¼ã¯ãã¾ã ã®å ´åã¯ð\n"
         f"{session_setup_url}"
     )
     notification_succeeded = False
-    # Slack通知（notify_error_to_slack は🚨エラープレフィックスが付くので直接送信）
+    # Slackéç¥ï¼notify_error_to_slack ã¯ð¨ã¨ã©ã¼ãã¬ãã£ãã¯ã¹ãä»ãã®ã§ç´æ¥éä¿¡ï¼
     if notify_slack_direct(message):
-        log("CTK期限切れ Slack通知: 送信成功")
+        log("CTKæéåã Slackéç¥: éä¿¡æå")
         notification_succeeded = True
     else:
-        log("ERROR: CTK期限切れ Slack通知 失敗")
-    # LINE通知（個人LINEに送信、未設定の場合はグループにフォールバック）
+        log("ERROR: CTKæéåã Slackéç¥ å¤±æ")
+    # LINEéç¥ï¼åäººLINEã«éä¿¡ãæªè¨­å®ã®å ´åã¯ã°ã«ã¼ãã«ãã©ã¼ã«ããã¯ï¼
     line_to_id = get_line_to_id()
     if LINE_CHANNEL_ACCESS_TOKEN and line_to_id:
         try:
@@ -342,21 +363,21 @@ def notify_ctk_expired() -> None:
                 },
                 timeout=10,
             )
-            log(f"CTK期限切れ LINE通知: status={resp.status_code}")
+            log(f"CTKæéåã LINEéç¥: status={resp.status_code}")
             if resp.status_code < 400:
                 notification_succeeded = True
         except Exception as e:
-            log(f"ERROR: CTK期限切れ LINE通知 失敗: {e}")
-    # 少なくとも1つ成功した場合のみフラグを設定（失敗時はフラグをリセットして次回リトライ）
+            log(f"ERROR: CTKæéåã LINEéç¥ å¤±æ: {e}")
+    # å°ãªãã¨ã1ã¤æåããå ´åã®ã¿ãã©ã°ãè¨­å®ï¼å¤±ææã¯ãã©ã°ããªã»ãããã¦æ¬¡åãªãã©ã¤ï¼
     with _ctk_expired_notified_lock:
         if notification_succeeded:
             _ctk_expired_notified = True
         else:
-            log("WARNING: CTK期限切れ通知が全て失敗。次回ポーリング時に再試行します。")
+            log("WARNING: CTKæéåãéç¥ãå¨ã¦å¤±æãæ¬¡åãã¼ãªã³ã°æã«åè©¦è¡ãã¾ãã")
 
 
 def notify_slack_direct(message: str) -> bool:
-    """Slack Webhook にメッセージを送信する（エラープレフィックスなし）。Returns True if successful."""
+    """Slack Webhook ã«ã¡ãã»ã¼ã¸ãéä¿¡ããï¼ã¨ã©ã¼ãã¬ãã£ãã¯ã¹ãªãï¼ãReturns True if successful."""
     webhook_url = SLACK_ERROR_WEBHOOK_URL or SLACK_WEBHOOK_URL_PROD
     if not webhook_url:
         log("ERROR: No Slack webhook URL configured; cannot send Slack message")
@@ -373,27 +394,27 @@ def notify_slack_direct(message: str) -> bool:
 
 
 def notify_error_to_slack(message: str) -> None:
-    """重大なエラーを Slack Webhook に通知する（🚨エラープレフィックス付き）"""
-    text = f"🚨 Indeed応募通知エラー発生\n{message}"
+    """éå¤§ãªã¨ã©ã¼ã Slack Webhook ã«éç¥ããï¼ð¨ã¨ã©ã¼ãã¬ãã£ãã¯ã¹ä»ãï¼"""
+    text = f"ð¨ Indeedå¿åéç¥ã¨ã©ã¼çºç\n{message}"
     notify_slack_direct(text)
 
 
 def notify_url_missing(applicant_name: str, unique_id: str) -> None:
-    """短縮URLが取得できなかった場合に LINE と Slack でアラートを送信する。
-    URL未取得は重大エラー → 手動確認を促す。
+    """ç­ç¸®URLãåå¾ã§ããªãã£ãå ´åã« LINE ã¨ Slack ã§ã¢ã©ã¼ããéä¿¡ããã
+    URLæªåå¾ã¯éå¤§ã¨ã©ã¼ â æåç¢ºèªãä¿ãã
     """
-    log(f"ALERT: URL missing for {applicant_name} ({unique_id}) — sending alert")
+    log(f"ALERT: URL missing for {applicant_name} ({unique_id}) â sending alert")
     message = (
-        f"⚠️ 【URL未取得アラート】\n\n"
-        f"応募者: {applicant_name}\n"
+        f"â ï¸ ãURLæªåå¾ã¢ã©ã¼ãã\n\n"
+        f"å¿åè: {applicant_name}\n"
         f"ID: {unique_id}\n\n"
-        f"Indeed管理画面のURLが取得できませんでした。\n"
-        f"手動でIndeed管理画面を確認してください。\n"
+        f"Indeedç®¡çç»é¢ã®URLãåå¾ã§ãã¾ããã§ããã\n"
+        f"æåã§Indeedç®¡çç»é¢ãç¢ºèªãã¦ãã ããã\n"
         f"https://employers.indeed.com/candidates"
     )
-    # Slackアラート
+    # Slackã¢ã©ã¼ã
     notify_slack_direct(message)
-    # LINEアラート（個人LINEに送信）
+    # LINEã¢ã©ã¼ãï¼åäººLINEã«éä¿¡ï¼
     line_to_id = get_line_to_id()
     if LINE_CHANNEL_ACCESS_TOKEN and line_to_id:
         try:
@@ -431,7 +452,7 @@ def get_line_to_id() -> Optional[str]:
 
 def add_test_prefix(message: str) -> str:
     """Add test version prefix if in test mode."""
-    return f"【テストバージョン】\n{message}" if is_test_mode() else message
+    return f"ããã¹ããã¼ã¸ã§ã³ã\n{message}" if is_test_mode() else message
 
 # --- Email Parsing ---
 def decode_header_value(value: Optional[str]) -> str:
@@ -493,7 +514,7 @@ def extract_indeed_url(html: str) -> str:
         return ""
     soup = BeautifulSoup(html, "html.parser")
     for a in soup.find_all("a"):
-        if "応募内容を確認する" in (a.get_text() or ""):
+        if "å¿ååå®¹ãç¢ºèªãã" in (a.get_text() or ""):
             return a.get("href") or ""
     for a in soup.find_all("a"):
         href = a.get("href") or ""
@@ -502,51 +523,51 @@ def extract_indeed_url(html: str) -> str:
     return ""
 
 def extract_indeed_legacy_id(html: str) -> Optional[str]:
-    """Indeed通知メールのHTMLからlegacyId（hex）を抽出する。
-    Indeed通知メールには以下のURLパターンが含まれる:
+    """Indeedéç¥ã¡ã¼ã«ã®HTMLããlegacyIdï¼hexï¼ãæ½åºããã
+    Indeedéç¥ã¡ã¼ã«ã«ã¯ä»¥ä¸ã®URLãã¿ã¼ã³ãå«ã¾ãã:
     - https://employers.indeed.com/candidates/view?id=<legacyId>
-    - https://engage.indeed.com/f/a/<legacyId>~~/... (旧形式: hex)
-    - https://engage.indeed.com/f/a/<base64url>~~... (新形式: base64url 22文字)
-    legacyId は hex文字列（8〜20桁）。
+    - https://engage.indeed.com/f/a/<legacyId>~~/... (æ§å½¢å¼: hex)
+    - https://engage.indeed.com/f/a/<base64url>~~... (æ°å½¢å¼: base64url 22æå­)
+    legacyId ã¯ hexæå­åï¼8ã20æ¡ï¼ã
     """
     if not html:
         return None
-    # パターン1: employers.indeed.com に直接 id= パラメータが含まれる場合
+    # ãã¿ã¼ã³1: employers.indeed.com ã«ç´æ¥ id= ãã©ã¡ã¼ã¿ãå«ã¾ããå ´å
     direct = re.search(r'employers\.indeed\.com/candidates(?:/view)?\?(?:[^"\'<>\s]*&)?id=([a-f0-9]{8,20})', html)
     if direct:
         return direct.group(1)
-    # パターン2: engage.indeed.com/f/a/<hex>~~ 形式（旧形式）
+    # ãã¿ã¼ã³2: engage.indeed.com/f/a/<hex>~~ å½¢å¼ï¼æ§å½¢å¼ï¼
     engage_hex = re.search(r'engage\.indeed\.com/f/a/([a-f0-9]{10,16})(?:~~|/)', html)
     if engage_hex:
         return engage_hex.group(1)
-    # パターン3: 任意のURLの id= パラメータ（indeed ドメイン内）
+    # ãã¿ã¼ã³3: ä»»æã®URLã® id= ãã©ã¡ã¼ã¿ï¼indeed ãã¡ã¤ã³åï¼
     any_id = re.search(r'indeed\.com[^"\'<>\s]*[?&]id=([a-f0-9]{8,20})', html)
     if any_id:
         return any_id.group(1)
     return None
 
 def extract_indeed_engage_urls(html: str) -> list:
-    """Indeed通知メールのHTMLからengage.indeed.comトラッキングURLを全て抽出する。
-    新形式(base64url)・旧形式(hex)問わず engage.indeed.com/f/a/ URLを返す。
-    これらURLはリダイレクトをたどると employers.indeed.com/candidates/view?id=<hex> に到達する。
+    """Indeedéç¥ã¡ã¼ã«ã®HTMLããengage.indeed.comãã©ãã­ã³ã°URLãå¨ã¦æ½åºããã
+    æ°å½¢å¼(base64url)ã»æ§å½¢å¼(hex)åãã engage.indeed.com/f/a/ URLãè¿ãã
+    ãããURLã¯ãªãã¤ã¬ã¯ãããã©ãã¨ employers.indeed.com/candidates/view?id=<hex> ã«å°éããã
     """
     if not html:
         return []
-    # engage.indeed.com/f/a/<任意の文字列>~~ パターン
+    # engage.indeed.com/f/a/<ä»»æã®æå­å>~~ ãã¿ã¼ã³
     matches = re.findall(r'(https://engage\.indeed\.com/f/a/[A-Za-z0-9_\-]{10,}~~[^\s"\'<>]*)', html)
-    return list(dict.fromkeys(matches))  # 重複除去（順序保持）
+    return list(dict.fromkeys(matches))  # éè¤é¤å»ï¼é åºä¿æï¼
 
 def extract_phone_number(html: str) -> Optional[str]:
-    """メール本文HTMLから電話番号を抽出する。"""
+    """ã¡ã¼ã«æ¬æHTMLããé»è©±çªå·ãæ½åºããã"""
     if not html:
         return None
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(separator="\n")
-    # 日本の電話番号パターン（携帯・固定・フリーダイヤル）
+    # æ¥æ¬ã®é»è©±çªå·ãã¿ã¼ã³ï¼æºå¸¯ã»åºå®ã»ããªã¼ãã¤ã¤ã«ï¼
     patterns = [
-        r'0[789]0[-\s]?\d{4}[-\s]?\d{4}',  # 携帯: 090/080/070
-        r'0\d{1,4}[-\s]?\d{1,4}[-\s]?\d{4}',  # 固定: 03-xxxx-xxxx 等
-        r'0120[-\s]?\d{3}[-\s]?\d{3}',  # フリーダイヤル
+        r'0[789]0[-\s]?\d{4}[-\s]?\d{4}',  # æºå¸¯: 090/080/070
+        r'0\d{1,4}[-\s]?\d{1,4}[-\s]?\d{4}',  # åºå®: 03-xxxx-xxxx ç­
+        r'0120[-\s]?\d{3}[-\s]?\d{3}',  # ããªã¼ãã¤ã¤ã«
     ]
     for pattern in patterns:
         match = re.search(pattern, text)
@@ -555,49 +576,49 @@ def extract_phone_number(html: str) -> Optional[str]:
     return None
 
 def normalize_phone_number(phone: str) -> str:
-    """+81形式を日本国内形式(0XX-XXXX-XXXX)に変換する。"""
+    """+81å½¢å¼ãæ¥æ¬å½åå½¢å¼(0XX-XXXX-XXXX)ã«å¤æããã"""
     if not phone:
         return phone
     digits = re.sub(r'[\s\-\(\)]', '', phone)
     if digits.startswith('+81'):
         digits = '0' + digits[3:]
-    if re.match(r'^0[789]0\d{8}$', digits):  # 携帯 090/080/070
+    if re.match(r'^0[789]0\d{8}$', digits):  # æºå¸¯ 090/080/070
         return f"{digits[:3]}-{digits[3:7]}-{digits[7:]}"
-    if re.match(r'^0\d{9}$', digits):  # 固定10桁
+    if re.match(r'^0\d{9}$', digits):  # åºå®10æ¡
         return f"{digits[:2]}-{digits[2:6]}-{digits[6:]}"
-    if re.match(r'^0120\d{6}$', digits):  # フリーダイヤル
+    if re.match(r'^0120\d{6}$', digits):  # ããªã¼ãã¤ã¤ã«
         return f"{digits[:4]}-{digits[4:7]}-{digits[7:]}"
     return phone
 
 def extract_body_text(html: str, max_chars: int = 500) -> str:
-    """メール本文HTMLからプレーンテキストを抽出する（最大max_chars文字）。"""
+    """ã¡ã¼ã«æ¬æHTMLãããã¬ã¼ã³ãã­ã¹ããæ½åºããï¼æå¤§max_charsæå­ï¼ã"""
     if not html:
         return ""
     soup = BeautifulSoup(html, "html.parser")
-    # script/styleタグを除去
+    # script/styleã¿ã°ãé¤å»
     for tag in soup(["script", "style"]):
         tag.decompose()
     text = soup.get_text(separator="\n")
-    # 連続する空行を1行にまとめる
+    # é£ç¶ããç©ºè¡ã1è¡ã«ã¾ã¨ãã
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     result = "\n".join(lines)
     if len(result) > max_chars:
-        result = result[:max_chars] + "…"
+        result = result[:max_chars] + "â¦"
     return result
 
 def format_phone_for_slack(phone: str) -> str:
     """Format phone number as a Slack tel: link.
-    Converts '+81 80 2478 7813' → '<tel:+818024787813|080-2478-7813>'
+    Converts '+81 80 2478 7813' â '<tel:+818024787813|080-2478-7813>'
     so it becomes a tappable link in Slack mobile.
     """
     if not phone:
         return phone
     # Remove spaces to build the tel URI
     tel_uri = phone.replace(" ", "")
-    # Build Japanese local display format: +81 80 XXXX XXXX → 080-XXXX-XXXX
+    # Build Japanese local display format: +81 80 XXXX XXXX â 080-XXXX-XXXX
     digits = tel_uri.lstrip("+")
     if digits.startswith("81") and len(digits) >= 11:
-        local = "0" + digits[2:]  # 81 → 0
+        local = "0" + digits[2:]  # 81 â 0
         # Format: 090/080/060 (3 digits) - 4 digits - 4 digits
         if len(local) == 11:
             display = f"{local[:3]}-{local[3:7]}-{local[7:]}"
@@ -611,7 +632,7 @@ def format_phone_for_slack(phone: str) -> str:
 
 def format_phone_for_line(phone: str) -> str:
     """Format phone number for LINE tap-to-call.
-    Converts '+81 80 2478 7813' → '080-2478-7813'
+    Converts '+81 80 2478 7813' â '080-2478-7813'
     LINE automatically turns hyphen-formatted Japanese numbers into tappable links.
     """
     if not phone:
@@ -656,29 +677,29 @@ def shorten_url(url: str) -> str:
     return url
 
 def extract_applicant_name_from_html(html: str) -> Optional[str]:
-    """IndeedメールのHTML本文から応募者名を抽出する。
-    Indeedのメールはfrom_headerが「Indeed <noreply@indeed.com>」のため
-    ヘッダーからは応募者名を取得できない。代わりにメール本文HTMLから取得する。
-    試みるパターン:
-    1. 「○○さんからの応募」「○○ さんが応募しました」等のテキスト
-    2. 件名「新しい応募者のお知らせ: ○○」のパターン
-    3. td/div/p内に「応募者:」「応募者名:」等のラベルに続く名前
+    """Indeedã¡ã¼ã«ã®HTMLæ¬æããå¿åèåãæ½åºããã
+    Indeedã®ã¡ã¼ã«ã¯from_headerããIndeed <noreply@indeed.com>ãã®ãã
+    ãããã¼ããã¯å¿åèåãåå¾ã§ããªããä»£ããã«ã¡ã¼ã«æ¬æHTMLããåå¾ããã
+    è©¦ã¿ããã¿ã¼ã³:
+    1. ãââããããã®å¿åããââ ãããå¿åãã¾ãããç­ã®ãã­ã¹ã
+    2. ä»¶åãæ°ããå¿åèã®ãç¥ãã: ââãã®ãã¿ã¼ã³
+    3. td/div/påã«ãå¿åè:ããå¿åèå:ãç­ã®ã©ãã«ã«ç¶ãåå
     """
     if not html:
         return None
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(separator="\n")
-    # パターン1: 「○○さんからの応募」「○○さんが応募しました」
+    # ãã¿ã¼ã³1: ãââããããã®å¿åããââãããå¿åãã¾ããã
     for pattern in [
-        r"([^\s \n]+(?:\s[^\s \n]+)?)\s*さん(?:から(?:の)?応募|が応募)",
-        r"新しい応募者(?:のお知らせ)?[:：]\s*([^\n\r]+)",
-        r"応募者(?:名)?[:：]\s*([^\n\r]+)",
-        r"([^\s \n]{1,20})\s*(?:様|さん)(?:\s|$|が|から|の)",
+        r"([^\s \n]+(?:\s[^\s \n]+)?)\s*ãã(?:ãã(?:ã®)?å¿å|ãå¿å)",
+        r"æ°ããå¿åè(?:ã®ãç¥ãã)?[:ï¼]\s*([^\n\r]+)",
+        r"å¿åè(?:å)?[:ï¼]\s*([^\n\r]+)",
+        r"([^\s \n]{1,20})\s*(?:æ§|ãã)(?:\s|$|ã|ãã|ã®)",
     ]:
         match = re.search(pattern, text)
         if match:
             name = match.group(1).strip()
-            # 明らかに名前ではないものを除外（URLや長すぎる文字列）
+            # æããã«ååã§ã¯ãªããã®ãé¤å¤ï¼URLãé·ãããæå­åï¼
             if name and len(name) <= 30 and "http" not in name and "@" not in name:
                 return name
     return None
@@ -703,25 +724,25 @@ def notify_slack_with_retry(
         return False
     mention_prefix = "<!channel>\n" if not is_test_mode() else ""
     if source == "indeed":
-        lines = ["【Indeed 新着応募】"]
-        lines.append(f"氏名：{name}")
+        lines = ["ãIndeed æ°çå¿åã"]
+        lines.append(f"æ°åï¼{name}")
         if job_title:
-            lines.append(f"求人：{job_title}")
-        phone_display = format_phone_for_slack(phone) if phone else "⚠️ 手動確認が必要"
-        lines.append(f"電話：{phone_display}")
+            lines.append(f"æ±äººï¼{job_title}")
+        phone_display = format_phone_for_slack(phone) if phone else "â ï¸ æåç¢ºèªãå¿è¦"
+        lines.append(f"é»è©±ï¼{phone_display}")
         if url:
-            lines.append(f"URL：{shorten_url(url)}")
-        lines.append("※ 電話番号が「手動確認」の場合はIndeed管理画面で確認してください")
+            lines.append(f"URLï¼{shorten_url(url)}")
+        lines.append("â» é»è©±çªå·ããæåç¢ºèªãã®å ´åã¯Indeedç®¡çç»é¢ã§ç¢ºèªãã¦ãã ãã")
     else:
-        lines = [f"【ジモティー】 【{name}】 さんから応募がありました。"]
+        lines = [f"ãã¸ã¢ãã£ã¼ã ã{name}ã ããããå¿åãããã¾ããã"]
         if job_title:
-            lines.append(f"求人: {job_title}")
+            lines.append(f"æ±äºº: {job_title}")
         if phone:
-            lines.append(f"電話番号: {format_phone_for_slack(phone)}")
+            lines.append(f"é»è©±çªå·: {format_phone_for_slack(phone)}")
         if location:
-            lines.append(f"住所: {location}")
+            lines.append(f"ä½æ: {location}")
         if email_addr:
-            lines.append(f"メール: {email_addr}")
+            lines.append(f"ã¡ã¼ã«: {email_addr}")
         if answers:
             for ans in answers:
                 key = ans.get("questionKey", "")
@@ -729,7 +750,7 @@ def notify_slack_with_retry(
                 if val and key:
                     lines.append(f"{key}: {val}")
         if url:
-            lines.extend(["", "応募内容はこちら:", shorten_url(url)])
+            lines.extend(["", "å¿ååå®¹ã¯ãã¡ã:", shorten_url(url)])
     message = add_test_prefix(mention_prefix + "\n".join(lines))
     for attempt in range(max_retries):
         try:
@@ -764,34 +785,34 @@ def notify_line_with_retry(
         log("LINE Token or TO ID missing")
         return False
     if source == "indeed":
-        lines = ["📋 Indeed 新着応募", ""]
-        lines.append(f"👤 氏名：{name}")
+        lines = ["ð Indeed æ°çå¿å", ""]
+        lines.append(f"ð¤ æ°åï¼{name}")
         if job_title:
-            lines.append(f"💼 求人：{job_title}")
-        phone_display = format_phone_for_line(phone) if phone else "⚠️ 手動確認が必要"
-        lines.append(f"📞 電話：{phone_display}")
+            lines.append(f"ð¼ æ±äººï¼{job_title}")
+        phone_display = format_phone_for_line(phone) if phone else "â ï¸ æåç¢ºèªãå¿è¦"
+        lines.append(f"ð é»è©±ï¼{phone_display}")
         if url:
-            lines.append(f"🔗 URL：{shorten_url(url)}")
+            lines.append(f"ð URLï¼{shorten_url(url)}")
         lines.append("")
-        lines.append("※ 電話番号が「手動確認」の場合はIndeed管理画面で確認してください")
+        lines.append("â» é»è©±çªå·ããæåç¢ºèªãã®å ´åã¯Indeedç®¡çç»é¢ã§ç¢ºèªãã¦ãã ãã")
     else:
-        lines = [f"【{name}】 さんからジモティーで新着があります。"]
+        lines = [f"ã{name}ã ããããã¸ã¢ãã£ã¼ã§æ°çãããã¾ãã"]
         if job_title:
-            lines.append(f"求人: {job_title}")
+            lines.append(f"æ±äºº: {job_title}")
         if phone:
-            lines.append(f"📞 電話番号: {format_phone_for_line(phone)}")
+            lines.append(f"ð é»è©±çªå·: {format_phone_for_line(phone)}")
         if location:
-            lines.append(f"📍 住所: {location}")
+            lines.append(f"ð ä½æ: {location}")
         if email_addr:
-            lines.append(f"📧 メール: {email_addr}")
+            lines.append(f"ð§ ã¡ã¼ã«: {email_addr}")
         if answers:
             for ans in answers:
                 key = ans.get("questionKey", "")
                 val = ans.get("value")
                 if val and key:
-                    lines.append(f"📝 {key}: {val}")
+                    lines.append(f"ð {key}: {val}")
         if url:
-            lines.extend(["", "詳細はこちら:", shorten_url(url)])
+            lines.extend(["", "è©³ç´°ã¯ãã¡ã:", shorten_url(url)])
     base_message = add_test_prefix("\n".join(lines))
     if is_test_mode():
         # Test mode: no @all mention, plain text
@@ -867,9 +888,9 @@ def parse_fetch_response(data: list) -> Tuple[Optional[str], Optional[bytes]]:
 
 def determine_source(subject: str) -> Tuple[Optional[str], Optional[str]]:
     """Determine email source and default URL based on subject."""
-    if "新しい応募者のお知らせ" in subject:
+    if "æ°ããå¿åèã®ãç¥ãã" in subject:
         return "indeed", None
-    elif "ジモティー" in subject:
+    elif "ã¸ã¢ãã£ã¼" in subject:
         return "jimoty", "https://jmty.jp/web_mail/posts"
     return None, None
 
@@ -902,9 +923,30 @@ def process_mail_by_uid(
     if not unique_id:
         log(f"ERROR: No unique ID found for uid={uid_str}, skipping to prevent duplicates")
         return None
-    # Double-check with X-GM-MSGID/Message-ID (in case UID tracking missed it)
+    # --- Atomic Dedup: file-locked check-and-claim (prevents 4/30-style double notify) ---
+    # Phase 1: Quick in-memory pre-check (avoids lock contention for already-known IDs)
     if unique_id in processed_ids:
         return None  # Already processed, skip silently
+    # Phase 2: Atomic file-locked check-and-register
+    # Reload processed_ids from disk under exclusive flock, then re-check.
+    # If still unseen, immediately persist the ID BEFORE sending any notification.
+    with dedup_file_lock():
+        with _processed_ids_lock:
+            disk_ids, load_ok = load_processed_ids()
+            if not load_ok:
+                log(f"ERROR: dedup lock acquired but processed_ids file unreadable, "
+                    f"skipping uid={uid_str} to prevent duplicate")
+                return None
+            if unique_id in disk_ids or f"uid:{uid_str}" in disk_ids:
+                log(f"Dedup: {unique_id} found on disk (missed in-memory), skipping")
+                return None
+            # Claim: persist immediately so concurrent/restarted processes see it
+            disk_ids.add(unique_id)
+            disk_ids.add(f"uid:{uid_str}")
+            if not save_processed_ids(disk_ids):
+                log(f"ERROR: Failed to persist dedup claim for {unique_id}, skipping")
+                return None
+            log(f"Dedup: claimed {unique_id} (uid:{uid_str}) under file lock")
     subject = decode_header_value(msg.get("Subject", ""))
     from_header = decode_header_value(msg.get("From", ""))
     source, default_url = determine_source(subject)
@@ -913,17 +955,17 @@ def process_mail_by_uid(
         return unique_id  # Mark as processed to avoid re-checking
     html = extract_html(msg)
     url = extract_indeed_url(html) if source == "indeed" else default_url
-    # IndeedメールはFrom=「Indeed <noreply@indeed.com>」なので
-    # メール本文HTMLから応募者名を取得する。取れなければFromヘッダーの名前を使う。
+    # Indeedã¡ã¼ã«ã¯From=ãIndeed <noreply@indeed.com>ããªã®ã§
+    # ã¡ã¼ã«æ¬æHTMLããå¿åèåãåå¾ãããåããªããã°Fromãããã¼ã®ååãä½¿ãã
     if source == "indeed":
         applicant_name = extract_applicant_name_from_html(html)
         if not applicant_name:
             applicant_name = extract_name(from_header)
     else:
         applicant_name = extract_name(from_header)
-    # 電話番号・本文テキストを抽出
+    # é»è©±çªå·ã»æ¬æãã­ã¹ããæ½åº
     phone = extract_phone_number(html)
-    # Indeed応募の場合: URLからlegacyIdを抽出してAPIで全詳細を取得
+    # Indeedå¿åã®å ´å: URLããlegacyIdãæ½åºãã¦APIã§å¨è©³ç´°ãåå¾
     indeed_location: Optional[str] = None
     indeed_email: Optional[str] = None
     indeed_answers: Optional[list] = None
@@ -933,8 +975,8 @@ def process_mail_by_uid(
         if legacy_id:
             log(f"Indeed legacyId found in HTML: {legacy_id}")
         else:
-            # HTMLから直接hex IDが取れなかった場合:
-            # engage.indeed.com トラッキングURLをたどってhex IDを取得する
+            # HTMLããç´æ¥hex IDãåããªãã£ãå ´å:
+            # engage.indeed.com ãã©ãã­ã³ã°URLããã©ã£ã¦hex IDãåå¾ãã
             log("Indeed legacyId not found in HTML, trying engage tracking URL redirect...")
             engage_urls = extract_indeed_engage_urls(html)
             log(f"Indeed engage URLs found: {len(engage_urls)}")
@@ -944,7 +986,7 @@ def process_mail_by_uid(
                     log(f"Indeed legacyId resolved via engage URL redirect: {legacy_id} (from {engage_url[:60]}...)")
                     break
             if not legacy_id:
-                # フォールバック: extract_indeed_url で取得した汎用URLも試みる
+                # ãã©ã¼ã«ããã¯: extract_indeed_url ã§åå¾ããæ±ç¨URLãè©¦ã¿ã
                 if url and "engage.indeed.com" in url:
                     legacy_id = resolve_legacy_id_from_tracking_url(url)
                     if legacy_id:
@@ -952,30 +994,30 @@ def process_mail_by_uid(
                 else:
                     log(f"Indeed legacyId not found (no valid engage URL)")
         if legacy_id:
-            # legacyIdが取得できた場合、管理画面URLを生成（engage URLより安定・短縮URL用）
+            # legacyIdãåå¾ã§ããå ´åãç®¡çç»é¢URLãçæï¼engage URLããå®å®ã»ç­ç¸®URLç¨ï¼
             url = f"https://employers.indeed.com/candidates/view?id={legacy_id}"
             details = fetch_all_details(legacy_id)
             if not details:
-                # 一時的なAPI障害対策: 3秒後に即リトライ（次サイクル待ちなし）
+                # ä¸æçãªAPIéå®³å¯¾ç­: 3ç§å¾ã«å³ãªãã©ã¤ï¼æ¬¡ãµã¤ã¯ã«å¾ã¡ãªãï¼
                 log(f"fetch_all_details empty, retrying in 3s...")
                 time.sleep(3)
                 details = fetch_all_details(legacy_id)
             if details:
-                phone = details.get("phone") or phone  # APIの方が正確
+                phone = details.get("phone") or phone  # APIã®æ¹ãæ­£ç¢º
                 indeed_location = details.get("location")
                 indeed_email = details.get("email")
                 indeed_answers = details.get("answers") or []
-                log(f"Indeed API details: phone={phone}, location={indeed_location}, answers={len(indeed_answers or [])}件")
+                log(f"Indeed API details: phone={phone}, location={indeed_location}, answers={len(indeed_answers or [])}ä»¶")
             else:
                 log(f"Indeed API returned no details for legacyId={legacy_id} after retry (CTK expired?)")
-                # CTK期限切れ検知 → LINE/Slack で通知（1回のみ）
+                # CTKæéåãæ¤ç¥ â LINE/Slack ã§éç¥ï¼1åã®ã¿ï¼
                 try:
                     from indeed_fetcher import is_ctk_expired
                     if is_ctk_expired():
                         notify_ctk_expired()
                 except ImportError:
                     pass
-            # フォールバック: phoneがない場合も名前検索で補完（GraphQL APIが電話番号を返さないことがある）
+            # ãã©ã¼ã«ããã¯: phoneããªãå ´åãååæ¤ç´¢ã§è£å®ï¼GraphQL APIãé»è©±çªå·ãè¿ããªããã¨ãããï¼
             if not phone:
                 log(f"Trying name-based search for '{applicant_name}'...")
                 name_details = fetch_by_name(applicant_name)
@@ -986,13 +1028,13 @@ def process_mail_by_uid(
                     log(f"Name-search details: phone={phone}, location={indeed_location}, email={indeed_email}")
                 else:
                     log(f"Name-search: no match for '{applicant_name}'")
-    # ── URL不在チェック（Indeed限定）──────────────────────────────────────
-    # URLが取れていない場合は内部リトライを行い、それでもダメならアラートを発報する。
-    # 電話番号がない場合は許容（"未登録"表示）だが、URLなしは手動確認が必要。
+    # ââ URLä¸å¨ãã§ãã¯ï¼Indeedéå®ï¼ââââââââââââââââââââââââââââââââââââââ
+    # URLãåãã¦ããªãå ´åã¯åé¨ãªãã©ã¤ãè¡ããããã§ããã¡ãªãã¢ã©ã¼ããçºå ±ããã
+    # é»è©±çªå·ããªãå ´åã¯è¨±å®¹ï¼"æªç»é²"è¡¨ç¤ºï¼ã ããURLãªãã¯æåç¢ºèªãå¿è¦ã
     if source == "indeed" and not url:
         log(f"URL not found for {applicant_name}, retrying engage URL resolution in 5s...")
         time.sleep(5)
-        # engage URLからlegacyIdを再試行
+        # engage URLããlegacyIdãåè©¦è¡
         retry_engage_urls = extract_indeed_engage_urls(html)
         for engage_url in retry_engage_urls:
             from indeed_fetcher import resolve_legacy_id_from_tracking_url as _resolve
@@ -1002,15 +1044,15 @@ def process_mail_by_uid(
                 log(f"URL resolved on retry: {url[:60]}")
                 break
         if not url:
-            log(f"URL still not found after retry for {applicant_name} ({unique_id}) — sending alert")
+            log(f"URL still not found after retry for {applicant_name} ({unique_id}) â sending alert")
             notify_url_missing(applicant_name, unique_id)
         else:
             log(f"URL obtained on retry for {applicant_name}")
     if phone:
         phone = normalize_phone_number(phone)
-    # --- v4: 1通だけ方式（120秒CASポーリング） ---
-    # Indeed応募: #indeed-cowork-queue に信号投稿 → 最大120秒ポーリング → 1通だけ通知
-    # 非Indeed（Jimoty等）: 従来通り直接通知
+    # --- v4: 1éã ãæ¹å¼ï¼120ç§CASãã¼ãªã³ã°ï¼ ---
+    # Indeedå¿å: #indeed-cowork-queue ã«ä¿¡å·æç¨¿ â æå¤§120ç§ãã¼ãªã³ã° â 1éã ãéç¥
+    # éIndeedï¼Jimotyç­ï¼: å¾æ¥éãç´æ¥éç¥
     if source == "indeed":
         short_url = shorten_url(url) if url else ""
         display_url = short_url or url or ""
@@ -1023,7 +1065,7 @@ def process_mail_by_uid(
                 engage_url_for_signal = engage_urls_list[0]
         except Exception:
             pass
-        # Coworkに電話番号取得を依頼（#indeed-cowork-queue に信号投稿）
+        # Coworkã«é»è©±çªå·åå¾ãä¾é ¼ï¼#indeed-cowork-queue ã«ä¿¡å·æç¨¿ï¼
         signal_ok = post_signal_to_slack(
             signal_id, applicant_name, position, url,
             engage_url_for_signal, legacy_id or "", short_url
@@ -1059,7 +1101,7 @@ def process_mail_by_uid(
             )
         else:
             log(f"WARNING: v4 Signal post failed for {signal_id}, proceeding without phone")
-        # 1通だけ通知（電話番号あり/なし）
+        # 1éã ãéç¥ï¼é»è©±çªå·ãã/ãªãï¼
         log(f"v5: Notify indeed (1-shot): {applicant_name}, phone={phone}, url={url}, id={unique_id}")
         slack_ok = notify_slack_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
         line_ok = notify_line_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
@@ -1068,14 +1110,14 @@ def process_mail_by_uid(
         if not line_ok:
             log(f"WARNING: LINE notification failed for {applicant_name} ({unique_id})")
         if not slack_ok and not line_ok:
-            phone_str = f"電話: {phone}" if phone else "電話: 未記入"
+            phone_str = f"é»è©±: {phone}" if phone else "é»è©±: æªè¨å¥"
             notify_error_to_slack(
-                f"【通知失敗】応募者: {applicant_name}\n{phone_str}\nUID: {unique_id}\n\n"
-                f"Slack/LINE通知に失敗しました。Gmailを手動確認してください。"
+                f"ãéç¥å¤±æãå¿åè: {applicant_name}\n{phone_str}\nUID: {unique_id}\n\n"
+                f"Slack/LINEéç¥ã«å¤±æãã¾ãããGmailãæåç¢ºèªãã¦ãã ããã"
             )
             log(f"ERROR: All notifications failed for {applicant_name} ({unique_id}) - marked as processed, error alert sent")
     else:
-        # 非Indeed（Jimoty等）: 従来通り直接通知
+        # éIndeedï¼Jimotyç­ï¼: å¾æ¥éãç´æ¥éç¥
         log(f"Notify {source}: {applicant_name}, phone={phone}, url={url}, id={unique_id}")
         slack_ok = notify_slack_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
         line_ok = notify_line_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
@@ -1084,10 +1126,10 @@ def process_mail_by_uid(
         if not line_ok:
             log(f"WARNING: LINE notification failed for {applicant_name} ({unique_id})")
         if not slack_ok and not line_ok:
-            phone_str = f"電話: {phone}" if phone else "電話: 未記入"
+            phone_str = f"é»è©±: {phone}" if phone else "é»è©±: æªè¨å¥"
             notify_error_to_slack(
-                f"【通知失敗】応募者: {applicant_name}\n{phone_str}\nUID: {unique_id}\n\n"
-                f"Slack/LINE通知に失敗しました。Gmailを手動確認してください。"
+                f"ãéç¥å¤±æãå¿åè: {applicant_name}\n{phone_str}\nUID: {unique_id}\n\n"
+                f"Slack/LINEéç¥ã«å¤±æãã¾ãããGmailãæåç¢ºèªãã¦ãã ããã"
             )
             log(f"ERROR: All notifications failed for {applicant_name} ({unique_id}) - marked as processed, error alert sent")
     return unique_id
@@ -1164,14 +1206,14 @@ def check_mail_with_status() -> bool:
                 total_new = len(truly_new_uids)
 
                 # === STARTUP PROTECTION: Detect restart with lost state ===
-                # 初回サイクルで閾値を超えるメールが見つかった場合、再起動後の重複通知を防ぐ
-                # processed_ids の件数に関係なく（部分的なVolume復元も検知）
+                # ååãµã¤ã¯ã«ã§é¾å¤ãè¶ããã¡ã¼ã«ãè¦ã¤ãã£ãå ´åãåèµ·åå¾ã®éè¤éç¥ãé²ã
+                # processed_ids ã®ä»¶æ°ã«é¢ä¿ãªãï¼é¨åçãªVolumeå¾©åãæ¤ç¥ï¼
                 with _first_cycle_lock:
                     if not _first_cycle_done and len(truly_new_uids) > STARTUP_NEW_EMAIL_THRESHOLD:
                         log(f"STARTUP PROTECTION: {len(truly_new_uids)} new emails found on first cycle "
                             f"(threshold={STARTUP_NEW_EMAIL_THRESHOLD}, existing processed_ids={len(processed_ids)}).")
                         log("Silently marking as processed to prevent re-notification on restart...")
-                        # 全件を軽量取得してgm:IDのみ記録（通知なし）
+                        # å¨ä»¶ãè»½éåå¾ãã¦gm:IDã®ã¿è¨é²ï¼éç¥ãªãï¼
                         startup_ids: Set[str] = set()
                         for uid in truly_new_uids:
                             uid_str = uid.decode() if isinstance(uid, bytes) else uid
@@ -1185,7 +1227,7 @@ def check_mail_with_status() -> bool:
                         return True
                     _first_cycle_done = True
 
-                # QUOTA ERROR対策: 1サイクルで処理するメール数を制限する
+                # QUOTA ERRORå¯¾ç­: 1ãµã¤ã¯ã«ã§å¦çããã¡ã¼ã«æ°ãå¶éãã
                 batch = truly_new_uids[:MAX_EMAILS_PER_CYCLE]
                 if total_new > MAX_EMAILS_PER_CYCLE:
                     log(f"Truly new emails to process: {total_new} (processing {MAX_EMAILS_PER_CYCLE} this cycle, {total_new - MAX_EMAILS_PER_CYCLE} deferred)")
@@ -1325,8 +1367,8 @@ def send_fallback_notification(applicant_name, indeed_url, short_url=None, posit
     url = short_url or indeed_url or ""
     log(f"Sending fallback notification for {applicant_name}")
     mention = "<!channel>\n" if not is_test_mode() else ""
-    position_line = f"\n求人：{position}" if position else ""
-    slack_text = f"{mention}【Indeed 新着応募（速報）】\n氏名：{applicant_name}{position_line}\n電話：⚠ 手動確認が必要\nURL：{url}\n※ Indeed管理画面で電話番号を確認してください"
+    position_line = f"\næ±äººï¼{position}" if position else ""
+    slack_text = f"{mention}ãIndeed æ°çå¿åï¼éå ±ï¼ã\næ°åï¼{applicant_name}{position_line}\né»è©±ï¼â  æåç¢ºèªãå¿è¦\nURLï¼{url}\nâ» Indeedç®¡çç»é¢ã§é»è©±çªå·ãç¢ºèªãã¦ãã ãã"
     webhook_url = get_slack_webhook_url()
     if webhook_url:
         try:
@@ -1339,8 +1381,8 @@ def send_fallback_notification(applicant_name, indeed_url, short_url=None, posit
             log(f"ERROR: Fallback Slack error: {e}")
     line_to_id = get_line_to_id()
     if LINE_CHANNEL_ACCESS_TOKEN and line_to_id:
-        position_line_l = f"\n求人：{position}" if position else ""
-        line_text = f"@all\n【Indeed 新着応募（速報）】\n氏名：{applicant_name}{position_line_l}\n電話：⚠ 手動確認が必要\nURL：{url}\n※ Indeed管理画面で電話番号を確認してください"
+        position_line_l = f"\næ±äººï¼{position}" if position else ""
+        line_text = f"@all\nãIndeed æ°çå¿åï¼éå ±ï¼ã\næ°åï¼{applicant_name}{position_line_l}\né»è©±ï¼â  æåç¢ºèªãå¿è¦\nURLï¼{url}\nâ» Indeedç®¡çç»é¢ã§é»è©±çªå·ãç¢ºèªãã¦ãã ãã"
         try:
             resp = requests.post("https://api.line.me/v2/bot/message/push", json={"to": line_to_id, "messages": [{"type": "textV2", "text": line_text, "sender": {}, "mentionees": [{"type": "all", "index": 0, "length": 4}]}]}, headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}, timeout=10)
             if resp.status_code < 400:
@@ -1373,7 +1415,7 @@ def check_fallback_timers():
                 entry["owner"] = "railway"
                 store[signal_id] = entry
                 changed = True
-                send_fallback_notification(applicant_name=entry.get("applicant_name", "不明"), indeed_url=entry.get("indeed_url", ""), short_url=entry.get("short_url", ""), position=entry.get("position", ""))
+                send_fallback_notification(applicant_name=entry.get("applicant_name", "ä¸æ"), indeed_url=entry.get("indeed_url", ""), short_url=entry.get("short_url", ""), position=entry.get("position", ""))
                 log(f"Fallback triggered for {signal_id} (status was {status})")
         if changed:
             save_cas_store(store)
@@ -1459,7 +1501,7 @@ def api_cas():
 
 @flask_app.route("/test-ctk", methods=["GET"])
 def test_ctk():
-    """診断用: CTKの有効性とIndeed API接続をテストする。legacyIdを指定すると詳細も取得。"""
+    """è¨ºæ­ç¨: CTKã®æå¹æ§ã¨Indeed APIæ¥ç¶ããã¹ããããlegacyIdãæå®ããã¨è©³ç´°ãåå¾ã"""
     token = flask_request.args.get("token", "")
     if not COWORK_WEBHOOK_TOKEN or not hmac.compare_digest(token, COWORK_WEBHOOK_TOKEN):
         return "Unauthorized", 401
@@ -1480,13 +1522,13 @@ def test_ctk():
         result["email"] = details.get("email") if details else None
     return jsonify(result)
 
-# --- CTK更新フォーム（モバイル対応） ---
+# --- CTKæ´æ°ãã©ã¼ã ï¼ã¢ãã¤ã«å¯¾å¿ï¼ ---
 _CTK_UPDATE_FORM_HTML = """<!DOCTYPE html>
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-  <title>Indeed CTK 更新</title>
+  <title>Indeed CTK æ´æ°</title>
   <style>
     * { box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -1508,29 +1550,29 @@ _CTK_UPDATE_FORM_HTML = """<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <h1>⚙️ Indeed CTK 更新</h1>
-  <p class="sub">新しいCTK値を貼り付けて「更新する」を押してください。再デプロイ不要で即反映されます。</p>
+  <h1>âï¸ Indeed CTK æ´æ°</h1>
+  <p class="sub">æ°ããCTKå¤ãè²¼ãä»ãã¦ãæ´æ°ããããæ¼ãã¦ãã ãããåããã­ã¤ä¸è¦ã§å³åæ ããã¾ãã</p>
   <form method="POST">
-    <textarea name="ctk" placeholder="CTK値をここに貼り付け..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
-    <button type="submit">✅ 更新する</button>
+    <textarea name="ctk" placeholder="CTKå¤ãããã«è²¼ãä»ã..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+    <button type="submit">â æ´æ°ãã</button>
   </form>
   <div class="howto">
-    <b>📋 CTKの取得手順（PCのChromeで）</b>
+    <b>ð CTKã®åå¾æé ï¼PCã®Chromeã§ï¼</b>
     <ol>
-      <li>jp.indeed.com にログイン</li>
-      <li>F12（またはCtrl+Shift+I）→ Application タブ → Cookies → jp.indeed.com</li>
-      <li>「CTK」の値をコピー</li>
-      <li>このページに貼り付けて送信</li>
+      <li>jp.indeed.com ã«ã­ã°ã¤ã³</li>
+      <li>F12ï¼ã¾ãã¯Ctrl+Shift+Iï¼â Application ã¿ã â Cookies â jp.indeed.com</li>
+      <li>ãCTKãã®å¤ãã³ãã¼</li>
+      <li>ãã®ãã¼ã¸ã«è²¼ãä»ãã¦éä¿¡</li>
     </ol>
   </div>
   <div class="howto" style="margin-top:10px;">
-    <b>📱 スマホの場合</b>
+    <b>ð± ã¹ããã®å ´å</b>
     <ol>
-      <li>PCのChromeで上の手順でCTKを取得</li>
-      <li>自分にメール等でCTK値を送る</li>
-      <li>スマホでこのページを開き、貼り付けて送信</li>
+      <li>PCã®Chromeã§ä¸ã®æé ã§CTKãåå¾</li>
+      <li>èªåã«ã¡ã¼ã«ç­ã§CTKå¤ãéã</li>
+      <li>ã¹ããã§ãã®ãã¼ã¸ãéããè²¼ãä»ãã¦éä¿¡</li>
     </ol>
-    <p style="margin:8px 0 0;color:#888;font-size:12px;">※ スマホのブラウザではCookieを直接確認できないため、PCでの取得が必要です。</p>
+    <p style="margin:8px 0 0;color:#888;font-size:12px;">â» ã¹ããã®ãã©ã¦ã¶ã§ã¯Cookieãç´æ¥ç¢ºèªã§ããªããããPCã§ã®åå¾ãå¿è¦ã§ãã</p>
   </div>
   <script>
     (function() {
@@ -1549,7 +1591,7 @@ _CTK_UPDATE_SUCCESS_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>CTK更新完了</title>
+  <title>CTKæ´æ°å®äº</title>
   <style>
     body { font-family: -apple-system, sans-serif; padding: 40px 24px;
            text-align: center; max-width: 400px; margin: 0 auto; }
@@ -1559,19 +1601,19 @@ _CTK_UPDATE_SUCCESS_HTML = """<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <div class="icon">✅</div>
-  <h1>CTK更新完了</h1>
-  <p>Indeed APIの認証が再開されました。<br>次回の応募通知から電話番号・住所が届きます。</p>
+  <div class="icon">â</div>
+  <h1>CTKæ´æ°å®äº</h1>
+  <p>Indeed APIã®èªè¨¼ãåéããã¾ããã<br>æ¬¡åã®å¿åéç¥ããé»è©±çªå·ã»ä½æãå±ãã¾ãã</p>
 </body>
 </html>"""
 
 @flask_app.route("/update-ctk-setup", methods=["GET"])
 def update_ctk_setup():
-    """ブックマークレット設定ページ。ワンタップCTK更新の初回セットアップ用。"""
+    """ããã¯ãã¼ã¯ã¬ããè¨­å®ãã¼ã¸ãã¯ã³ã¿ããCTKæ´æ°ã®ååã»ããã¢ããç¨ã"""
     token = flask_request.args.get("token", "")
     if not COWORK_WEBHOOK_TOKEN or not hmac.compare_digest(token, COWORK_WEBHOOK_TOKEN):
         return "Unauthorized", 401
-    # ブックマークレットJS（jp.indeed.comのCTKを自動読み取りしてPOST送信）
+    # ããã¯ãã¼ã¯ã¬ããJSï¼jp.indeed.comã®CTKãèªåèª­ã¿åããã¦POSTéä¿¡ï¼
     post_url = f"{RAILWAY_SERVICE_URL}/update-ctk?token={COWORK_WEBHOOK_TOKEN}"
     manual_url = f"{RAILWAY_SERVICE_URL}/update-ctk?token={COWORK_WEBHOOK_TOKEN}"
     bookmarklet_js = (
@@ -1595,7 +1637,7 @@ def update_ctk_setup():
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-  <title>CTK更新 ワンタップ設定</title>
+  <title>CTKæ´æ° ã¯ã³ã¿ããè¨­å®</title>
   <style>
     *{{box-sizing:border-box;}}
     body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:20px;max-width:540px;margin:0 auto;background:#f8f9fa;color:#222;}}
@@ -1614,39 +1656,39 @@ def update_ctk_setup():
   </style>
 </head>
 <body>
-  <h1>⚡ CTK更新 ワンタップ設定</h1>
-  <p class="sub">一度設定すれば、次回からボタン1つでCTKを更新できます。</p>
+  <h1>â¡ CTKæ´æ° ã¯ã³ã¿ããè¨­å®</h1>
+  <p class="sub">ä¸åº¦è¨­å®ããã°ãæ¬¡åãããã¿ã³1ã¤ã§CTKãæ´æ°ã§ãã¾ãã</p>
 
   <div class="step">
-    <span class="step-num">1</span><span class="step-title">ブックマークレットを保存する</span>
+    <span class="step-num">1</span><span class="step-title">ããã¯ãã¼ã¯ã¬ãããä¿å­ãã</span>
     <div class="step-body">
-      下のボタンを<b>長押し（または右クリック）→「リンクをブックマークに追加」</b>で保存してください。<br>
-      名前は <b>「CTK更新」</b> にしておくと便利です。
-      <a class="bm-link" href="{bookmarklet_js}">⭐ CTK更新（ブックマーク用ボタン）</a>
+      ä¸ã®ãã¿ã³ã<b>é·æ¼ãï¼ã¾ãã¯å³ã¯ãªãã¯ï¼âããªã³ã¯ãããã¯ãã¼ã¯ã«è¿½å ã</b>ã§ä¿å­ãã¦ãã ããã<br>
+      ååã¯ <b>ãCTKæ´æ°ã</b> ã«ãã¦ããã¨ä¾¿å©ã§ãã
+      <a class="bm-link" href="{bookmarklet_js}">â­ CTKæ´æ°ï¼ããã¯ãã¼ã¯ç¨ãã¿ã³ï¼</a>
     </div>
   </div>
 
   <div class="step">
-    <span class="step-num">2</span><span class="step-title">CTKが切れたら…</span>
+    <span class="step-num">2</span><span class="step-title">CTKãåãããâ¦</span>
     <div class="step-body">
-      ① Chromeで <b>jp.indeed.com</b> を開く（ログイン済みであればOK）<br>
-      ② ブラウザの <b>☆ お気に入り → 「CTK更新」</b> をタップ<br>
-      ③ CTK値が自動入力されたページが開く<br>
-      ④ 「更新する」ボタンを押して完了！<br><br>
-      <span style="color:#b45309;font-size:13px;">⚠ 自動取得できない場合は手動入力フォームに転送されます。<br>
-      その場合はPCのChromeで <b>F12 → Application → Cookies → CTK</b> の値をコピーして貼り付けてください。</span>
+      â  Chromeã§ <b>jp.indeed.com</b> ãéãï¼ã­ã°ã¤ã³æ¸ã¿ã§ããã°OKï¼<br>
+      â¡ ãã©ã¦ã¶ã® <b>â ãæ°ã«å¥ã â ãCTKæ´æ°ã</b> ãã¿ãã<br>
+      â¢ CTKå¤ãèªåå¥åããããã¼ã¸ãéã<br>
+      â£ ãæ´æ°ããããã¿ã³ãæ¼ãã¦å®äºï¼<br><br>
+      <span style="color:#b45309;font-size:13px;">â  èªååå¾ã§ããªãå ´åã¯æåå¥åãã©ã¼ã ã«è»¢éããã¾ãã<br>
+      ãã®å ´åã¯PCã®Chromeã§ <b>F12 â Application â Cookies â CTK</b> ã®å¤ãã³ãã¼ãã¦è²¼ãä»ãã¦ãã ããã</span>
     </div>
   </div>
 
   <div class="after">
-    <div class="after-title">✅ 設定完了後の手順はこれだけ</div>
+    <div class="after-title">â è¨­å®å®äºå¾ã®æé ã¯ããã ã</div>
     <div class="after-body">
-      jp.indeed.com を開く → お気に入りから「CTK更新」をタップ → CTK自動入力 → 「更新する」を押す<br>
-      <span style="font-size:13px;color:#166534;">（自動取得できない場合は手動入力フォームで対応可）</span>
+      jp.indeed.com ãéã â ãæ°ã«å¥ããããCTKæ´æ°ããã¿ãã â CTKèªåå¥å â ãæ´æ°ããããæ¼ã<br>
+      <span style="font-size:13px;color:#166534;">ï¼èªååå¾ã§ããªãå ´åã¯æåå¥åãã©ã¼ã ã§å¯¾å¿å¯ï¼</span>
     </div>
   </div>
 
-  <p class="note">このページのURLは保管してください。次回のセットアップ時に必要です。</p>
+  <p class="note">ãã®ãã¼ã¸ã®URLã¯ä¿ç®¡ãã¦ãã ãããæ¬¡åã®ã»ããã¢ããæã«å¿è¦ã§ãã</p>
 </body>
 </html>"""
     return html
@@ -1654,7 +1696,7 @@ def update_ctk_setup():
 
 @flask_app.route("/update-ctk", methods=["GET", "POST"])
 def update_ctk_endpoint():
-    """CTK更新フォーム（モバイル対応）。COWORK_WEBHOOK_TOKENで認証。"""
+    """CTKæ´æ°ãã©ã¼ã ï¼ã¢ãã¤ã«å¯¾å¿ï¼ãCOWORK_WEBHOOK_TOKENã§èªè¨¼ã"""
     token = flask_request.args.get("token", "")
     if not COWORK_WEBHOOK_TOKEN or not hmac.compare_digest(token, COWORK_WEBHOOK_TOKEN):
         return "Unauthorized", 401
@@ -1662,7 +1704,7 @@ def update_ctk_endpoint():
     if flask_request.method == "GET":
         return _CTK_UPDATE_FORM_HTML
 
-    # POST: CTKを更新してフラグをリセット
+    # POST: CTKãæ´æ°ãã¦ãã©ã°ããªã»ãã
     new_ctk = flask_request.form.get("ctk", "").strip()
     if not new_ctk:
         return "CTK is required", 400
@@ -1675,7 +1717,7 @@ def update_ctk_endpoint():
     except Exception as e:
         log(f"ERROR: CTK update via web form failed: {e}")
         return f"Error: {e}", 500
-    # CTK期限切れ通知フラグもリセット（次回期限切れ時に再通知できるように）
+    # CTKæéåãéç¥ãã©ã°ããªã»ããï¼æ¬¡åæéåãæã«åéç¥ã§ããããã«ï¼
     global _ctk_expired_notified
     with _ctk_expired_notified_lock:
         _ctk_expired_notified = False
@@ -1683,21 +1725,21 @@ def update_ctk_endpoint():
     return _CTK_UPDATE_SUCCESS_HTML
 
 
-# ── セッションCookie更新（電話番号取得に必要） ──────────────────────────────
+# ââ ã»ãã·ã§ã³Cookieæ´æ°ï¼é»è©±çªå·åå¾ã«å¿è¦ï¼ ââââââââââââââââââââââââââââââ
 @flask_app.route("/update-session-setup", methods=["GET"])
 def update_session_setup():
-    """セッションCookieブックマークレット設定ページ。
-    employers.indeed.com 上で実行するとCookie一式をRailwayに送信する。
+    """ã»ãã·ã§ã³Cookieããã¯ãã¼ã¯ã¬ããè¨­å®ãã¼ã¸ã
+    employers.indeed.com ä¸ã§å®è¡ããã¨Cookieä¸å¼ãRailwayã«éä¿¡ããã
     """
     token = flask_request.args.get("token", "")
     if not COWORK_WEBHOOK_TOKEN or not hmac.compare_digest(token, COWORK_WEBHOOK_TOKEN):
         return "Unauthorized", 401
     post_url = f"{RAILWAY_SERVICE_URL}/update-session?token={COWORK_WEBHOOK_TOKEN}"
-    # ブックマークレットJS: employers.indeed.comで実行 → 全Cookieを送信
+    # ããã¯ãã¼ã¯ã¬ããJS: employers.indeed.comã§å®è¡ â å¨Cookieãéä¿¡
     bookmarklet_js = (
         "javascript:(function(){{"
         "var c=document.cookie;"
-        "if(!c){{alert('Cookieが取得できません。employers.indeed.comで実行してください。');return;}}"
+        "if(!c){{alert('Cookieãåå¾ã§ãã¾ãããemployers.indeed.comã§å®è¡ãã¦ãã ããã');return;}}"
         "var url='{post_url}&cookies='+encodeURIComponent(c);"
         "window.location.href=url;"
         "}})();"
@@ -1707,7 +1749,7 @@ def update_session_setup():
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-  <title>セッション更新 設定</title>
+  <title>ã»ãã·ã§ã³æ´æ° è¨­å®</title>
   <style>
     *{{box-sizing:border-box;}}
     body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:20px;max-width:540px;margin:0 auto;background:#f8f9fa;color:#222;}}
@@ -1726,40 +1768,40 @@ def update_session_setup():
   </style>
 </head>
 <body>
-  <h1>📱 セッション更新 設定</h1>
-  <p class="sub">電話番号を取得するためのCookieをRailwayに登録します。</p>
+  <h1>ð± ã»ãã·ã§ã³æ´æ° è¨­å®</h1>
+  <p class="sub">é»è©±çªå·ãåå¾ããããã®CookieãRailwayã«ç»é²ãã¾ãã</p>
 
   <div class="warn">
-    ⚠️ <b>employers.indeed.com</b> を開いた状態でこのブックマークを実行してください。<br>
-    jp.indeed.comでは動作しません。
+    â ï¸ <b>employers.indeed.com</b> ãéããç¶æã§ãã®ããã¯ãã¼ã¯ãå®è¡ãã¦ãã ããã<br>
+    jp.indeed.comã§ã¯åä½ãã¾ããã
   </div>
 
   <div class="step">
-    <span class="step-num">1</span><span class="step-title">ブックマークレットを保存する</span>
+    <span class="step-num">1</span><span class="step-title">ããã¯ãã¼ã¯ã¬ãããä¿å­ãã</span>
     <div class="step-body">
-      下のボタンを<b>長押し（または右クリック）→「リンクをブックマークに追加」</b>で保存してください。<br>
-      名前は <b>「Indeed セッション更新」</b> にしてください。
-      <a class="bm-link" href="{bookmarklet_js}">🔑 Indeed セッション更新（ブックマーク用）</a>
+      ä¸ã®ãã¿ã³ã<b>é·æ¼ãï¼ã¾ãã¯å³ã¯ãªãã¯ï¼âããªã³ã¯ãããã¯ãã¼ã¯ã«è¿½å ã</b>ã§ä¿å­ãã¦ãã ããã<br>
+      ååã¯ <b>ãIndeed ã»ãã·ã§ã³æ´æ°ã</b> ã«ãã¦ãã ããã
+      <a class="bm-link" href="{bookmarklet_js}">ð Indeed ã»ãã·ã§ã³æ´æ°ï¼ããã¯ãã¼ã¯ç¨ï¼</a>
     </div>
   </div>
 
   <div class="step">
-    <span class="step-num">2</span><span class="step-title">定期的に実行する（月1〜2回）</span>
+    <span class="step-num">2</span><span class="step-title">å®æçã«å®è¡ããï¼æ1ã2åï¼</span>
     <div class="step-body">
-      ① Chromeで <b>employers.indeed.com/candidates</b> を開く（ログイン済みであればOK）<br>
-      ② ブラウザの <b>☆ お気に入り → 「Indeed セッション更新」</b> をタップ<br>
-      ③ 「セッション更新完了」と表示されれば完了！<br><br>
+      â  Chromeã§ <b>employers.indeed.com/candidates</b> ãéãï¼ã­ã°ã¤ã³æ¸ã¿ã§ããã°OKï¼<br>
+      â¡ ãã©ã¦ã¶ã® <b>â ãæ°ã«å¥ã â ãIndeed ã»ãã·ã§ã³æ´æ°ã</b> ãã¿ãã<br>
+      â¢ ãã»ãã·ã§ã³æ´æ°å®äºãã¨è¡¨ç¤ºãããã°å®äºï¼<br><br>
       <span style="color:#b45309;font-size:13px;">
-        💡 電話番号が「未登録」と表示される場合や、URLアラートが来た場合に実行してください。
+        ð¡ é»è©±çªå·ããæªç»é²ãã¨è¡¨ç¤ºãããå ´åããURLã¢ã©ã¼ããæ¥ãå ´åã«å®è¡ãã¦ãã ããã
       </span>
     </div>
   </div>
 
   <div class="after">
-    <div class="after-title">✅ 設定後の効果</div>
+    <div class="after-title">â è¨­å®å¾ã®å¹æ</div>
     <div class="after-body">
-      応募通知に電話番号・住所が含まれるようになります。<br>
-      セッションが切れた場合は同じ手順で再実行してください（月1〜2回程度）。
+      å¿åéç¥ã«é»è©±çªå·ã»ä½æãå«ã¾ããããã«ãªãã¾ãã<br>
+      ã»ãã·ã§ã³ãåããå ´åã¯åãæé ã§åå®è¡ãã¦ãã ããï¼æ1ã2åç¨åº¦ï¼ã
     </div>
   </div>
 </body>
@@ -1769,7 +1811,7 @@ def update_session_setup():
 
 @flask_app.route("/update-session", methods=["GET"])
 def update_session_endpoint():
-    """セッションCookieを受け取って保存する。ブックマークレットから呼ばれる。"""
+    """ã»ãã·ã§ã³Cookieãåãåã£ã¦ä¿å­ãããããã¯ãã¼ã¯ã¬ããããå¼ã°ããã"""
     token = flask_request.args.get("token", "")
     if not COWORK_WEBHOOK_TOKEN or not hmac.compare_digest(token, COWORK_WEBHOOK_TOKEN):
         return "Unauthorized", 401
@@ -1780,7 +1822,7 @@ def update_session_endpoint():
         from indeed_fetcher import save_session_cookies
         save_session_cookies(cookies_str)
         log(f"Session cookies updated via bookmarklet (length={len(cookies_str)})")
-        # CTK expired フラグもリセット（セッション更新で一緒にCTKも更新される可能性あり）
+        # CTK expired ãã©ã°ããªã»ããï¼ã»ãã·ã§ã³æ´æ°ã§ä¸ç·ã«CTKãæ´æ°ãããå¯è½æ§ããï¼
         try:
             from indeed_fetcher import reset_ctk_expired
             reset_ctk_expired()
@@ -1795,32 +1837,32 @@ def update_session_endpoint():
     return """<!DOCTYPE html>
 <html lang="ja"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>セッション更新完了</title>
+<title>ã»ãã·ã§ã³æ´æ°å®äº</title>
 <style>body{{font-family:-apple-system,sans-serif;padding:40px 24px;text-align:center;max-width:400px;margin:0 auto;}}.icon{{font-size:64px;margin-bottom:16px;}}</style>
 </head><body>
-<div class="icon">✅</div>
-<h1>セッション更新完了</h1>
-<p>Cookieが登録されました。<br>次回の応募通知から電話番号が届きます。</p>
+<div class="icon">â</div>
+<h1>ã»ãã·ã§ã³æ´æ°å®äº</h1>
+<p>Cookieãç»é²ããã¾ããã<br>æ¬¡åã®å¿åéç¥ããé»è©±çªå·ãå±ãã¾ãã</p>
 </body></html>"""
 
 
 @flask_app.route("/send-setup-msg", methods=["GET"])
 def send_setup_msg():
-    """LINEグループにCTKセットアップURLを送信する（初回設定用・GET呼び出し可）。"""
+    """LINEã°ã«ã¼ãã«CTKã»ããã¢ããURLãéä¿¡ããï¼ååè¨­å®ç¨ã»GETå¼ã³åºãå¯ï¼ã"""
     token = flask_request.args.get("token", "")
     if not COWORK_WEBHOOK_TOKEN or not hmac.compare_digest(token, COWORK_WEBHOOK_TOKEN):
         return "Unauthorized", 401
     setup_url = f"{RAILWAY_SERVICE_URL}/update-ctk-setup?token={COWORK_WEBHOOK_TOKEN}"
     msg = (
-        "【CTK更新 初回設定のお願い】\n\n"
-        "IndeedのCTKが期限切れになったとき、\n"
-        "ワンタップで更新できるブックマークレットを設定してください。\n\n"
-        "① 下のURLをChromeで開く\n"
-        "② 表示された手順に従ってブックマークを追加\n"
-        "③ 次回CTK切れ通知が来たらブックマークをタップするだけ\n\n"
+        "ãCTKæ´æ° ååè¨­å®ã®ãé¡ãã\n\n"
+        "Indeedã®CTKãæéåãã«ãªã£ãã¨ãã\n"
+        "ã¯ã³ã¿ããã§æ´æ°ã§ããããã¯ãã¼ã¯ã¬ãããè¨­å®ãã¦ãã ããã\n\n"
+        "â  ä¸ã®URLãChromeã§éã\n"
+        "â¡ è¡¨ç¤ºãããæé ã«å¾ã£ã¦ããã¯ãã¼ã¯ãè¿½å \n"
+        "â¢ æ¬¡åCTKåãéç¥ãæ¥ããããã¯ãã¼ã¯ãã¿ããããã ã\n\n"
         f"{setup_url}"
     )
-    line_to_id = get_line_to_id()  # is_test_mode() 経由で統一（直接 MODE 参照を廃止）
+    line_to_id = get_line_to_id()  # is_test_mode() çµç±ã§çµ±ä¸ï¼ç´æ¥ MODE åç§ãå»æ­¢ï¼
     if not line_to_id or not LINE_CHANNEL_ACCESS_TOKEN:
         return "LINE not configured", 500
     try:
@@ -1832,54 +1874,54 @@ def send_setup_msg():
         )
         log(f"[send-setup-msg] LINE status={resp.status_code}")
         if resp.status_code < 400:
-            return "✅ LINEに送信しました", 200
+            return "â LINEã«éä¿¡ãã¾ãã", 200
         return f"LINE API error: {resp.status_code} {resp.text}", 500
     except Exception as e:
         log(f"[send-setup-msg] error: {e}")
         return f"Error: {e}", 500
 @flask_app.route("/send-test-all", methods=["GET"])
 def send_test_all():
-    """Slack + LINEグループ + LINE個人にテストメッセージを送信する。URL短縮テスト付き。"""
+    """Slack + LINEã°ã«ã¼ã + LINEåäººã«ãã¹ãã¡ãã»ã¼ã¸ãéä¿¡ãããURLç­ç¸®ãã¹ãä»ãã"""
     token = flask_request.args.get("token", "")
     if not COWORK_WEBHOOK_TOKEN or not hmac.compare_digest(token, COWORK_WEBHOOK_TOKEN):
         return "Unauthorized", 401
     msg = flask_request.args.get("msg", "")
     raw_url = flask_request.args.get("url", "")
     results = {"shorten": None, "slack": None, "line_group": None}
-    # URL短縮テスト
+    # URLç­ç¸®ãã¹ã
     short_url = ""
     if raw_url:
         short_url = shorten_url(raw_url)
         results["shorten"] = {"original": raw_url, "shortened": short_url, "success": short_url != raw_url}
         log(f"[send-test-all] shorten: {raw_url} -> {short_url}")
-    # メッセージ中の[URL]を置換
+    # ã¡ãã»ã¼ã¸ä¸­ã®[URL]ãç½®æ
     if msg:
         final_msg = msg.replace("[URL]", short_url) if short_url else msg
         slack_msg = final_msg
         line_msg = final_msg
     else:
-        # デフォルトテストメッセージ（新フォーマット）
+        # ããã©ã«ããã¹ãã¡ãã»ã¼ã¸ï¼æ°ãã©ã¼ãããï¼
         test_url = short_url if short_url else "https://example.com/test"
         slack_msg = (
             "<!channel>\n"
-            "【Indeed 新着応募】\n"
-            "氏名：テスト太郎\n"
-            "求人：テスト求人タイトル\n"
-            "電話：090-1234-5678\n"
-            f"URL：{test_url}\n"
-            "※ 電話番号が「手動確認」の場合はIndeed管理画面で確認してください"
+            "ãIndeed æ°çå¿åã\n"
+            "æ°åï¼ãã¹ãå¤ªé\n"
+            "æ±äººï¼ãã¹ãæ±äººã¿ã¤ãã«\n"
+            "é»è©±ï¼090-1234-5678\n"
+            f"URLï¼{test_url}\n"
+            "â» é»è©±çªå·ããæåç¢ºèªãã®å ´åã¯Indeedç®¡çç»é¢ã§ç¢ºèªãã¦ãã ãã"
         )
         line_msg = (
-            "📋 Indeed 新着応募\n"
+            "ð Indeed æ°çå¿å\n"
             "\n"
-            "👤 氏名：テスト太郎\n"
-            "💼 求人：テスト求人タイトル\n"
-            "📞 電話：090-1234-5678\n"
-            f"🔗 URL：{test_url}\n"
+            "ð¤ æ°åï¼ãã¹ãå¤ªé\n"
+            "ð¼ æ±äººï¼ãã¹ãæ±äººã¿ã¤ãã«\n"
+            "ð é»è©±ï¼090-1234-5678\n"
+            f"ð URLï¼{test_url}\n"
             "\n"
-            "※ 電話番号が「手動確認」の場合はIndeed管理画面で確認してください"
+            "â» é»è©±çªå·ããæåç¢ºèªãã®å ´åã¯Indeedç®¡çç»é¢ã§ç¢ºèªãã¦ãã ãã"
         )
-    # Slack送信
+    # Slackéä¿¡
     webhook_url = get_slack_webhook_url()
     if webhook_url:
         try:
@@ -1889,7 +1931,7 @@ def send_test_all():
         except Exception as e:
             results["slack"] = {"error": str(e)}
             log(f"[send-test-all] Slack error: {e}")
-    # LINEグループ送信
+    # LINEã°ã«ã¼ãéä¿¡
     line_group_id = get_line_to_id()
     if LINE_CHANNEL_ACCESS_TOKEN and line_group_id:
         try:
@@ -1995,7 +2037,7 @@ def main() -> None:
     # Start Flask webhook server in background thread
     flask_thread = Thread(target=run_flask_server, daemon=True)
     flask_thread.start()
-    # v5: 1通だけ方式 — フォールバックタイマー不要（40秒CASポーリングで完結）
+    # v5: 1éã ãæ¹å¼ â ãã©ã¼ã«ããã¯ã¿ã¤ãã¼ä¸è¦ï¼40ç§CASãã¼ãªã³ã°ã§å®çµï¼
     # fb_thread = Thread(target=start_fallback_checker, daemon=True)
     # fb_thread.start()
     log(f"v5: 1-shot notification mode (40s CAS polling, no fallback checker)")
@@ -2076,7 +2118,7 @@ LINE_TO_ID_TEST = os.getenv("LINE_TO_ID_TEST")
 LINE_TO_ID_PROD = os.getenv("LINE_TO_ID_PROD")
 COWORK_WEBHOOK_TOKEN = os.getenv("COWORK_WEBHOOK_TOKEN", "")
 
-# CTK更新フォームのベースURL（Railway のサービスURL）
+# CTKæ´æ°ãã©ã¼ã ã®ãã¼ã¹URLï¼Railway ã®ãµã¼ãã¹URLï¼
 RAILWAY_SERVICE_URL = os.getenv("RAILWAY_SERVICE_URL", "https://recruit-production-f2dc.up.railway.app")
 
 _processed_ids_lock = RLock()  # Thread-safe access to processed_ids
@@ -2090,9 +2132,9 @@ COWORK_QUEUE_CHANNEL = os.getenv("COWORK_QUEUE_CHANNEL", "C0B1D2757FS")
 PROCESSED_IDS_FILE = os.getenv("PROCESSED_IDS_FILE", os.path.join(LOG_DIR, "processed_ids.json"))
 
 # --- Processed IDs cleanup settings ---
-_processed_ids_timestamps: Dict[str, str] = {}  # {id: "YYYY-MM-DD"} — 登録日を追跡
+_processed_ids_timestamps: Dict[str, str] = {}  # {id: "YYYY-MM-DD"} â ç»é²æ¥ãè¿½è·¡
 
-# --- CAS State Store (v2: Indeed応募信号管理) ---
+# --- CAS State Store (v2: Indeedå¿åä¿¡å·ç®¡ç) ---
 CAS_STATE_FILE = os.path.join(LOG_DIR, "cas_state.json")
 _cas_store = {}  # {signal_id: {"status": ..., "detected_at": ..., ...}}
 _cas_store_lock = RLock()
@@ -2105,7 +2147,7 @@ LINE_MENTION_ID_2 = os.getenv("LINE_MENTION_ID_2")
 
 # --- Polling Interval ---
 def _safe_int(env_var: str, default: int) -> int:
-    """環境変数を安全にintに変換する。不正値の場合はデフォルト値を使用。"""
+    """ç°å¢å¤æ°ãå®å¨ã«intã«å¤æãããä¸æ­£å¤ã®å ´åã¯ããã©ã«ãå¤ãä½¿ç¨ã"""
     raw = os.getenv(env_var)
     if raw is None:
         return default
@@ -2117,21 +2159,21 @@ def _safe_int(env_var: str, default: int) -> int:
         return default
 
 
-POLL_INTERVAL_SECONDS = _safe_int("POLL_INTERVAL_SECONDS", 20)  # デフォルト20秒
-MAX_BACKOFF_SECONDS = _safe_int("MAX_BACKOFF_SECONDS", 900)  # 最大15分のバックオフ
+POLL_INTERVAL_SECONDS = _safe_int("POLL_INTERVAL_SECONDS", 20)  # ããã©ã«ã20ç§
+MAX_BACKOFF_SECONDS = _safe_int("MAX_BACKOFF_SECONDS", 900)  # æå¤§15åã®ããã¯ãªã
 
 # --- Search window for emails (days) ---
-SEARCH_DAYS = _safe_int("SEARCH_DAYS", 1)  # デフォルト1日間（Gmail API制限対策）
+SEARCH_DAYS = _safe_int("SEARCH_DAYS", 1)  # ããã©ã«ã1æ¥éï¼Gmail APIå¶éå¯¾ç­ï¼
 
-# --- Batch limit per cycle (QUOTA ERROR対策) ---
-MAX_EMAILS_PER_CYCLE = _safe_int("MAX_EMAILS_PER_CYCLE", 10)  # 1サイクルで処理する最大メール数
+# --- Batch limit per cycle (QUOTA ERRORå¯¾ç­) ---
+MAX_EMAILS_PER_CYCLE = _safe_int("MAX_EMAILS_PER_CYCLE", 10)  # 1ãµã¤ã¯ã«ã§å¦çããæå¤§ã¡ã¼ã«æ°
 
 # --- Startup Protection Threshold ---
-# 初回サイクルでこの数を超えるメールが見つかった場合、再起動後の重複通知を防ぐため静かにマーク
+# ååãµã¤ã¯ã«ã§ãã®æ°ãè¶ããã¡ã¼ã«ãè¦ã¤ãã£ãå ´åãåèµ·åå¾ã®éè¤éç¥ãé²ãããéãã«ãã¼ã¯
 STARTUP_NEW_EMAIL_THRESHOLD = _safe_int("STARTUP_NEW_EMAIL_THRESHOLD", 3)
 FALLBACK_TIMEOUT_SECONDS = _safe_int("FALLBACK_TIMEOUT_SECONDS", 300)
 FALLBACK_CHECK_INTERVAL = _safe_int("FALLBACK_CHECK_INTERVAL", 30)
-PROCESSED_IDS_MAX_AGE_DAYS = _safe_int("PROCESSED_IDS_MAX_AGE_DAYS", 30)  # 30日超のIDを自動削除
+PROCESSED_IDS_MAX_AGE_DAYS = _safe_int("PROCESSED_IDS_MAX_AGE_DAYS", 30)  # 30æ¥è¶ã®IDãèªååé¤
 
 # --- Logging ---
 def log(msg: str) -> None:
@@ -2201,14 +2243,14 @@ def load_processed_ids() -> Tuple[Set[str], bool]:
                 id_set = set(data.keys())
                 log(f"Loaded {len(id_set)} processed IDs (timestamped format) from {PROCESSED_IDS_FILE}")
             elif isinstance(data, list):
-                # Legacy list format → migrate to dict with today's date
+                # Legacy list format â migrate to dict with today's date
                 id_set = set(data)
                 _processed_ids_timestamps = {id_val: today_str for id_val in id_set}
                 log(f"Loaded {len(id_set)} processed IDs (legacy list format, migrating to timestamped)")
             else:
                 raise ValueError(f"Unexpected JSON type: {type(data).__name__}")
 
-            # Migrate old ID format (raw numbers → gm: prefix)
+            # Migrate old ID format (raw numbers â gm: prefix)
             original_set = set(id_set)
             migrated = migrate_old_id_format(original_set)
             if migrated != original_set:
@@ -2286,7 +2328,7 @@ def save_processed_ids(processed_ids: Set[str]) -> bool:
                         return int(msg_id[4:])
                     except ValueError:
                         return 0
-                return 0  # mid: and unknown — treated as oldest, discarded first when trimming
+                return 0  # mid: and unknown â treated as oldest, discarded first when trimming
             kept = set(sorted(processed_ids, key=_sort_key)[-MAX_PROCESSED_IDS:])
             removed = processed_ids - kept
             for k in removed:
@@ -2329,42 +2371,42 @@ def save_processed_ids_with_merge(new_ids: Set[str]) -> bool:
         return save_processed_ids(current_ids)
 
 def notify_ctk_expired() -> None:
-    """Indeed CTK 期限切れを LINE と Slack で通知する（1サービス起動中に1度だけ）。
-    フラグは少なくとも1つの通知成功後に設定する。全失敗時はフラグをリセットして次回リトライ可能に。
+    """Indeed CTK æéåãã LINE ã¨ Slack ã§éç¥ããï¼1ãµã¼ãã¹èµ·åä¸­ã«1åº¦ã ãï¼ã
+    ãã©ã°ã¯å°ãªãã¨ã1ã¤ã®éç¥æåå¾ã«è¨­å®ãããå¨å¤±ææã¯ãã©ã°ããªã»ãããã¦æ¬¡åãªãã©ã¤å¯è½ã«ã
     """
     global _ctk_expired_notified
     with _ctk_expired_notified_lock:
         if _ctk_expired_notified:
-            return  # すでに通知済み
-    # ← フラグはここでは設定しない（送信成功後に設定）
-    log("ALERT: Indeed CTK が期限切れです。LINE/Slack に通知します。")
+            return  # ãã§ã«éç¥æ¸ã¿
+    # â ãã©ã°ã¯ããã§ã¯è¨­å®ããªãï¼éä¿¡æåå¾ã«è¨­å®ï¼
+    log("ALERT: Indeed CTK ãæéåãã§ããLINE/Slack ã«éç¥ãã¾ãã")
     setup_url = f"{RAILWAY_SERVICE_URL}/update-ctk-setup?token={COWORK_WEBHOOK_TOKEN}"
     session_setup_url = f"{RAILWAY_SERVICE_URL}/update-session-setup?token={COWORK_WEBHOOK_TOKEN}"
     message = (
-        "⚠️ Indeed CTK が期限切れです\n\n"
-        "電話番号・住所の取得ができません。\n"
-        "※ 応募通知自体は届き続けます。\n\n"
-        "【CTK更新手順】\n"
-        "① Chrome で jp.indeed.com を開く\n"
-        "② お気に入り →「CTK更新」をタップ\n"
-        "③ CTK値が自動入力されたページが開く\n"
-        "④「更新する」ボタンを押して完了\n\n"
-        "【セッションCookie更新（電話番号取得）】\n"
-        "① employers.indeed.com/candidates を開く\n"
-        "② お気に入り →「Indeed セッション更新」をタップ\n\n"
-        "※ CTK更新ブックマークがまだの場合は👇\n"
+        "â ï¸ Indeed CTK ãæéåãã§ã\n\n"
+        "é»è©±çªå·ã»ä½æã®åå¾ãã§ãã¾ããã\n"
+        "â» å¿åéç¥èªä½ã¯å±ãç¶ãã¾ãã\n\n"
+        "ãCTKæ´æ°æé ã\n"
+        "â  Chrome ã§ jp.indeed.com ãéã\n"
+        "â¡ ãæ°ã«å¥ã âãCTKæ´æ°ããã¿ãã\n"
+        "â¢ CTKå¤ãèªåå¥åããããã¼ã¸ãéã\n"
+        "â£ãæ´æ°ããããã¿ã³ãæ¼ãã¦å®äº\n\n"
+        "ãã»ãã·ã§ã³Cookieæ´æ°ï¼é»è©±çªå·åå¾ï¼ã\n"
+        "â  employers.indeed.com/candidates ãéã\n"
+        "â¡ ãæ°ã«å¥ã âãIndeed ã»ãã·ã§ã³æ´æ°ããã¿ãã\n\n"
+        "â» CTKæ´æ°ããã¯ãã¼ã¯ãã¾ã ã®å ´åã¯ð\n"
         f"{setup_url}\n\n"
-        "※ セッション更新ブックマークがまだの場合は👇\n"
+        "â» ã»ãã·ã§ã³æ´æ°ããã¯ãã¼ã¯ãã¾ã ã®å ´åã¯ð\n"
         f"{session_setup_url}"
     )
     notification_succeeded = False
-    # Slack通知（notify_error_to_slack は🚨エラープレフィックスが付くので直接送信）
+    # Slackéç¥ï¼notify_error_to_slack ã¯ð¨ã¨ã©ã¼ãã¬ãã£ãã¯ã¹ãä»ãã®ã§ç´æ¥éä¿¡ï¼
     if notify_slack_direct(message):
-        log("CTK期限切れ Slack通知: 送信成功")
+        log("CTKæéåã Slackéç¥: éä¿¡æå")
         notification_succeeded = True
     else:
-        log("ERROR: CTK期限切れ Slack通知 失敗")
-    # LINE通知（個人LINEに送信、未設定の場合はグループにフォールバック）
+        log("ERROR: CTKæéåã Slackéç¥ å¤±æ")
+    # LINEéç¥ï¼åäººLINEã«éä¿¡ãæªè¨­å®ã®å ´åã¯ã°ã«ã¼ãã«ãã©ã¼ã«ããã¯ï¼
     line_to_id = get_line_to_id()
     if LINE_CHANNEL_ACCESS_TOKEN and line_to_id:
         try:
@@ -2377,21 +2419,21 @@ def notify_ctk_expired() -> None:
                 },
                 timeout=10,
             )
-            log(f"CTK期限切れ LINE通知: status={resp.status_code}")
+            log(f"CTKæéåã LINEéç¥: status={resp.status_code}")
             if resp.status_code < 400:
                 notification_succeeded = True
         except Exception as e:
-            log(f"ERROR: CTK期限切れ LINE通知 失敗: {e}")
-    # 少なくとも1つ成功した場合のみフラグを設定（失敗時はフラグをリセットして次回リトライ）
+            log(f"ERROR: CTKæéåã LINEéç¥ å¤±æ: {e}")
+    # å°ãªãã¨ã1ã¤æåããå ´åã®ã¿ãã©ã°ãè¨­å®ï¼å¤±ææã¯ãã©ã°ããªã»ãããã¦æ¬¡åãªãã©ã¤ï¼
     with _ctk_expired_notified_lock:
         if notification_succeeded:
             _ctk_expired_notified = True
         else:
-            log("WARNING: CTK期限切れ通知が全て失敗。次回ポーリング時に再試行します。")
+            log("WARNING: CTKæéåãéç¥ãå¨ã¦å¤±æãæ¬¡åãã¼ãªã³ã°æã«åè©¦è¡ãã¾ãã")
 
 
 def notify_slack_direct(message: str) -> bool:
-    """Slack Webhook にメッセージを送信する（エラープレフィックスなし）。Returns True if successful."""
+    """Slack Webhook ã«ã¡ãã»ã¼ã¸ãéä¿¡ããï¼ã¨ã©ã¼ãã¬ãã£ãã¯ã¹ãªãï¼ãReturns True if successful."""
     webhook_url = SLACK_ERROR_WEBHOOK_URL or SLACK_WEBHOOK_URL_PROD
     if not webhook_url:
         log("ERROR: No Slack webhook URL configured; cannot send Slack message")
@@ -2408,27 +2450,27 @@ def notify_slack_direct(message: str) -> bool:
 
 
 def notify_error_to_slack(message: str) -> None:
-    """重大なエラーを Slack Webhook に通知する（🚨エラープレフィックス付き）"""
-    text = f"🚨 Indeed応募通知エラー発生\n{message}"
+    """éå¤§ãªã¨ã©ã¼ã Slack Webhook ã«éç¥ããï¼ð¨ã¨ã©ã¼ãã¬ãã£ãã¯ã¹ä»ãï¼"""
+    text = f"ð¨ Indeedå¿åéç¥ã¨ã©ã¼çºç\n{message}"
     notify_slack_direct(text)
 
 
 def notify_url_missing(applicant_name: str, unique_id: str) -> None:
-    """短縮URLが取得できなかった場合に LINE と Slack でアラートを送信する。
-    URL未取得は重大エラー → 手動確認を促す。
+    """ç­ç¸®URLãåå¾ã§ããªãã£ãå ´åã« LINE ã¨ Slack ã§ã¢ã©ã¼ããéä¿¡ããã
+    URLæªåå¾ã¯éå¤§ã¨ã©ã¼ â æåç¢ºèªãä¿ãã
     """
-    log(f"ALERT: URL missing for {applicant_name} ({unique_id}) — sending alert")
+    log(f"ALERT: URL missing for {applicant_name} ({unique_id}) â sending alert")
     message = (
-        f"⚠️ 【URL未取得アラート】\n\n"
-        f"応募者: {applicant_name}\n"
+        f"â ï¸ ãURLæªåå¾ã¢ã©ã¼ãã\n\n"
+        f"å¿åè: {applicant_name}\n"
         f"ID: {unique_id}\n\n"
-        f"Indeed管理画面のURLが取得できませんでした。\n"
-        f"手動でIndeed管理画面を確認してください。\n"
+        f"Indeedç®¡çç»é¢ã®URLãåå¾ã§ãã¾ããã§ããã\n"
+        f"æåã§Indeedç®¡çç»é¢ãç¢ºèªãã¦ãã ããã\n"
         f"https://employers.indeed.com/candidates"
     )
-    # Slackアラート
+    # Slackã¢ã©ã¼ã
     notify_slack_direct(message)
-    # LINEアラート（個人LINEに送信）
+    # LINEã¢ã©ã¼ãï¼åäººLINEã«éä¿¡ï¼
     line_to_id = get_line_to_id()
     if LINE_CHANNEL_ACCESS_TOKEN and line_to_id:
         try:
@@ -2466,7 +2508,7 @@ def get_line_to_id() -> Optional[str]:
 
 def add_test_prefix(message: str) -> str:
     """Add test version prefix if in test mode."""
-    return f"【テストバージョン】\n{message}" if is_test_mode() else message
+    return f"ããã¹ããã¼ã¸ã§ã³ã\n{message}" if is_test_mode() else message
 
 # --- Email Parsing ---
 def decode_header_value(value: Optional[str]) -> str:
@@ -2528,7 +2570,7 @@ def extract_indeed_url(html: str) -> str:
         return ""
     soup = BeautifulSoup(html, "html.parser")
     for a in soup.find_all("a"):
-        if "応募内容を確認する" in (a.get_text() or ""):
+        if "å¿ååå®¹ãç¢ºèªãã" in (a.get_text() or ""):
             return a.get("href") or ""
     for a in soup.find_all("a"):
         href = a.get("href") or ""
@@ -2537,51 +2579,51 @@ def extract_indeed_url(html: str) -> str:
     return ""
 
 def extract_indeed_legacy_id(html: str) -> Optional[str]:
-    """Indeed通知メールのHTMLからlegacyId（hex）を抽出する。
-    Indeed通知メールには以下のURLパターンが含まれる:
+    """Indeedéç¥ã¡ã¼ã«ã®HTMLããlegacyIdï¼hexï¼ãæ½åºããã
+    Indeedéç¥ã¡ã¼ã«ã«ã¯ä»¥ä¸ã®URLãã¿ã¼ã³ãå«ã¾ãã:
     - https://employers.indeed.com/candidates/view?id=<legacyId>
-    - https://engage.indeed.com/f/a/<legacyId>~~/... (旧形式: hex)
-    - https://engage.indeed.com/f/a/<base64url>~~... (新形式: base64url 22文字)
-    legacyId は hex文字列（8〜20桁）。
+    - https://engage.indeed.com/f/a/<legacyId>~~/... (æ§å½¢å¼: hex)
+    - https://engage.indeed.com/f/a/<base64url>~~... (æ°å½¢å¼: base64url 22æå­)
+    legacyId ã¯ hexæå­åï¼8ã20æ¡ï¼ã
     """
     if not html:
         return None
-    # パターン1: employers.indeed.com に直接 id= パラメータが含まれる場合
+    # ãã¿ã¼ã³1: employers.indeed.com ã«ç´æ¥ id= ãã©ã¡ã¼ã¿ãå«ã¾ããå ´å
     direct = re.search(r'employers\.indeed\.com/candidates(?:/view)?\?(?:[^"\'<>\s]*&)?id=([a-f0-9]{8,20})', html)
     if direct:
         return direct.group(1)
-    # パターン2: engage.indeed.com/f/a/<hex>~~ 形式（旧形式）
+    # ãã¿ã¼ã³2: engage.indeed.com/f/a/<hex>~~ å½¢å¼ï¼æ§å½¢å¼ï¼
     engage_hex = re.search(r'engage\.indeed\.com/f/a/([a-f0-9]{10,16})(?:~~|/)', html)
     if engage_hex:
         return engage_hex.group(1)
-    # パターン3: 任意のURLの id= パラメータ（indeed ドメイン内）
+    # ãã¿ã¼ã³3: ä»»æã®URLã® id= ãã©ã¡ã¼ã¿ï¼indeed ãã¡ã¤ã³åï¼
     any_id = re.search(r'indeed\.com[^"\'<>\s]*[?&]id=([a-f0-9]{8,20})', html)
     if any_id:
         return any_id.group(1)
     return None
 
 def extract_indeed_engage_urls(html: str) -> list:
-    """Indeed通知メールのHTMLからengage.indeed.comトラッキングURLを全て抽出する。
-    新形式(base64url)・旧形式(hex)問わず engage.indeed.com/f/a/ URLを返す。
-    これらURLはリダイレクトをたどると employers.indeed.com/candidates/view?id=<hex> に到達する。
+    """Indeedéç¥ã¡ã¼ã«ã®HTMLããengage.indeed.comãã©ãã­ã³ã°URLãå¨ã¦æ½åºããã
+    æ°å½¢å¼(base64url)ã»æ§å½¢å¼(hex)åãã engage.indeed.com/f/a/ URLãè¿ãã
+    ãããURLã¯ãªãã¤ã¬ã¯ãããã©ãã¨ employers.indeed.com/candidates/view?id=<hex> ã«å°éããã
     """
     if not html:
         return []
-    # engage.indeed.com/f/a/<任意の文字列>~~ パターン
+    # engage.indeed.com/f/a/<ä»»æã®æå­å>~~ ãã¿ã¼ã³
     matches = re.findall(r'(https://engage\.indeed\.com/f/a/[A-Za-z0-9_\-]{10,}~~[^\s"\'<>]*)', html)
-    return list(dict.fromkeys(matches))  # 重複除去（順序保持）
+    return list(dict.fromkeys(matches))  # éè¤é¤å»ï¼é åºä¿æï¼
 
 def extract_phone_number(html: str) -> Optional[str]:
-    """メール本文HTMLから電話番号を抽出する。"""
+    """ã¡ã¼ã«æ¬æHTMLããé»è©±çªå·ãæ½åºããã"""
     if not html:
         return None
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(separator="\n")
-    # 日本の電話番号パターン（携帯・固定・フリーダイヤル）
+    # æ¥æ¬ã®é»è©±çªå·ãã¿ã¼ã³ï¼æºå¸¯ã»åºå®ã»ããªã¼ãã¤ã¤ã«ï¼
     patterns = [
-        r'0[789]0[-\s]?\d{4}[-\s]?\d{4}',  # 携帯: 090/080/070
-        r'0\d{1,4}[-\s]?\d{1,4}[-\s]?\d{4}',  # 固定: 03-xxxx-xxxx 等
-        r'0120[-\s]?\d{3}[-\s]?\d{3}',  # フリーダイヤル
+        r'0[789]0[-\s]?\d{4}[-\s]?\d{4}',  # æºå¸¯: 090/080/070
+        r'0\d{1,4}[-\s]?\d{1,4}[-\s]?\d{4}',  # åºå®: 03-xxxx-xxxx ç­
+        r'0120[-\s]?\d{3}[-\s]?\d{3}',  # ããªã¼ãã¤ã¤ã«
     ]
     for pattern in patterns:
         match = re.search(pattern, text)
@@ -2590,49 +2632,49 @@ def extract_phone_number(html: str) -> Optional[str]:
     return None
 
 def normalize_phone_number(phone: str) -> str:
-    """+81形式を日本国内形式(0XX-XXXX-XXXX)に変換する。"""
+    """+81å½¢å¼ãæ¥æ¬å½åå½¢å¼(0XX-XXXX-XXXX)ã«å¤æããã"""
     if not phone:
         return phone
     digits = re.sub(r'[\s\-\(\)]', '', phone)
     if digits.startswith('+81'):
         digits = '0' + digits[3:]
-    if re.match(r'^0[789]0\d{8}$', digits):  # 携帯 090/080/070
+    if re.match(r'^0[789]0\d{8}$', digits):  # æºå¸¯ 090/080/070
         return f"{digits[:3]}-{digits[3:7]}-{digits[7:]}"
-    if re.match(r'^0\d{9}$', digits):  # 固定10桁
+    if re.match(r'^0\d{9}$', digits):  # åºå®10æ¡
         return f"{digits[:2]}-{digits[2:6]}-{digits[6:]}"
-    if re.match(r'^0120\d{6}$', digits):  # フリーダイヤル
+    if re.match(r'^0120\d{6}$', digits):  # ããªã¼ãã¤ã¤ã«
         return f"{digits[:4]}-{digits[4:7]}-{digits[7:]}"
     return phone
 
 def extract_body_text(html: str, max_chars: int = 500) -> str:
-    """メール本文HTMLからプレーンテキストを抽出する（最大max_chars文字）。"""
+    """ã¡ã¼ã«æ¬æHTMLãããã¬ã¼ã³ãã­ã¹ããæ½åºããï¼æå¤§max_charsæå­ï¼ã"""
     if not html:
         return ""
     soup = BeautifulSoup(html, "html.parser")
-    # script/styleタグを除去
+    # script/styleã¿ã°ãé¤å»
     for tag in soup(["script", "style"]):
         tag.decompose()
     text = soup.get_text(separator="\n")
-    # 連続する空行を1行にまとめる
+    # é£ç¶ããç©ºè¡ã1è¡ã«ã¾ã¨ãã
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     result = "\n".join(lines)
     if len(result) > max_chars:
-        result = result[:max_chars] + "…"
+        result = result[:max_chars] + "â¦"
     return result
 
 def format_phone_for_slack(phone: str) -> str:
     """Format phone number as a Slack tel: link.
-    Converts '+81 80 2478 7813' → '<tel:+818024787813|080-2478-7813>'
+    Converts '+81 80 2478 7813' â '<tel:+818024787813|080-2478-7813>'
     so it becomes a tappable link in Slack mobile.
     """
     if not phone:
         return phone
     # Remove spaces to build the tel URI
     tel_uri = phone.replace(" ", "")
-    # Build Japanese local display format: +81 80 XXXX XXXX → 080-XXXX-XXXX
+    # Build Japanese local display format: +81 80 XXXX XXXX â 080-XXXX-XXXX
     digits = tel_uri.lstrip("+")
     if digits.startswith("81") and len(digits) >= 11:
-        local = "0" + digits[2:]  # 81 → 0
+        local = "0" + digits[2:]  # 81 â 0
         # Format: 090/080/060 (3 digits) - 4 digits - 4 digits
         if len(local) == 11:
             display = f"{local[:3]}-{local[3:7]}-{local[7:]}"
@@ -2646,7 +2688,7 @@ def format_phone_for_slack(phone: str) -> str:
 
 def format_phone_for_line(phone: str) -> str:
     """Format phone number for LINE tap-to-call.
-    Converts '+81 80 2478 7813' → '080-2478-7813'
+    Converts '+81 80 2478 7813' â '080-2478-7813'
     LINE automatically turns hyphen-formatted Japanese numbers into tappable links.
     """
     if not phone:
@@ -2691,29 +2733,29 @@ def shorten_url(url: str) -> str:
     return url
 
 def extract_applicant_name_from_html(html: str) -> Optional[str]:
-    """IndeedメールのHTML本文から応募者名を抽出する。
-    Indeedのメールはfrom_headerが「Indeed <noreply@indeed.com>」のため
-    ヘッダーからは応募者名を取得できない。代わりにメール本文HTMLから取得する。
-    試みるパターン:
-    1. 「○○さんからの応募」「○○ さんが応募しました」等のテキスト
-    2. 件名「新しい応募者のお知らせ: ○○」のパターン
-    3. td/div/p内に「応募者:」「応募者名:」等のラベルに続く名前
+    """Indeedã¡ã¼ã«ã®HTMLæ¬æããå¿åèåãæ½åºããã
+    Indeedã®ã¡ã¼ã«ã¯from_headerããIndeed <noreply@indeed.com>ãã®ãã
+    ãããã¼ããã¯å¿åèåãåå¾ã§ããªããä»£ããã«ã¡ã¼ã«æ¬æHTMLããåå¾ããã
+    è©¦ã¿ããã¿ã¼ã³:
+    1. ãââããããã®å¿åããââ ãããå¿åãã¾ãããç­ã®ãã­ã¹ã
+    2. ä»¶åãæ°ããå¿åèã®ãç¥ãã: ââãã®ãã¿ã¼ã³
+    3. td/div/påã«ãå¿åè:ããå¿åèå:ãç­ã®ã©ãã«ã«ç¶ãåå
     """
     if not html:
         return None
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(separator="\n")
-    # パターン1: 「○○さんからの応募」「○○さんが応募しました」
+    # ãã¿ã¼ã³1: ãââããããã®å¿åããââãããå¿åãã¾ããã
     for pattern in [
-        r"([^\s \n]+(?:\s[^\s \n]+)?)\s*さん(?:から(?:の)?応募|が応募)",
-        r"新しい応募者(?:のお知らせ)?[:：]\s*([^\n\r]+)",
-        r"応募者(?:名)?[:：]\s*([^\n\r]+)",
-        r"([^\s \n]{1,20})\s*(?:様|さん)(?:\s|$|が|から|の)",
+        r"([^\s \n]+(?:\s[^\s \n]+)?)\s*ãã(?:ãã(?:ã®)?å¿å|ãå¿å)",
+        r"æ°ããå¿åè(?:ã®ãç¥ãã)?[:ï¼]\s*([^\n\r]+)",
+        r"å¿åè(?:å)?[:ï¼]\s*([^\n\r]+)",
+        r"([^\s \n]{1,20})\s*(?:æ§|ãã)(?:\s|$|ã|ãã|ã®)",
     ]:
         match = re.search(pattern, text)
         if match:
             name = match.group(1).strip()
-            # 明らかに名前ではないものを除外（URLや長すぎる文字列）
+            # æããã«ååã§ã¯ãªããã®ãé¤å¤ï¼URLãé·ãããæå­åï¼
             if name and len(name) <= 30 and "http" not in name and "@" not in name:
                 return name
     return None
@@ -2738,26 +2780,26 @@ def notify_slack_with_retry(
         return False
     mention_prefix = "<!channel>\n" if not is_test_mode() else ""
     if source == "indeed":
-        lines = ["【Indeed 新着応募】"]
-        lines.append(f"氏名：{name}")
+        lines = ["ãIndeed æ°çå¿åã"]
+        lines.append(f"æ°åï¼{name}")
         if job_title:
-            lines.append(f"求人：{job_title}")
-        lines.append(f"電話：{format_phone_for_slack(phone) if phone else '未登録'}")
-        lines.append(f"住所：{location if location else '未登録'}")
+            lines.append(f"æ±äººï¼{job_title}")
+        lines.append(f"é»è©±ï¼{format_phone_for_slack(phone) if phone else 'æªç»é²'}")
+        lines.append(f"ä½æï¼{location if location else 'æªç»é²'}")
         if email_addr:
-            lines.append(f"メール：{email_addr}")
+            lines.append(f"ã¡ã¼ã«ï¼{email_addr}")
         if url:
-            lines.append(f"URL：{shorten_url(url)}")
+            lines.append(f"URLï¼{shorten_url(url)}")
     else:
-        lines = [f"【ジモティー】 【{name}】 さんから応募がありました。"]
+        lines = [f"ãã¸ã¢ãã£ã¼ã ã{name}ã ããããå¿åãããã¾ããã"]
         if job_title:
-            lines.append(f"求人: {job_title}")
+            lines.append(f"æ±äºº: {job_title}")
         if phone:
-            lines.append(f"電話番号: {format_phone_for_slack(phone)}")
+            lines.append(f"é»è©±çªå·: {format_phone_for_slack(phone)}")
         if location:
-            lines.append(f"住所: {location}")
+            lines.append(f"ä½æ: {location}")
         if email_addr:
-            lines.append(f"メール: {email_addr}")
+            lines.append(f"ã¡ã¼ã«: {email_addr}")
         if answers:
             for ans in answers:
                 key = ans.get("questionKey", "")
@@ -2765,7 +2807,7 @@ def notify_slack_with_retry(
                 if val and key:
                     lines.append(f"{key}: {val}")
         if url:
-            lines.extend(["", "応募内容はこちら:", shorten_url(url)])
+            lines.extend(["", "å¿ååå®¹ã¯ãã¡ã:", shorten_url(url)])
     message = add_test_prefix(mention_prefix + "\n".join(lines))
     for attempt in range(max_retries):
         try:
@@ -2800,34 +2842,34 @@ def notify_line_with_retry(
         log("LINE Token or TO ID missing")
         return False
     if source == "indeed":
-        lines = ["【Indeed 新着応募】"]
-        lines.append(f"氏名：{name}")
+        lines = ["ãIndeed æ°çå¿åã"]
+        lines.append(f"æ°åï¼{name}")
         if job_title:
-            lines.append(f"求人：{job_title}")
-        lines.append(f"電話：{format_phone_for_line(phone) if phone else '未登録'}")
-        lines.append(f"住所：{location if location else '未登録'}")
+            lines.append(f"æ±äººï¼{job_title}")
+        lines.append(f"é»è©±ï¼{format_phone_for_line(phone) if phone else 'æªç»é²'}")
+        lines.append(f"ä½æï¼{location if location else 'æªç»é²'}")
         if email_addr:
-            lines.append(f"メール：{email_addr}")
+            lines.append(f"ã¡ã¼ã«ï¼{email_addr}")
         if url:
-            lines.append(f"URL：{shorten_url(url)}")
+            lines.append(f"URLï¼{shorten_url(url)}")
     else:
-        lines = [f"【{name}】 さんからジモティーで新着があります。"]
+        lines = [f"ã{name}ã ããããã¸ã¢ãã£ã¼ã§æ°çãããã¾ãã"]
         if job_title:
-            lines.append(f"求人: {job_title}")
+            lines.append(f"æ±äºº: {job_title}")
         if phone:
-            lines.append(f"📞 電話番号: {format_phone_for_line(phone)}")
+            lines.append(f"ð é»è©±çªå·: {format_phone_for_line(phone)}")
         if location:
-            lines.append(f"📍 住所: {location}")
+            lines.append(f"ð ä½æ: {location}")
         if email_addr:
-            lines.append(f"📧 メール: {email_addr}")
+            lines.append(f"ð§ ã¡ã¼ã«: {email_addr}")
         if answers:
             for ans in answers:
                 key = ans.get("questionKey", "")
                 val = ans.get("value")
                 if val and key:
-                    lines.append(f"📝 {key}: {val}")
+                    lines.append(f"ð {key}: {val}")
         if url:
-            lines.extend(["", "詳細はこちら:", shorten_url(url)])
+            lines.extend(["", "è©³ç´°ã¯ãã¡ã:", shorten_url(url)])
     base_message = add_test_prefix("\n".join(lines))
     if is_test_mode():
         # Test mode: no @all mention, plain text
@@ -2903,9 +2945,9 @@ def parse_fetch_response(data: list) -> Tuple[Optional[str], Optional[bytes]]:
 
 def determine_source(subject: str) -> Tuple[Optional[str], Optional[str]]:
     """Determine email source and default URL based on subject."""
-    if "新しい応募者のお知らせ" in subject:
+    if "æ°ããå¿åèã®ãç¥ãã" in subject:
         return "indeed", None
-    elif "ジモティー" in subject:
+    elif "ã¸ã¢ãã£ã¼" in subject:
         return "jimoty", "https://jmty.jp/web_mail/posts"
     return None, None
 
@@ -2949,17 +2991,17 @@ def process_mail_by_uid(
         return unique_id  # Mark as processed to avoid re-checking
     html = extract_html(msg)
     url = extract_indeed_url(html) if source == "indeed" else default_url
-    # IndeedメールはFrom=「Indeed <noreply@indeed.com>」なので
-    # メール本文HTMLから応募者名を取得する。取れなければFromヘッダーの名前を使う。
+    # Indeedã¡ã¼ã«ã¯From=ãIndeed <noreply@indeed.com>ããªã®ã§
+    # ã¡ã¼ã«æ¬æHTMLããå¿åèåãåå¾ãããåããªããã°Fromãããã¼ã®ååãä½¿ãã
     if source == "indeed":
         applicant_name = extract_applicant_name_from_html(html)
         if not applicant_name:
             applicant_name = extract_name(from_header)
     else:
         applicant_name = extract_name(from_header)
-    # 電話番号・本文テキストを抽出
+    # é»è©±çªå·ã»æ¬æãã­ã¹ããæ½åº
     phone = extract_phone_number(html)
-    # Indeed応募の場合: URLからlegacyIdを抽出してAPIで全詳細を取得
+    # Indeedå¿åã®å ´å: URLããlegacyIdãæ½åºãã¦APIã§å¨è©³ç´°ãåå¾
     indeed_location: Optional[str] = None
     indeed_email: Optional[str] = None
     indeed_answers: Optional[list] = None
@@ -2969,8 +3011,8 @@ def process_mail_by_uid(
         if legacy_id:
             log(f"Indeed legacyId found in HTML: {legacy_id}")
         else:
-            # HTMLから直接hex IDが取れなかった場合:
-            # engage.indeed.com トラッキングURLをたどってhex IDを取得する
+            # HTMLããç´æ¥hex IDãåããªãã£ãå ´å:
+            # engage.indeed.com ãã©ãã­ã³ã°URLããã©ã£ã¦hex IDãåå¾ãã
             log("Indeed legacyId not found in HTML, trying engage tracking URL redirect...")
             engage_urls = extract_indeed_engage_urls(html)
             log(f"Indeed engage URLs found: {len(engage_urls)}")
@@ -2980,7 +3022,7 @@ def process_mail_by_uid(
                     log(f"Indeed legacyId resolved via engage URL redirect: {legacy_id} (from {engage_url[:60]}...)")
                     break
             if not legacy_id:
-                # フォールバック: extract_indeed_url で取得した汎用URLも試みる
+                # ãã©ã¼ã«ããã¯: extract_indeed_url ã§åå¾ããæ±ç¨URLãè©¦ã¿ã
                 if url and "engage.indeed.com" in url:
                     legacy_id = resolve_legacy_id_from_tracking_url(url)
                     if legacy_id:
@@ -2988,30 +3030,30 @@ def process_mail_by_uid(
                 else:
                     log(f"Indeed legacyId not found (no valid engage URL)")
         if legacy_id:
-            # legacyIdが取得できた場合、管理画面URLを生成（engage URLより安定・短縮URL用）
+            # legacyIdãåå¾ã§ããå ´åãç®¡çç»é¢URLãçæï¼engage URLããå®å®ã»ç­ç¸®URLç¨ï¼
             url = f"https://employers.indeed.com/candidates/view?id={legacy_id}"
             details = fetch_all_details(legacy_id)
             if not details:
-                # 一時的なAPI障害対策: 3秒後に即リトライ（次サイクル待ちなし）
+                # ä¸æçãªAPIéå®³å¯¾ç­: 3ç§å¾ã«å³ãªãã©ã¤ï¼æ¬¡ãµã¤ã¯ã«å¾ã¡ãªãï¼
                 log(f"fetch_all_details empty, retrying in 3s...")
                 time.sleep(3)
                 details = fetch_all_details(legacy_id)
             if details:
-                phone = details.get("phone") or phone  # APIの方が正確
+                phone = details.get("phone") or phone  # APIã®æ¹ãæ­£ç¢º
                 indeed_location = details.get("location")
                 indeed_email = details.get("email")
                 indeed_answers = details.get("answers") or []
-                log(f"Indeed API details: phone={phone}, location={indeed_location}, answers={len(indeed_answers or [])}件")
+                log(f"Indeed API details: phone={phone}, location={indeed_location}, answers={len(indeed_answers or [])}ä»¶")
             else:
                 log(f"Indeed API returned no details for legacyId={legacy_id} after retry (CTK expired?)")
-                # CTK期限切れ検知 → LINE/Slack で通知（1回のみ）
+                # CTKæéåãæ¤ç¥ â LINE/Slack ã§éç¥ï¼1åã®ã¿ï¼
                 try:
                     from indeed_fetcher import is_ctk_expired
                     if is_ctk_expired():
                         notify_ctk_expired()
                 except ImportError:
                     pass
-            # フォールバック: phoneがない場合も名前検索で補完（GraphQL APIが電話番号を返さないことがある）
+            # ãã©ã¼ã«ããã¯: phoneããªãå ´åãååæ¤ç´¢ã§è£å®ï¼GraphQL APIãé»è©±çªå·ãè¿ããªããã¨ãããï¼
             if not phone:
                 log(f"Trying name-based search for '{applicant_name}'...")
                 name_details = fetch_by_name(applicant_name)
@@ -3022,13 +3064,13 @@ def process_mail_by_uid(
                     log(f"Name-search details: phone={phone}, location={indeed_location}, email={indeed_email}")
                 else:
                     log(f"Name-search: no match for '{applicant_name}'")
-    # ── URL不在チェック（Indeed限定）──────────────────────────────────────
-    # URLが取れていない場合は内部リトライを行い、それでもダメならアラートを発報する。
-    # 電話番号がない場合は許容（"未登録"表示）だが、URLなしは手動確認が必要。
+    # ââ URLä¸å¨ãã§ãã¯ï¼Indeedéå®ï¼ââââââââââââââââââââââââââââââââââââââ
+    # URLãåãã¦ããªãå ´åã¯åé¨ãªãã©ã¤ãè¡ããããã§ããã¡ãªãã¢ã©ã¼ããçºå ±ããã
+    # é»è©±çªå·ããªãå ´åã¯è¨±å®¹ï¼"æªç»é²"è¡¨ç¤ºï¼ã ããURLãªãã¯æåç¢ºèªãå¿è¦ã
     if source == "indeed" and not url:
         log(f"URL not found for {applicant_name}, retrying engage URL resolution in 5s...")
         time.sleep(5)
-        # engage URLからlegacyIdを再試行
+        # engage URLããlegacyIdãåè©¦è¡
         retry_engage_urls = extract_indeed_engage_urls(html)
         for engage_url in retry_engage_urls:
             from indeed_fetcher import resolve_legacy_id_from_tracking_url as _resolve
@@ -3038,15 +3080,15 @@ def process_mail_by_uid(
                 log(f"URL resolved on retry: {url[:60]}")
                 break
         if not url:
-            log(f"URL still not found after retry for {applicant_name} ({unique_id}) — sending alert")
+            log(f"URL still not found after retry for {applicant_name} ({unique_id}) â sending alert")
             notify_url_missing(applicant_name, unique_id)
         else:
             log(f"URL obtained on retry for {applicant_name}")
     if phone:
         phone = normalize_phone_number(phone)
-    # --- v4: 1通だけ方式（120秒CASポーリング） ---
-    # Indeed応募: #indeed-cowork-queue に信号投稿 → 最大120秒ポーリング → 1通だけ通知
-    # 非Indeed（Jimoty等）: 従来通り直接通知
+    # --- v4: 1éã ãæ¹å¼ï¼120ç§CASãã¼ãªã³ã°ï¼ ---
+    # Indeedå¿å: #indeed-cowork-queue ã«ä¿¡å·æç¨¿ â æå¤§120ç§ãã¼ãªã³ã° â 1éã ãéç¥
+    # éIndeedï¼Jimotyç­ï¼: å¾æ¥éãç´æ¥éç¥
     if source == "indeed":
         short_url = shorten_url(url) if url else ""
         display_url = short_url or url or ""
@@ -3059,7 +3101,7 @@ def process_mail_by_uid(
                 engage_url_for_signal = engage_urls_list[0]
         except Exception:
             pass
-        # Coworkに電話番号取得を依頼（#indeed-cowork-queue に信号投稿）
+        # Coworkã«é»è©±çªå·åå¾ãä¾é ¼ï¼#indeed-cowork-queue ã«ä¿¡å·æç¨¿ï¼
         signal_ok = post_signal_to_slack(
             signal_id, applicant_name, position, url,
             engage_url_for_signal, legacy_id or "", short_url
@@ -3095,7 +3137,7 @@ def process_mail_by_uid(
             )
         else:
             log(f"WARNING: v4 Signal post failed for {signal_id}, proceeding without phone")
-        # 1通だけ通知（電話番号あり/なし）
+        # 1éã ãéç¥ï¼é»è©±çªå·ãã/ãªãï¼
         log(f"v5: Notify indeed (1-shot): {applicant_name}, phone={phone}, url={url}, id={unique_id}")
         slack_ok = notify_slack_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
         line_ok = notify_line_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
@@ -3104,14 +3146,14 @@ def process_mail_by_uid(
         if not line_ok:
             log(f"WARNING: LINE notification failed for {applicant_name} ({unique_id})")
         if not slack_ok and not line_ok:
-            phone_str = f"電話: {phone}" if phone else "電話: 未記入"
+            phone_str = f"é»è©±: {phone}" if phone else "é»è©±: æªè¨å¥"
             notify_error_to_slack(
-                f"【通知失敗】応募者: {applicant_name}\n{phone_str}\nUID: {unique_id}\n\n"
-                f"Slack/LINE通知に失敗しました。Gmailを手動確認してください。"
+                f"ãéç¥å¤±æãå¿åè: {applicant_name}\n{phone_str}\nUID: {unique_id}\n\n"
+                f"Slack/LINEéç¥ã«å¤±æãã¾ãããGmailãæåç¢ºèªãã¦ãã ããã"
             )
             log(f"ERROR: All notifications failed for {applicant_name} ({unique_id}) - marked as processed, error alert sent")
     else:
-        # 非Indeed（Jimoty等）: 従来通り直接通知
+        # éIndeedï¼Jimotyç­ï¼: å¾æ¥éãç´æ¥éç¥
         log(f"Notify {source}: {applicant_name}, phone={phone}, url={url}, id={unique_id}")
         slack_ok = notify_slack_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
         line_ok = notify_line_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
@@ -3120,10 +3162,10 @@ def process_mail_by_uid(
         if not line_ok:
             log(f"WARNING: LINE notification failed for {applicant_name} ({unique_id})")
         if not slack_ok and not line_ok:
-            phone_str = f"電話: {phone}" if phone else "電話: 未記入"
+            phone_str = f"é»è©±: {phone}" if phone else "é»è©±: æªè¨å¥"
             notify_error_to_slack(
-                f"【通知失敗】応募者: {applicant_name}\n{phone_str}\nUID: {unique_id}\n\n"
-                f"Slack/LINE通知に失敗しました。Gmailを手動確認してください。"
+                f"ãéç¥å¤±æãå¿åè: {applicant_name}\n{phone_str}\nUID: {unique_id}\n\n"
+                f"Slack/LINEéç¥ã«å¤±æãã¾ãããGmailãæåç¢ºèªãã¦ãã ããã"
             )
             log(f"ERROR: All notifications failed for {applicant_name} ({unique_id}) - marked as processed, error alert sent")
     return unique_id
@@ -3200,14 +3242,14 @@ def check_mail_with_status() -> bool:
                 total_new = len(truly_new_uids)
 
                 # === STARTUP PROTECTION: Detect restart with lost state ===
-                # 初回サイクルで閾値を超えるメールが見つかった場合、再起動後の重複通知を防ぐ
-                # processed_ids の件数に関係なく（部分的なVolume復元も検知）
+                # ååãµã¤ã¯ã«ã§é¾å¤ãè¶ããã¡ã¼ã«ãè¦ã¤ãã£ãå ´åãåèµ·åå¾ã®éè¤éç¥ãé²ã
+                # processed_ids ã®ä»¶æ°ã«é¢ä¿ãªãï¼é¨åçãªVolumeå¾©åãæ¤ç¥ï¼
                 with _first_cycle_lock:
                     if not _first_cycle_done and len(truly_new_uids) > STARTUP_NEW_EMAIL_THRESHOLD:
                         log(f"STARTUP PROTECTION: {len(truly_new_uids)} new emails found on first cycle "
                             f"(threshold={STARTUP_NEW_EMAIL_THRESHOLD}, existing processed_ids={len(processed_ids)}).")
                         log("Silently marking as processed to prevent re-notification on restart...")
-                        # 全件を軽量取得してgm:IDのみ記録（通知なし）
+                        # å¨ä»¶ãè»½éåå¾ãã¦gm:IDã®ã¿è¨é²ï¼éç¥ãªãï¼
                         startup_ids: Set[str] = set()
                         for uid in truly_new_uids:
                             uid_str = uid.decode() if isinstance(uid, bytes) else uid
@@ -3221,7 +3263,7 @@ def check_mail_with_status() -> bool:
                         return True
                     _first_cycle_done = True
 
-                # QUOTA ERROR対策: 1サイクルで処理するメール数を制限する
+                # QUOTA ERRORå¯¾ç­: 1ãµã¤ã¯ã«ã§å¦çããã¡ã¼ã«æ°ãå¶éãã
                 batch = truly_new_uids[:MAX_EMAILS_PER_CYCLE]
                 if total_new > MAX_EMAILS_PER_CYCLE:
                     log(f"Truly new emails to process: {total_new} (processing {MAX_EMAILS_PER_CYCLE} this cycle, {total_new - MAX_EMAILS_PER_CYCLE} deferred)")
@@ -3361,8 +3403,8 @@ def send_fallback_notification(applicant_name, indeed_url, short_url=None, posit
     url = short_url or indeed_url or ""
     log(f"Sending fallback notification for {applicant_name}")
     mention = "<!channel>\n" if not is_test_mode() else ""
-    position_line = f"\n求人：{position}" if position else ""
-    slack_text = f"{mention}【Indeed 新着応募（速報）】\n氏名：{applicant_name}{position_line}\n電話：⚠ 手動確認が必要\nURL：{url}\n※ Indeed管理画面で電話番号を確認してください"
+    position_line = f"\næ±äººï¼{position}" if position else ""
+    slack_text = f"{mention}ãIndeed æ°çå¿åï¼éå ±ï¼ã\næ°åï¼{applicant_name}{position_line}\né»è©±ï¼â  æåç¢ºèªãå¿è¦\nURLï¼{url}\nâ» Indeedç®¡çç»é¢ã§é»è©±çªå·ãç¢ºèªãã¦ãã ãã"
     webhook_url = get_slack_webhook_url()
     if webhook_url:
         try:
@@ -3375,8 +3417,8 @@ def send_fallback_notification(applicant_name, indeed_url, short_url=None, posit
             log(f"ERROR: Fallback Slack error: {e}")
     line_to_id = get_line_to_id()
     if LINE_CHANNEL_ACCESS_TOKEN and line_to_id:
-        position_line_l = f"\n求人：{position}" if position else ""
-        line_text = f"@all\n【Indeed 新着応募（速報）】\n氏名：{applicant_name}{position_line_l}\n電話：⚠ 手動確認が必要\nURL：{url}\n※ Indeed管理画面で電話番号を確認してください"
+        position_line_l = f"\næ±äººï¼{position}" if position else ""
+        line_text = f"@all\nãIndeed æ°çå¿åï¼éå ±ï¼ã\næ°åï¼{applicant_name}{position_line_l}\né»è©±ï¼â  æåç¢ºèªãå¿è¦\nURLï¼{url}\nâ» Indeedç®¡çç»é¢ã§é»è©±çªå·ãç¢ºèªãã¦ãã ãã"
         try:
             resp = requests.post("https://api.line.me/v2/bot/message/push", json={"to": line_to_id, "messages": [{"type": "textV2", "text": line_text, "sender": {}, "mentionees": [{"type": "all", "index": 0, "length": 4}]}]}, headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}, timeout=10)
             if resp.status_code < 400:
@@ -3409,7 +3451,7 @@ def check_fallback_timers():
                 entry["owner"] = "railway"
                 store[signal_id] = entry
                 changed = True
-                send_fallback_notification(applicant_name=entry.get("applicant_name", "不明"), indeed_url=entry.get("indeed_url", ""), short_url=entry.get("short_url", ""), position=entry.get("position", ""))
+                send_fallback_notification(applicant_name=entry.get("applicant_name", "ä¸æ"), indeed_url=entry.get("indeed_url", ""), short_url=entry.get("short_url", ""), position=entry.get("position", ""))
                 log(f"Fallback triggered for {signal_id} (status was {status})")
         if changed:
             save_cas_store(store)
@@ -3495,7 +3537,7 @@ def api_cas():
 
 @flask_app.route("/test-ctk", methods=["GET"])
 def test_ctk():
-    """診断用: CTKの有効性とIndeed API接続をテストする。legacyIdを指定すると詳細も取得。"""
+    """è¨ºæ­ç¨: CTKã®æå¹æ§ã¨Indeed APIæ¥ç¶ããã¹ããããlegacyIdãæå®ããã¨è©³ç´°ãåå¾ã"""
     token = flask_request.args.get("token", "")
     if not COWORK_WEBHOOK_TOKEN or not hmac.compare_digest(token, COWORK_WEBHOOK_TOKEN):
         return "Unauthorized", 401
@@ -3516,13 +3558,13 @@ def test_ctk():
         result["email"] = details.get("email") if details else None
     return jsonify(result)
 
-# --- CTK更新フォーム（モバイル対応） ---
+# --- CTKæ´æ°ãã©ã¼ã ï¼ã¢ãã¤ã«å¯¾å¿ï¼ ---
 _CTK_UPDATE_FORM_HTML = """<!DOCTYPE html>
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-  <title>Indeed CTK 更新</title>
+  <title>Indeed CTK æ´æ°</title>
   <style>
     * { box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -3544,29 +3586,29 @@ _CTK_UPDATE_FORM_HTML = """<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <h1>⚙️ Indeed CTK 更新</h1>
-  <p class="sub">新しいCTK値を貼り付けて「更新する」を押してください。再デプロイ不要で即反映されます。</p>
+  <h1>âï¸ Indeed CTK æ´æ°</h1>
+  <p class="sub">æ°ããCTKå¤ãè²¼ãä»ãã¦ãæ´æ°ããããæ¼ãã¦ãã ãããåããã­ã¤ä¸è¦ã§å³åæ ããã¾ãã</p>
   <form method="POST">
-    <textarea name="ctk" placeholder="CTK値をここに貼り付け..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
-    <button type="submit">✅ 更新する</button>
+    <textarea name="ctk" placeholder="CTKå¤ãããã«è²¼ãä»ã..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+    <button type="submit">â æ´æ°ãã</button>
   </form>
   <div class="howto">
-    <b>📋 CTKの取得手順（PCのChromeで）</b>
+    <b>ð CTKã®åå¾æé ï¼PCã®Chromeã§ï¼</b>
     <ol>
-      <li>jp.indeed.com にログイン</li>
-      <li>F12（またはCtrl+Shift+I）→ Application タブ → Cookies → jp.indeed.com</li>
-      <li>「CTK」の値をコピー</li>
-      <li>このページに貼り付けて送信</li>
+      <li>jp.indeed.com ã«ã­ã°ã¤ã³</li>
+      <li>F12ï¼ã¾ãã¯Ctrl+Shift+Iï¼â Application ã¿ã â Cookies â jp.indeed.com</li>
+      <li>ãCTKãã®å¤ãã³ãã¼</li>
+      <li>ãã®ãã¼ã¸ã«è²¼ãä»ãã¦éä¿¡</li>
     </ol>
   </div>
   <div class="howto" style="margin-top:10px;">
-    <b>📱 スマホの場合</b>
+    <b>ð± ã¹ããã®å ´å</b>
     <ol>
-      <li>PCのChromeで上の手順でCTKを取得</li>
-      <li>自分にメール等でCTK値を送る</li>
-      <li>スマホでこのページを開き、貼り付けて送信</li>
+      <li>PCã®Chromeã§ä¸ã®æé ã§CTKãåå¾</li>
+      <li>èªåã«ã¡ã¼ã«ç­ã§CTKå¤ãéã</li>
+      <li>ã¹ããã§ãã®ãã¼ã¸ãéããè²¼ãä»ãã¦éä¿¡</li>
     </ol>
-    <p style="margin:8px 0 0;color:#888;font-size:12px;">※ スマホのブラウザではCookieを直接確認できないため、PCでの取得が必要です。</p>
+    <p style="margin:8px 0 0;color:#888;font-size:12px;">â» ã¹ããã®ãã©ã¦ã¶ã§ã¯Cookieãç´æ¥ç¢ºèªã§ããªããããPCã§ã®åå¾ãå¿è¦ã§ãã</p>
   </div>
   <script>
     (function() {
@@ -3585,7 +3627,7 @@ _CTK_UPDATE_SUCCESS_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>CTK更新完了</title>
+  <title>CTKæ´æ°å®äº</title>
   <style>
     body { font-family: -apple-system, sans-serif; padding: 40px 24px;
            text-align: center; max-width: 400px; margin: 0 auto; }
@@ -3595,19 +3637,19 @@ _CTK_UPDATE_SUCCESS_HTML = """<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <div class="icon">✅</div>
-  <h1>CTK更新完了</h1>
-  <p>Indeed APIの認証が再開されました。<br>次回の応募通知から電話番号・住所が届きます。</p>
+  <div class="icon">â</div>
+  <h1>CTKæ´æ°å®äº</h1>
+  <p>Indeed APIã®èªè¨¼ãåéããã¾ããã<br>æ¬¡åã®å¿åéç¥ããé»è©±çªå·ã»ä½æãå±ãã¾ãã</p>
 </body>
 </html>"""
 
 @flask_app.route("/update-ctk-setup", methods=["GET"])
 def update_ctk_setup():
-    """ブックマークレット設定ページ。ワンタップCTK更新の初回セットアップ用。"""
+    """ããã¯ãã¼ã¯ã¬ããè¨­å®ãã¼ã¸ãã¯ã³ã¿ããCTKæ´æ°ã®ååã»ããã¢ããç¨ã"""
     token = flask_request.args.get("token", "")
     if not COWORK_WEBHOOK_TOKEN or not hmac.compare_digest(token, COWORK_WEBHOOK_TOKEN):
         return "Unauthorized", 401
-    # ブックマークレットJS（jp.indeed.comのCTKを自動読み取りしてPOST送信）
+    # ããã¯ãã¼ã¯ã¬ããJSï¼jp.indeed.comã®CTKãèªåèª­ã¿åããã¦POSTéä¿¡ï¼
     post_url = f"{RAILWAY_SERVICE_URL}/update-ctk?token={COWORK_WEBHOOK_TOKEN}"
     manual_url = f"{RAILWAY_SERVICE_URL}/update-ctk?token={COWORK_WEBHOOK_TOKEN}"
     bookmarklet_js = (
@@ -3631,7 +3673,7 @@ def update_ctk_setup():
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-  <title>CTK更新 ワンタップ設定</title>
+  <title>CTKæ´æ° ã¯ã³ã¿ããè¨­å®</title>
   <style>
     *{{box-sizing:border-box;}}
     body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:20px;max-width:540px;margin:0 auto;background:#f8f9fa;color:#222;}}
@@ -3650,39 +3692,39 @@ def update_ctk_setup():
   </style>
 </head>
 <body>
-  <h1>⚡ CTK更新 ワンタップ設定</h1>
-  <p class="sub">一度設定すれば、次回からボタン1つでCTKを更新できます。</p>
+  <h1>â¡ CTKæ´æ° ã¯ã³ã¿ããè¨­å®</h1>
+  <p class="sub">ä¸åº¦è¨­å®ããã°ãæ¬¡åãããã¿ã³1ã¤ã§CTKãæ´æ°ã§ãã¾ãã</p>
 
   <div class="step">
-    <span class="step-num">1</span><span class="step-title">ブックマークレットを保存する</span>
+    <span class="step-num">1</span><span class="step-title">ããã¯ãã¼ã¯ã¬ãããä¿å­ãã</span>
     <div class="step-body">
-      下のボタンを<b>長押し（または右クリック）→「リンクをブックマークに追加」</b>で保存してください。<br>
-      名前は <b>「CTK更新」</b> にしておくと便利です。
-      <a class="bm-link" href="{bookmarklet_js}">⭐ CTK更新（ブックマーク用ボタン）</a>
+      ä¸ã®ãã¿ã³ã<b>é·æ¼ãï¼ã¾ãã¯å³ã¯ãªãã¯ï¼âããªã³ã¯ãããã¯ãã¼ã¯ã«è¿½å ã</b>ã§ä¿å­ãã¦ãã ããã<br>
+      ååã¯ <b>ãCTKæ´æ°ã</b> ã«ãã¦ããã¨ä¾¿å©ã§ãã
+      <a class="bm-link" href="{bookmarklet_js}">â­ CTKæ´æ°ï¼ããã¯ãã¼ã¯ç¨ãã¿ã³ï¼</a>
     </div>
   </div>
 
   <div class="step">
-    <span class="step-num">2</span><span class="step-title">CTKが切れたら…</span>
+    <span class="step-num">2</span><span class="step-title">CTKãåãããâ¦</span>
     <div class="step-body">
-      ① Chromeで <b>jp.indeed.com</b> を開く（ログイン済みであればOK）<br>
-      ② ブラウザの <b>☆ お気に入り → 「CTK更新」</b> をタップ<br>
-      ③ CTK値が自動入力されたページが開く<br>
-      ④ 「更新する」ボタンを押して完了！<br><br>
-      <span style="color:#b45309;font-size:13px;">⚠ 自動取得できない場合は手動入力フォームに転送されます。<br>
-      その場合はPCのChromeで <b>F12 → Application → Cookies → CTK</b> の値をコピーして貼り付けてください。</span>
+      â  Chromeã§ <b>jp.indeed.com</b> ãéãï¼ã­ã°ã¤ã³æ¸ã¿ã§ããã°OKï¼<br>
+      â¡ ãã©ã¦ã¶ã® <b>â ãæ°ã«å¥ã â ãCTKæ´æ°ã</b> ãã¿ãã<br>
+      â¢ CTKå¤ãèªåå¥åããããã¼ã¸ãéã<br>
+      â£ ãæ´æ°ããããã¿ã³ãæ¼ãã¦å®äºï¼<br><br>
+      <span style="color:#b45309;font-size:13px;">â  èªååå¾ã§ããªãå ´åã¯æåå¥åãã©ã¼ã ã«è»¢éããã¾ãã<br>
+      ãã®å ´åã¯PCã®Chromeã§ <b>F12 â Application â Cookies â CTK</b> ã®å¤ãã³ãã¼ãã¦è²¼ãä»ãã¦ãã ããã</span>
     </div>
   </div>
 
   <div class="after">
-    <div class="after-title">✅ 設定完了後の手順はこれだけ</div>
+    <div class="after-title">â è¨­å®å®äºå¾ã®æé ã¯ããã ã</div>
     <div class="after-body">
-      jp.indeed.com を開く → お気に入りから「CTK更新」をタップ → CTK自動入力 → 「更新する」を押す<br>
-      <span style="font-size:13px;color:#166534;">（自動取得できない場合は手動入力フォームで対応可）</span>
+      jp.indeed.com ãéã â ãæ°ã«å¥ããããCTKæ´æ°ããã¿ãã â CTKèªåå¥å â ãæ´æ°ããããæ¼ã<br>
+      <span style="font-size:13px;color:#166534;">ï¼èªååå¾ã§ããªãå ´åã¯æåå¥åãã©ã¼ã ã§å¯¾å¿å¯ï¼</span>
     </div>
   </div>
 
-  <p class="note">このページのURLは保管してください。次回のセットアップ時に必要です。</p>
+  <p class="note">ãã®ãã¼ã¸ã®URLã¯ä¿ç®¡ãã¦ãã ãããæ¬¡åã®ã»ããã¢ããæã«å¿è¦ã§ãã</p>
 </body>
 </html>"""
     return html
@@ -3690,7 +3732,7 @@ def update_ctk_setup():
 
 @flask_app.route("/update-ctk", methods=["GET", "POST"])
 def update_ctk_endpoint():
-    """CTK更新フォーム（モバイル対応）。COWORK_WEBHOOK_TOKENで認証。"""
+    """CTKæ´æ°ãã©ã¼ã ï¼ã¢ãã¤ã«å¯¾å¿ï¼ãCOWORK_WEBHOOK_TOKENã§èªè¨¼ã"""
     token = flask_request.args.get("token", "")
     if not COWORK_WEBHOOK_TOKEN or not hmac.compare_digest(token, COWORK_WEBHOOK_TOKEN):
         return "Unauthorized", 401
@@ -3698,7 +3740,7 @@ def update_ctk_endpoint():
     if flask_request.method == "GET":
         return _CTK_UPDATE_FORM_HTML
 
-    # POST: CTKを更新してフラグをリセット
+    # POST: CTKãæ´æ°ãã¦ãã©ã°ããªã»ãã
     new_ctk = flask_request.form.get("ctk", "").strip()
     if not new_ctk:
         return "CTK is required", 400
@@ -3711,7 +3753,7 @@ def update_ctk_endpoint():
     except Exception as e:
         log(f"ERROR: CTK update via web form failed: {e}")
         return f"Error: {e}", 500
-    # CTK期限切れ通知フラグもリセット（次回期限切れ時に再通知できるように）
+    # CTKæéåãéç¥ãã©ã°ããªã»ããï¼æ¬¡åæéåãæã«åéç¥ã§ããããã«ï¼
     global _ctk_expired_notified
     with _ctk_expired_notified_lock:
         _ctk_expired_notified = False
@@ -3719,21 +3761,21 @@ def update_ctk_endpoint():
     return _CTK_UPDATE_SUCCESS_HTML
 
 
-# ── セッションCookie更新（電話番号取得に必要） ──────────────────────────────
+# ââ ã»ãã·ã§ã³Cookieæ´æ°ï¼é»è©±çªå·åå¾ã«å¿è¦ï¼ ââââââââââââââââââââââââââââââ
 @flask_app.route("/update-session-setup", methods=["GET"])
 def update_session_setup():
-    """セッションCookieブックマークレット設定ページ。
-    employers.indeed.com 上で実行するとCookie一式をRailwayに送信する。
+    """ã»ãã·ã§ã³Cookieããã¯ãã¼ã¯ã¬ããè¨­å®ãã¼ã¸ã
+    employers.indeed.com ä¸ã§å®è¡ããã¨Cookieä¸å¼ãRailwayã«éä¿¡ããã
     """
     token = flask_request.args.get("token", "")
     if not COWORK_WEBHOOK_TOKEN or not hmac.compare_digest(token, COWORK_WEBHOOK_TOKEN):
         return "Unauthorized", 401
     post_url = f"{RAILWAY_SERVICE_URL}/update-session?token={COWORK_WEBHOOK_TOKEN}"
-    # ブックマークレットJS: employers.indeed.comで実行 → 全Cookieを送信
+    # ããã¯ãã¼ã¯ã¬ããJS: employers.indeed.comã§å®è¡ â å¨Cookieãéä¿¡
     bookmarklet_js = (
         "javascript:(function(){{"
         "var c=document.cookie;"
-        "if(!c){{alert('Cookieが取得できません。employers.indeed.comで実行してください。');return;}}"
+        "if(!c){{alert('Cookieãåå¾ã§ãã¾ãããemployers.indeed.comã§å®è¡ãã¦ãã ããã');return;}}"
         "var url='{post_url}&cookies='+encodeURIComponent(c);"
         "window.location.href=url;"
         "}})();"
@@ -3743,7 +3785,7 @@ def update_session_setup():
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-  <title>セッション更新 設定</title>
+  <title>ã»ãã·ã§ã³æ´æ° è¨­å®</title>
   <style>
     *{{box-sizing:border-box;}}
     body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:20px;max-width:540px;margin:0 auto;background:#f8f9fa;color:#222;}}
@@ -3762,40 +3804,40 @@ def update_session_setup():
   </style>
 </head>
 <body>
-  <h1>📱 セッション更新 設定</h1>
-  <p class="sub">電話番号を取得するためのCookieをRailwayに登録します。</p>
+  <h1>ð± ã»ãã·ã§ã³æ´æ° è¨­å®</h1>
+  <p class="sub">é»è©±çªå·ãåå¾ããããã®CookieãRailwayã«ç»é²ãã¾ãã</p>
 
   <div class="warn">
-    ⚠️ <b>employers.indeed.com</b> を開いた状態でこのブックマークを実行してください。<br>
-    jp.indeed.comでは動作しません。
+    â ï¸ <b>employers.indeed.com</b> ãéããç¶æã§ãã®ããã¯ãã¼ã¯ãå®è¡ãã¦ãã ããã<br>
+    jp.indeed.comã§ã¯åä½ãã¾ããã
   </div>
 
   <div class="step">
-    <span class="step-num">1</span><span class="step-title">ブックマークレットを保存する</span>
+    <span class="step-num">1</span><span class="step-title">ããã¯ãã¼ã¯ã¬ãããä¿å­ãã</span>
     <div class="step-body">
-      下のボタンを<b>長押し（または右クリック）→「リンクをブックマークに追加」</b>で保存してください。<br>
-      名前は <b>「Indeed セッション更新」</b> にしてください。
-      <a class="bm-link" href="{bookmarklet_js}">🔑 Indeed セッション更新（ブックマーク用）</a>
+      ä¸ã®ãã¿ã³ã<b>é·æ¼ãï¼ã¾ãã¯å³ã¯ãªãã¯ï¼âããªã³ã¯ãããã¯ãã¼ã¯ã«è¿½å ã</b>ã§ä¿å­ãã¦ãã ããã<br>
+      ååã¯ <b>ãIndeed ã»ãã·ã§ã³æ´æ°ã</b> ã«ãã¦ãã ããã
+      <a class="bm-link" href="{bookmarklet_js}">ð Indeed ã»ãã·ã§ã³æ´æ°ï¼ããã¯ãã¼ã¯ç¨ï¼</a>
     </div>
   </div>
 
   <div class="step">
-    <span class="step-num">2</span><span class="step-title">定期的に実行する（月1〜2回）</span>
+    <span class="step-num">2</span><span class="step-title">å®æçã«å®è¡ããï¼æ1ã2åï¼</span>
     <div class="step-body">
-      ① Chromeで <b>employers.indeed.com/candidates</b> を開く（ログイン済みであればOK）<br>
-      ② ブラウザの <b>☆ お気に入り → 「Indeed セッション更新」</b> をタップ<br>
-      ③ 「セッション更新完了」と表示されれば完了！<br><br>
+      â  Chromeã§ <b>employers.indeed.com/candidates</b> ãéãï¼ã­ã°ã¤ã³æ¸ã¿ã§ããã°OKï¼<br>
+      â¡ ãã©ã¦ã¶ã® <b>â ãæ°ã«å¥ã â ãIndeed ã»ãã·ã§ã³æ´æ°ã</b> ãã¿ãã<br>
+      â¢ ãã»ãã·ã§ã³æ´æ°å®äºãã¨è¡¨ç¤ºãããã°å®äºï¼<br><br>
       <span style="color:#b45309;font-size:13px;">
-        💡 電話番号が「未登録」と表示される場合や、URLアラートが来た場合に実行してください。
+        ð¡ é»è©±çªå·ããæªç»é²ãã¨è¡¨ç¤ºãããå ´åããURLã¢ã©ã¼ããæ¥ãå ´åã«å®è¡ãã¦ãã ããã
       </span>
     </div>
   </div>
 
   <div class="after">
-    <div class="after-title">✅ 設定後の効果</div>
+    <div class="after-title">â è¨­å®å¾ã®å¹æ</div>
     <div class="after-body">
-      応募通知に電話番号・住所が含まれるようになります。<br>
-      セッションが切れた場合は同じ手順で再実行してください（月1〜2回程度）。
+      å¿åéç¥ã«é»è©±çªå·ã»ä½æãå«ã¾ããããã«ãªãã¾ãã<br>
+      ã»ãã·ã§ã³ãåããå ´åã¯åãæé ã§åå®è¡ãã¦ãã ããï¼æ1ã2åç¨åº¦ï¼ã
     </div>
   </div>
 </body>
@@ -3805,7 +3847,7 @@ def update_session_setup():
 
 @flask_app.route("/update-session", methods=["GET"])
 def update_session_endpoint():
-    """セッションCookieを受け取って保存する。ブックマークレットから呼ばれる。"""
+    """ã»ãã·ã§ã³Cookieãåãåã£ã¦ä¿å­ãããããã¯ãã¼ã¯ã¬ããããå¼ã°ããã"""
     token = flask_request.args.get("token", "")
     if not COWORK_WEBHOOK_TOKEN or not hmac.compare_digest(token, COWORK_WEBHOOK_TOKEN):
         return "Unauthorized", 401
@@ -3816,7 +3858,7 @@ def update_session_endpoint():
         from indeed_fetcher import save_session_cookies
         save_session_cookies(cookies_str)
         log(f"Session cookies updated via bookmarklet (length={len(cookies_str)})")
-        # CTK expired フラグもリセット（セッション更新で一緒にCTKも更新される可能性あり）
+        # CTK expired ãã©ã°ããªã»ããï¼ã»ãã·ã§ã³æ´æ°ã§ä¸ç·ã«CTKãæ´æ°ãããå¯è½æ§ããï¼
         try:
             from indeed_fetcher import reset_ctk_expired
             reset_ctk_expired()
@@ -3831,32 +3873,32 @@ def update_session_endpoint():
     return """<!DOCTYPE html>
 <html lang="ja"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>セッション更新完了</title>
+<title>ã»ãã·ã§ã³æ´æ°å®äº</title>
 <style>body{{font-family:-apple-system,sans-serif;padding:40px 24px;text-align:center;max-width:400px;margin:0 auto;}}.icon{{font-size:64px;margin-bottom:16px;}}</style>
 </head><body>
-<div class="icon">✅</div>
-<h1>セッション更新完了</h1>
-<p>Cookieが登録されました。<br>次回の応募通知から電話番号が届きます。</p>
+<div class="icon">â</div>
+<h1>ã»ãã·ã§ã³æ´æ°å®äº</h1>
+<p>Cookieãç»é²ããã¾ããã<br>æ¬¡åã®å¿åéç¥ããé»è©±çªå·ãå±ãã¾ãã</p>
 </body></html>"""
 
 
 @flask_app.route("/send-setup-msg", methods=["GET"])
 def send_setup_msg():
-    """LINEグループにCTKセットアップURLを送信する（初回設定用・GET呼び出し可）。"""
+    """LINEã°ã«ã¼ãã«CTKã»ããã¢ããURLãéä¿¡ããï¼ååè¨­å®ç¨ã»GETå¼ã³åºãå¯ï¼ã"""
     token = flask_request.args.get("token", "")
     if not COWORK_WEBHOOK_TOKEN or not hmac.compare_digest(token, COWORK_WEBHOOK_TOKEN):
         return "Unauthorized", 401
     setup_url = f"{RAILWAY_SERVICE_URL}/update-ctk-setup?token={COWORK_WEBHOOK_TOKEN}"
     msg = (
-        "【CTK更新 初回設定のお願い】\n\n"
-        "IndeedのCTKが期限切れになったとき、\n"
-        "ワンタップで更新できるブックマークレットを設定してください。\n\n"
-        "① 下のURLをChromeで開く\n"
-        "② 表示された手順に従ってブックマークを追加\n"
-        "③ 次回CTK切れ通知が来たらブックマークをタップするだけ\n\n"
+        "ãCTKæ´æ° ååè¨­å®ã®ãé¡ãã\n\n"
+        "Indeedã®CTKãæéåãã«ãªã£ãã¨ãã\n"
+        "ã¯ã³ã¿ããã§æ´æ°ã§ããããã¯ãã¼ã¯ã¬ãããè¨­å®ãã¦ãã ããã\n\n"
+        "â  ä¸ã®URLãChromeã§éã\n"
+        "â¡ è¡¨ç¤ºãããæé ã«å¾ã£ã¦ããã¯ãã¼ã¯ãè¿½å \n"
+        "â¢ æ¬¡åCTKåãéç¥ãæ¥ããããã¯ãã¼ã¯ãã¿ããããã ã\n\n"
         f"{setup_url}"
     )
-    line_to_id = get_line_to_id()  # is_test_mode() 経由で統一（直接 MODE 参照を廃止）
+    line_to_id = get_line_to_id()  # is_test_mode() çµç±ã§çµ±ä¸ï¼ç´æ¥ MODE åç§ãå»æ­¢ï¼
     if not line_to_id or not LINE_CHANNEL_ACCESS_TOKEN:
         return "LINE not configured", 500
     try:
@@ -3868,29 +3910,29 @@ def send_setup_msg():
         )
         log(f"[send-setup-msg] LINE status={resp.status_code}")
         if resp.status_code < 400:
-            return "✅ LINEに送信しました", 200
+            return "â LINEã«éä¿¡ãã¾ãã", 200
         return f"LINE API error: {resp.status_code} {resp.text}", 500
     except Exception as e:
         log(f"[send-setup-msg] error: {e}")
         return f"Error: {e}", 500
 @flask_app.route("/send-test-all", methods=["GET"])
 def send_test_all():
-    """Slack + LINEグループ + LINE個人にテストメッセージを送信する。URL短縮テスト付き。"""
+    """Slack + LINEã°ã«ã¼ã + LINEåäººã«ãã¹ãã¡ãã»ã¼ã¸ãéä¿¡ãããURLç­ç¸®ãã¹ãä»ãã"""
     token = flask_request.args.get("token", "")
     if not COWORK_WEBHOOK_TOKEN or not hmac.compare_digest(token, COWORK_WEBHOOK_TOKEN):
         return "Unauthorized", 401
     msg = flask_request.args.get("msg", "")
     raw_url = flask_request.args.get("url", "")
     results = {"shorten": None, "slack": None, "line_group": None}
-    # URL短縮テスト
+    # URLç­ç¸®ãã¹ã
     short_url = ""
     if raw_url:
         short_url = shorten_url(raw_url)
         results["shorten"] = {"original": raw_url, "shortened": short_url, "success": short_url != raw_url}
         log(f"[send-test-all] shorten: {raw_url} -> {short_url}")
-    # メッセージ中の[URL]を置換
+    # ã¡ãã»ã¼ã¸ä¸­ã®[URL]ãç½®æ
     final_msg = msg.replace("[URL]", short_url) if short_url else msg
-    # Slack送信
+    # Slackéä¿¡
     webhook_url = get_slack_webhook_url()
     if webhook_url:
         try:
@@ -3900,7 +3942,7 @@ def send_test_all():
         except Exception as e:
             results["slack"] = {"error": str(e)}
             log(f"[send-test-all] Slack error: {e}")
-    # LINEグループ送信
+    # LINEã°ã«ã¼ãéä¿¡
     line_group_id = get_line_to_id()
     if LINE_CHANNEL_ACCESS_TOKEN and line_group_id:
         try:
@@ -4006,7 +4048,7 @@ def main() -> None:
     # Start Flask webhook server in background thread
     flask_thread = Thread(target=run_flask_server, daemon=True)
     flask_thread.start()
-    # v5: 1通だけ方式 — フォールバックタイマー不要（40秒CASポーリングで完結）
+    # v5: 1éã ãæ¹å¼ â ãã©ã¼ã«ããã¯ã¿ã¤ãã¼ä¸è¦ï¼40ç§CASãã¼ãªã³ã°ã§å®çµï¼
     # fb_thread = Thread(target=start_fallback_checker, daemon=True)
     # fb_thread.start()
     log(f"v5: 1-shot notification mode (40s CAS polling, no fallback checker)")
