@@ -802,9 +802,9 @@ def notify_line_with_retry(
     else:
         # Production mode: @all mention via textV2
         substitution = {
-            "mention_all": {"type": "mention", "mentionee": {"type": "all"}}
+            "all": {"type": "mention", "mentionee": {"type": "all"}}
         }
-        text_v2 = "{mention_all} " + base_message
+        text_v2 = "{all}\n" + base_message
         body = {
             "to": line_to_id,
             "messages": [{"type": "textV2", "text": text_v2, "substitution": substitution}],
@@ -1895,7 +1895,7 @@ def send_test_all():
         try:
             resp = requests.post(
                 "https://api.line.me/v2/bot/message/push",
-                json={"to": line_group_id, "messages": [{"type": "text", "text": line_msg}]},
+                json={"to": line_group_id, "messages": [{"type": "textV2", "text": "{all}\n" + line_msg, "substitution": {"all": {"type": "mention", "mentionee": {"type": "all"}}}}]},
                 headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"},
                 timeout=10,
             )
@@ -2838,9 +2838,9 @@ def notify_line_with_retry(
     else:
         # Production mode: @all mention via textV2
         substitution = {
-            "mention_all": {"type": "mention", "mentionee": {"type": "all"}}
+            "all": {"type": "mention", "mentionee": {"type": "all"}}
         }
-        text_v2 = "{mention_all} " + base_message
+        text_v2 = "{all}\n" + base_message
         body = {
             "to": line_to_id,
             "messages": [{"type": "textV2", "text": text_v2, "substitution": substitution}],
