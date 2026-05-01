@@ -1009,74 +1009,13 @@ def process_mail_by_uid(
             log(f"URL obtained on retry for {applicant_name}")
     if phone:
         phone = normalize_phone_number(phone)
-    # --- v3: 2段階通知方式 ---
-    # Indeed応募: 常に速報を即送信（電話番号なし）→ Coworkに電話番号取得を委譲
+    # --- v4: 1通だけ方式（120秒CASポーリング） ---
+    # Indeed応募: #indeed-cowork-queue に信号投稿 → 最大120秒ポーリング → 1通だけ通知
     # 非Indeed（Jimoty等）: 従来通り直接通知
     if source == "indeed":
-        # ── 第1段階: 速報通知（電話番号なし、即時） ──
         short_url = shorten_url(url) if url else ""
         display_url = short_url or url or ""
         position = subject or ""
-        log(f"v3: Sending speed notification for {applicant_name} (phone skipped)")
-        mention = "<!channel>\n" if not is_test_mode() else ""
-        speed_text = (
-            f"{mention}"
-            f"【Indeed 新着応募（速報）】\n"
-            f"氏名：{applicant_name}\n"
-            f"求人名：{position}\n"
-            f"URL：{display_url}\n"
-            f"\u26a0 Indeed管理画面で電話番号を確認してください"
-        )
-        speed_msg = add_test_prefix(speed_text)
-        webhook_url = get_slack_webhook_url()
-        slack_ok = False
-        if webhook_url:
-            try:
-                resp = requests.post(webhook_url, json={"text": speed_msg}, timeout=10)
-                if resp.status_code < 400:
-                    slack_ok = True
-                    log(f"v3: Speed Slack notification sent for {applicant_name}")
-                else:
-                    log(f"ERROR: v3 Speed Slack failed: {resp.status_code}")
-            except Exception as e:
-                log(f"ERROR: v3 Speed Slack error: {e}")
-        # LINE速報も送信
-        line_to_id = get_line_to_id()
-        line_ok = False
-        if LINE_CHANNEL_ACCESS_TOKEN and line_to_id:
-            line_speed_text = (
-                f"@all\n"
-                f"【Indeed 新着応募（速報）】\n"
-                f"氏名：{applicant_name}\n"
-                f"求人名：{position}\n"
-                f"URL：{display_url}\n"
-                f"\u26a0 Indeed管理画面で電話番号を確認してください"
-            )
-            try:
-                resp = requests.post(
-                    "https://api.line.me/v2/bot/message/push",
-                    json={"to": line_to_id, "messages": [{"type": "text", "text": line_speed_text}]},
-                    headers={
-                        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
-                        "Content-Type": "application/json",
-                    },
-                    timeout=10,
-                )
-                if resp.status_code < 400:
-                    line_ok = True
-                    log(f"v3: Speed LINE notification sent for {applicant_name}")
-                else:
-                    log(f"ERROR: v3 Speed LINE failed: {resp.status_code}")
-            except Exception as e:
-                log(f"ERROR: v3 Speed LINE error: {e}")
-        if not slack_ok and not line_ok:
-            notify_error_to_slack(
-                f"【速報通知失敗】応募者: {applicant_name}\nUID: {unique_id}\n\n"
-                f"Slack/LINE速報通知に失敗しました。Gmailを手動確認してください。"
-            )
-            log(f"ERROR: All speed notifications failed for {applicant_name} ({unique_id})")
-
-        # ── 第2段階: Coworkに電話番号取得を委譲 ──
         signal_id = f"gm:{uid_str}"
         engage_url_for_signal = ""
         try:
@@ -1085,6 +1024,7 @@ def process_mail_by_uid(
                 engage_url_for_signal = engage_urls_list[0]
         except Exception:
             pass
+        # Coworkに電話番号取得を依頼（#indeed-cowork-queue に信号投稿）
         signal_ok = post_signal_to_slack(
             signal_id, applicant_name, position, url,
             engage_url_for_signal, legacy_id or "", short_url
@@ -1097,9 +1037,44 @@ def process_mail_by_uid(
                 short_url=short_url,
                 owner="railway"
             )
-            log(f"v3: Signal posted to cowork-queue: {signal_id}")
+            log(f"v4: Signal posted, polling CAS for phone (max 120s): {signal_id}")
+            # Poll CAS store for up to 120 seconds at 10-second intervals
+            poll_timeout = 120
+            poll_interval = 10
+            elapsed = 0
+            while elapsed < poll_timeout:
+                time.sleep(poll_interval)
+                elapsed += poll_interval
+                entry = get_cas_entry(signal_id)
+                if entry and entry.get("phone"):
+                    phone = normalize_phone_number(entry["phone"])
+                    indeed_location = entry.get("location") or indeed_location
+                    indeed_email = entry.get("email") or indeed_email
+                    log(f"v4: Phone obtained via CAS polling after {elapsed}s: {phone}")
+                    break
+            if not phone:
+                log(f"v4: CAS polling timed out after {poll_timeout}s, sending notification without phone")
+            record_cas_entry(signal_id, "NOTIFIED",
+                notified_at=datetime.now().astimezone().isoformat(),
+                owner="railway"
+            )
         else:
-            log(f"WARNING: v3 Signal post failed for {signal_id}, phone fetch may not happen")
+            log(f"WARNING: v4 Signal post failed for {signal_id}, proceeding without phone")
+        # 1通だけ通知（電話番号あり/なし）
+        log(f"v4: Notify indeed (1-shot): {applicant_name}, phone={phone}, url={url}, id={unique_id}")
+        slack_ok = notify_slack_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
+        line_ok = notify_line_with_retry(source, applicant_name, url, phone=phone, location=indeed_location, email_addr=indeed_email, answers=indeed_answers)
+        if not slack_ok:
+            log(f"WARNING: Slack notification failed for {applicant_name} ({unique_id})")
+        if not line_ok:
+            log(f"WARNING: LINE notification failed for {applicant_name} ({unique_id})")
+        if not slack_ok and not line_ok:
+            phone_str = f"電話: {phone}" if phone else "電話: 未記入"
+            notify_error_to_slack(
+                f"【通知失敗】応募者: {applicant_name}\n{phone_str}\nUID: {unique_id}\n\n"
+                f"Slack/LINE通知に失敗しました。Gmailを手動確認してください。"
+            )
+            log(f"ERROR: All notifications failed for {applicant_name} ({unique_id}) - marked as processed, error alert sent")
     else:
         # 非Indeed（Jimoty等）: 従来通り直接通知
         log(f"Notify {source}: {applicant_name}, phone={phone}, url={url}, id={unique_id}")
@@ -1473,6 +1448,10 @@ def api_cas():
             entry["notified_at"] = jst_now
         elif target_to == "FALLBACK":
             entry["fallback_at"] = jst_now
+        # Store additional data if provided (phone, location, email for v4 polling)
+        for field in ("phone", "location", "email"):
+            if data.get(field):
+                entry[field] = data[field]
         store[signal_id] = entry
         save_cas_store(store)
     log(f"CAS: {signal_id} {expected_from} -> {target_to} (owner={owner})")
@@ -1992,10 +1971,10 @@ def main() -> None:
     # Start Flask webhook server in background thread
     flask_thread = Thread(target=run_flask_server, daemon=True)
     flask_thread.start()
-    # v3: フォールバックタイマー無効化（速報通知が即座に送信されるため不要）
+    # v4: 1通だけ方式 — フォールバックタイマー不要（120秒CASポーリングで完結）
     # fb_thread = Thread(target=start_fallback_checker, daemon=True)
     # fb_thread.start()
-    log(f"v3: Fallback checker DISABLED (speed notifications are sent immediately)")
+    log(f"v4: 1-shot notification mode (120s CAS polling, no fallback checker)")
     log(f"Starting Gmail polling with POLL_INTERVAL_SECONDS={POLL_INTERVAL_SECONDS}")
     log(f"MODE={MODE}, SEARCH_DAYS={SEARCH_DAYS}, MAX_BACKOFF_SECONDS={MAX_BACKOFF_SECONDS}, MAX_EMAILS_PER_CYCLE={MAX_EMAILS_PER_CYCLE}")
     # Verify storage is working
