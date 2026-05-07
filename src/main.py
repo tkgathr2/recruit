@@ -288,6 +288,37 @@ def extract_applicant_name_from_html(html: str) -> Optional[str]:
     return None
 
 
+def shorten_url(url: str) -> str:
+    """Shorten URL using is.gd (primary) and TinyURL (fallback).
+
+    is.gd is preferred because TinyURL has been observed to time out
+    from Railway (see commit a5b0e85 history). Returns the original URL
+    if both shorteners fail.
+    """
+    if not url:
+        return url
+    # Primary: is.gd
+    try:
+        api = "https://is.gd/create.php?format=simple&url=" + requests.utils.quote(url, safe="")
+        resp = requests.get(api, timeout=5)
+        if resp.status_code == 200 and resp.text.strip().startswith("http"):
+            return resp.text.strip()
+        log(f"WARN: is.gd shorten returned status={resp.status_code} body={resp.text[:80]}")
+    except Exception as e:
+        log(f"WARN: is.gd shorten failed: {e}")
+    # Fallback: TinyURL
+    try:
+        api = "https://tinyurl.com/api-create.php?url=" + requests.utils.quote(url, safe="")
+        resp = requests.get(api, timeout=5)
+        if resp.status_code == 200 and resp.text.strip().startswith("http"):
+            return resp.text.strip()
+        log(f"WARN: TinyURL shorten returned status={resp.status_code}")
+    except Exception as e:
+        log(f"WARN: TinyURL shorten failed: {e}")
+    log("WARN: Both URL shorteners failed, using original URL")
+    return url
+
+
 # --- Notification Functions ---
 def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optional[str] = None, max_retries: int = 3) -> bool:
     """Send notification to Slack with retry logic. Returns True if successful."""
@@ -305,7 +336,7 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
     if job_title:
         lines.append(f"求人: {job_title}")
     if url:
-        lines.extend(["", "応募内容はこちら:", url])
+        lines.extend(["", "応募内容はこちら:", shorten_url(url)])
     message = add_test_prefix(mention_prefix + "\n".join(lines))
     for attempt in range(max_retries):
         try:
@@ -338,7 +369,7 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
         # to avoid Google OAuth blocking in LINE's in-app browser
         separator = "&" if "?" in url else "?"
         external_url = f"{url}{separator}openExternalBrowser=1"
-        lines.extend(["", "詳細はこちら:", external_url])
+        lines.extend(["", "詳細はこちら:", shorten_url(external_url)])
     base_message = add_test_prefix("\n".join(lines))
     # Use @all mention to notify all members in the group
     substitution = {
