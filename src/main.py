@@ -327,10 +327,7 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
         log("No Slack Webhook URL")
         return False
     title = "【Indeed応募】" if source == "indeed" else "【ジモティー】"
-    mention_parts = [f"<@{mid}>" for mid in [SLACK_MENTION_ID_1, SLACK_MENTION_ID_2] if mid]
-    mention_prefix = " ".join(mention_parts) + "\n" if mention_parts else ""
-    if not mention_parts:
-        log("WARNING: No Slack mention IDs configured")
+        mention_prefix = "<!channel>\n"
 
     lines = [f"{title} 【{name}】 さんから応募がありました。"]
     if job_title:
