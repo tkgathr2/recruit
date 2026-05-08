@@ -327,7 +327,7 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
         log("No Slack Webhook URL")
         return False
     title = "【Indeed応募】" if source == "indeed" else "【ジモティー】"
-        mention_prefix = "<!channel>\n"
+    mention_prefix = "<!channel>\n"
 
     lines = [f"{title} 【{name}】 さんから応募がありました。"]
     if job_title:
