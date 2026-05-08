@@ -32,11 +32,6 @@ SLACK_ERROR_WEBHOOK_URL = os.getenv("SLACK_ERROR_WEBHOOK_URL")
 # --- Processed IDs file for duplicate prevention ---
 PROCESSED_IDS_FILE = os.getenv("PROCESSED_IDS_FILE", os.path.join(LOG_DIR, "processed_ids.json"))
 
-# --- Mention IDs (generic slots: set as many as needed) ---
-SLACK_MENTION_ID_1 = os.getenv("SLACK_MENTION_ID_1")
-SLACK_MENTION_ID_2 = os.getenv("SLACK_MENTION_ID_2")
-LINE_MENTION_ID_1 = os.getenv("LINE_MENTION_ID_1")
-LINE_MENTION_ID_2 = os.getenv("LINE_MENTION_ID_2")
 
 # --- Polling Interval ---
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))  # デフォルト60秒（Gmail API制限対策）
@@ -139,7 +134,7 @@ def save_processed_ids(processed_ids: Set[str]) -> bool:
         return False
     try:
         # Exclude uid: entries - they are session-only cache, gm:/mid: entries handle dedup
-        persistent_ids = [id for id in processed_ids if not id.startswith("uid:")]
+        persistent_ids = [item for item in processed_ids if not item.startswith("uid:")]
         # Atomic write: write to temp file then replace to prevent partial writes on crash
         target_path = Path(PROCESSED_IDS_FILE)
         tmp_path = target_path.with_suffix(".tmp")
@@ -587,7 +582,6 @@ def check_mail_with_status() -> bool:
                     processed_ids.add(f"uid:{uid_str}")
                 if not save_processed_ids(processed_ids):
                     log("ERROR: Failed to save bootstrapped UIDs")
-                    return True  # Not a quota error
 
             if truly_new_uids:
                 total_new = len(truly_new_uids)
