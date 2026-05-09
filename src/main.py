@@ -168,6 +168,19 @@ def notify_error_to_slack(message: str) -> None:
         # éç¥æã®ã¨ã©ã¼ã§ããã«ä¾å¤ãæããã¨ã«ã¼ãããã®ã§ã­ã°ã®ã¿
         log(f"ERROR: exception while sending error notification to Slack: {e}")
 
+    # DM にも同じメッセージを送信
+    if SLACK_DM_WEBHOOK_URL:
+        try:
+            dm_resp = requests.post(
+                SLACK_DM_WEBHOOK_URL,
+                json={"text": text},
+                timeout=5,
+            )
+            if dm_resp.status_code >= 400:
+                log(f"ERROR: failed to send error DM to Slack (status={dm_resp.status_code})")
+        except Exception as e:
+            log(f"ERROR: exception while sending error DM to Slack: {e}")
+
 
 # --- MODE management ---
 def is_test_mode() -> bool:
@@ -521,6 +534,29 @@ def process_mail_by_uid(
     if not slack_ok and line_ok:
         log(f"WARNING: LINE OK but Slack failed for {applicant_name} ({unique_id}), will retry next cycle (may cause duplicate LINE notification)")
         return None
+
+
+    # 片方でも失敗した場合、詳細を DM に送信
+    if not slack_ok or not line_ok:
+        failed_channels = []
+        if not slack_ok:
+            failed_channels.append("Slack")
+        if not line_ok:
+            failed_channels.append("LINE")
+        dm_detail = (
+            f"\u26a0\ufe0f 通知一部失敗\n"
+            f"失敗チャンネル: {', '.join(failed_channels)}\n"
+            f"メール件名: {subject}\n"
+            f"送信者: {from_header}\n"
+            f"応募者名: {applicant_name}\n"
+            f"ソース: {source}\n"
+            f"unique_id: {unique_id}"
+        )
+        if SLACK_DM_WEBHOOK_URL:
+            try:
+                requests.post(SLACK_DM_WEBHOOK_URL, json={"text": dm_detail}, timeout=5)
+            except Exception as e:
+                log(f"ERROR: Failed to send detail DM: {e}")
 
     return unique_id
 
