@@ -28,21 +28,20 @@ LINE_TO_ID_TEST = os.getenv("LINE_TO_ID_TEST")
 LINE_TO_ID_PROD = os.getenv("LINE_TO_ID_PROD")
 LOG_DIR = os.getenv("LOG_DIR", "/tmp")
 SLACK_ERROR_WEBHOOK_URL = os.getenv("SLACK_ERROR_WEBHOOK_URL")
-SLACK_DM_WEBHOOK_URL = os.getenv("SLACK_DM_WEBHOOK_URL")
 
 # --- Processed IDs file for duplicate prevention ---
 PROCESSED_IDS_FILE = os.getenv("PROCESSED_IDS_FILE", os.path.join(LOG_DIR, "processed_ids.json"))
 
 
 # --- Polling Interval ---
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))  # ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ©ÃÂ£ÃÂÃÂ«ÃÂ£ÃÂÃÂ60ÃÂ§ÃÂ§ÃÂÃÂ¯ÃÂ¼ÃÂGmail APIÃÂ¥ÃÂÃÂ¶ÃÂ©ÃÂÃÂÃÂ¥ÃÂ¯ÃÂ¾ÃÂ§ÃÂ­ÃÂÃÂ¯ÃÂ¼ÃÂ
-MAX_BACKOFF_SECONDS = int(os.getenv("MAX_BACKOFF_SECONDS", "900"))  # ÃÂ¦ÃÂÃÂÃÂ¥ÃÂ¤ÃÂ§15ÃÂ¥ÃÂÃÂÃÂ£ÃÂÃÂ®ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ¯ÃÂ£ÃÂÃÂªÃÂ£ÃÂÃÂ
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))  # ããã©ã«ã60ç§ï¼Gmail APIå¶éå¯¾ç­ï¼
+MAX_BACKOFF_SECONDS = int(os.getenv("MAX_BACKOFF_SECONDS", "900"))  # æå¤§15åã®ããã¯ãªã
 
 # --- Search window for emails (days) ---
-SEARCH_DAYS = int(os.getenv("SEARCH_DAYS", "1"))  # ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ©ÃÂ£ÃÂÃÂ«ÃÂ£ÃÂÃÂ1ÃÂ¦ÃÂÃÂ¥ÃÂ©ÃÂÃÂÃÂ¯ÃÂ¼ÃÂGmail APIÃÂ¥ÃÂÃÂ¶ÃÂ©ÃÂÃÂÃÂ¥ÃÂ¯ÃÂ¾ÃÂ§ÃÂ­ÃÂÃÂ¯ÃÂ¼ÃÂ
+SEARCH_DAYS = int(os.getenv("SEARCH_DAYS", "1"))  # ããã©ã«ã1æ¥éï¼Gmail APIå¶éå¯¾ç­ï¼
 
-# --- Batch limit per cycle (QUOTA ERRORÃÂ¥ÃÂ¯ÃÂ¾ÃÂ§ÃÂ­ÃÂ) ---
-MAX_EMAILS_PER_CYCLE = int(os.getenv("MAX_EMAILS_PER_CYCLE", "10"))  # 1ÃÂ£ÃÂÃÂµÃÂ£ÃÂÃÂ¤ÃÂ£ÃÂÃÂ¯ÃÂ£ÃÂÃÂ«ÃÂ£ÃÂÃÂ§ÃÂ¥ÃÂÃÂ¦ÃÂ§ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ¦ÃÂÃÂÃÂ¥ÃÂ¤ÃÂ§ÃÂ£ÃÂÃÂ¡ÃÂ£ÃÂÃÂ¼ÃÂ£ÃÂÃÂ«ÃÂ¦ÃÂÃÂ°
+# --- Batch limit per cycle (QUOTA ERRORå¯¾ç­) ---
+MAX_EMAILS_PER_CYCLE = int(os.getenv("MAX_EMAILS_PER_CYCLE", "10"))  # 1ãµã¤ã¯ã«ã§å¦çããæå¤§ã¡ã¼ã«æ°
 
 
 # --- Logging ---
@@ -136,11 +135,6 @@ def save_processed_ids(processed_ids: Set[str]) -> bool:
     try:
         # Exclude uid: entries - they are session-only cache, gm:/mid: entries handle dedup
         persistent_ids = [item for item in processed_ids if not item.startswith("uid:")]
-        # Limit to latest 5000 entries to prevent JSON growth
-        MAX_PROCESSED_IDS = 5000
-        if len(persistent_ids) > MAX_PROCESSED_IDS:
-            persistent_ids = persistent_ids[-MAX_PROCESSED_IDS:]
-            log(f"Trimmed processed_ids to latest {MAX_PROCESSED_IDS} entries")
         # Atomic write: write to temp file then replace to prevent partial writes on crash
         target_path = Path(PROCESSED_IDS_FILE)
         tmp_path = target_path.with_suffix(".tmp")
@@ -156,12 +150,12 @@ def save_processed_ids(processed_ids: Set[str]) -> bool:
 
 
 def notify_error_to_slack(message: str) -> None:
-    """ÃÂ©ÃÂÃÂÃÂ¥ÃÂ¤ÃÂ§ÃÂ£ÃÂÃÂªÃÂ£ÃÂÃÂ¨ÃÂ£ÃÂÃÂ©ÃÂ£ÃÂÃÂ¼ÃÂ£ÃÂÃÂ Slack Webhook ÃÂ£ÃÂÃÂ«ÃÂ©ÃÂÃÂÃÂ§ÃÂÃÂ¥ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ"""
+    """éå¤§ãªã¨ã©ã¼ã Slack Webhook ã«éç¥ãã"""
     webhook_url = SLACK_ERROR_WEBHOOK_URL or SLACK_WEBHOOK_URL_PROD
     if not webhook_url:
         log("ERROR: No Slack webhook URL configured; cannot notify error to Slack")
         return
-    text = f"ÃÂ°ÃÂÃÂÃÂ¨ IndeedÃÂ¥ÃÂ¿ÃÂÃÂ¥ÃÂÃÂÃÂ©ÃÂÃÂÃÂ§ÃÂÃÂ¥ÃÂ£ÃÂÃÂ¨ÃÂ£ÃÂÃÂ©ÃÂ£ÃÂÃÂ¼ÃÂ§ÃÂÃÂºÃÂ§ÃÂÃÂ\n{message}"
+    text = f"ð¨ Indeedå¿åéç¥ã¨ã©ã¼çºç\n{message}"
     try:
         resp = requests.post(
             webhook_url,
@@ -171,7 +165,7 @@ def notify_error_to_slack(message: str) -> None:
         if resp.status_code >= 400:
             log(f"ERROR: failed to send error notification to Slack (status={resp.status_code}, body={resp.text})")
     except Exception as e:
-        # ÃÂ©ÃÂÃÂÃÂ§ÃÂÃÂ¥ÃÂ¦ÃÂÃÂÃÂ£ÃÂÃÂ®ÃÂ£ÃÂÃÂ¨ÃÂ£ÃÂÃÂ©ÃÂ£ÃÂÃÂ¼ÃÂ£ÃÂÃÂ§ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ«ÃÂ¤ÃÂ¾ÃÂÃÂ¥ÃÂ¤ÃÂÃÂ£ÃÂÃÂÃÂ¦ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ¨ÃÂ£ÃÂÃÂ«ÃÂ£ÃÂÃÂ¼ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ®ÃÂ£ÃÂÃÂ§ÃÂ£ÃÂÃÂ­ÃÂ£ÃÂÃÂ°ÃÂ£ÃÂÃÂ®ÃÂ£ÃÂÃÂ¿
+        # éç¥æã®ã¨ã©ã¼ã§ããã«ä¾å¤ãæããã¨ã«ã¼ãããã®ã§ã­ã°ã®ã¿
         log(f"ERROR: exception while sending error notification to Slack: {e}")
 
 
@@ -199,7 +193,7 @@ def get_line_to_id() -> Optional[str]:
 
 def add_test_prefix(message: str) -> str:
     """Add test version prefix if in test mode."""
-    return f"ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ¹ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ¼ÃÂ£ÃÂÃÂ¸ÃÂ£ÃÂÃÂ§ÃÂ£ÃÂÃÂ³ÃÂ£ÃÂÃÂ\n{message}" if is_test_mode() else message
+    return f"ããã¹ããã¼ã¸ã§ã³ã\n{message}" if is_test_mode() else message
 
 
 # --- Email Parsing ---
@@ -247,7 +241,7 @@ def extract_indeed_url(html: str) -> str:
         return ""
     soup = BeautifulSoup(html, "html.parser")
     for a in soup.find_all("a"):
-        if "ÃÂ¥ÃÂ¿ÃÂÃÂ¥ÃÂÃÂÃÂ¥ÃÂÃÂÃÂ¥ÃÂ®ÃÂ¹ÃÂ£ÃÂÃÂÃÂ§ÃÂ¢ÃÂºÃÂ¨ÃÂªÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ" in (a.get_text() or ""):
+        if "å¿ååå®¹ãç¢ºèªãã" in (a.get_text() or ""):
             return a.get("href") or ""
     for a in soup.find_all("a"):
         href = a.get("href") or ""
@@ -257,32 +251,32 @@ def extract_indeed_url(html: str) -> str:
 
 
 def extract_applicant_name_from_html(html: str) -> Optional[str]:
-    """IndeedÃÂ£ÃÂÃÂ¡ÃÂ£ÃÂÃÂ¼ÃÂ£ÃÂÃÂ«ÃÂ£ÃÂÃÂ®HTMLÃÂ¦ÃÂÃÂ¬ÃÂ¦ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ¥ÃÂ¿ÃÂÃÂ¥ÃÂÃÂÃÂ¨ÃÂÃÂÃÂ¥ÃÂÃÂÃÂ£ÃÂÃÂÃÂ¦ÃÂÃÂ½ÃÂ¥ÃÂÃÂºÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ
+    """Indeedã¡ã¼ã«ã®HTMLæ¬æããå¿åèåãæ½åºããã
 
-    IndeedÃÂ£ÃÂÃÂ®ÃÂ£ÃÂÃÂ¡ÃÂ£ÃÂÃÂ¼ÃÂ£ÃÂÃÂ«ÃÂ£ÃÂÃÂ¯from_headerÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂIndeed <noreply@indeed.com>ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ®ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ
-    ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ¼ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ¯ÃÂ¥ÃÂ¿ÃÂÃÂ¥ÃÂÃÂÃÂ¨ÃÂÃÂÃÂ¥ÃÂÃÂÃÂ£ÃÂÃÂÃÂ¥ÃÂÃÂÃÂ¥ÃÂ¾ÃÂÃÂ£ÃÂÃÂ§ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂªÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ¤ÃÂ»ÃÂ£ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ«ÃÂ£ÃÂÃÂ¡ÃÂ£ÃÂÃÂ¼ÃÂ£ÃÂÃÂ«ÃÂ¦ÃÂÃÂ¬ÃÂ¦ÃÂÃÂHTMLÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ¥ÃÂÃÂÃÂ¥ÃÂ¾ÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ
+    Indeedã®ã¡ã¼ã«ã¯from_headerããIndeed <noreply@indeed.com>ãã®ãã
+    ãããã¼ããã¯å¿åèåãåå¾ã§ããªããä»£ããã«ã¡ã¼ã«æ¬æHTMLããåå¾ããã
 
-    ÃÂ¨ÃÂ©ÃÂ¦ÃÂ£ÃÂÃÂ¿ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ¿ÃÂ£ÃÂÃÂ¼ÃÂ£ÃÂÃÂ³:
-    1. ÃÂ£ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ®ÃÂ¥ÃÂ¿ÃÂÃÂ¥ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ¥ÃÂ¿ÃÂÃÂ¥ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ¾ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ§ÃÂ­ÃÂÃÂ£ÃÂÃÂ®ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ­ÃÂ£ÃÂÃÂ¹ÃÂ£ÃÂÃÂ
-    2. ÃÂ¤ÃÂ»ÃÂ¶ÃÂ¥ÃÂÃÂÃÂ£ÃÂÃÂÃÂ¦ÃÂÃÂ°ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ¥ÃÂ¿ÃÂÃÂ¥ÃÂÃÂÃÂ¨ÃÂÃÂÃÂ£ÃÂÃÂ®ÃÂ£ÃÂÃÂÃÂ§ÃÂÃÂ¥ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ: ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ®ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ¿ÃÂ£ÃÂÃÂ¼ÃÂ£ÃÂÃÂ³
-    3. td/div/pÃÂ¥ÃÂÃÂÃÂ£ÃÂÃÂ«ÃÂ£ÃÂÃÂÃÂ¥ÃÂ¿ÃÂÃÂ¥ÃÂÃÂÃÂ¨ÃÂÃÂ:ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ¥ÃÂ¿ÃÂÃÂ¥ÃÂÃÂÃÂ¨ÃÂÃÂÃÂ¥ÃÂÃÂ:ÃÂ£ÃÂÃÂÃÂ§ÃÂ­ÃÂÃÂ£ÃÂÃÂ®ÃÂ£ÃÂÃÂ©ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ«ÃÂ£ÃÂÃÂ«ÃÂ§ÃÂ¶ÃÂÃÂ£ÃÂÃÂÃÂ¥ÃÂÃÂÃÂ¥ÃÂÃÂ
+    è©¦ã¿ããã¿ã¼ã³:
+    1. ãââããããã®å¿åããââ ãããå¿åãã¾ãããç­ã®ãã­ã¹ã
+    2. ä»¶åãæ°ããå¿åèã®ãç¥ãã: ââãã®ãã¿ã¼ã³
+    3. td/div/påã«ãå¿åè:ããå¿åèå:ãç­ã®ã©ãã«ã«ç¶ãåå
     """
     if not html:
         return None
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(separator="\n")
 
-    # ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ¿ÃÂ£ÃÂÃÂ¼ÃÂ£ÃÂÃÂ³1: ÃÂ£ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ®ÃÂ¥ÃÂ¿ÃÂÃÂ¥ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ¥ÃÂ¿ÃÂÃÂ¥ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ¾ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ
+    # ãã¿ã¼ã³1: ãââããããã®å¿åããââãããå¿åãã¾ããã
     for pattern in [
-        r"([^\sÃÂ£ÃÂÃÂ\n]+(?:\s[^\sÃÂ£ÃÂÃÂ\n]+)?)\s*ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ(?:ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ(?:ÃÂ£ÃÂÃÂ®)?ÃÂ¥ÃÂ¿ÃÂÃÂ¥ÃÂÃÂ|ÃÂ£ÃÂÃÂÃÂ¥ÃÂ¿ÃÂÃÂ¥ÃÂÃÂ)",
-        r"ÃÂ¦ÃÂÃÂ°ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ¥ÃÂ¿ÃÂÃÂ¥ÃÂÃÂÃÂ¨ÃÂÃÂ(?:ÃÂ£ÃÂÃÂ®ÃÂ£ÃÂÃÂÃÂ§ÃÂÃÂ¥ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ)?[:ÃÂ¯ÃÂ¼ÃÂ]\s*([^\n\r]+)",
-        r"ÃÂ¥ÃÂ¿ÃÂÃÂ¥ÃÂÃÂÃÂ¨ÃÂÃÂ(?:ÃÂ¥ÃÂÃÂ)?[:ÃÂ¯ÃÂ¼ÃÂ]\s*([^\n\r]+)",
-        r"([^\sÃÂ£ÃÂÃÂ\n]{1,20})\s*(?:ÃÂ¦ÃÂ§ÃÂ|ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ)(?:\s|$|ÃÂ£ÃÂÃÂ|ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ|ÃÂ£ÃÂÃÂ®)",
+        r"([^\sã\n]+(?:\s[^\sã\n]+)?)\s*ãã(?:ãã(?:ã®)?å¿å|ãå¿å)",
+        r"æ°ããå¿åè(?:ã®ãç¥ãã)?[:ï¼]\s*([^\n\r]+)",
+        r"å¿åè(?:å)?[:ï¼]\s*([^\n\r]+)",
+        r"([^\sã\n]{1,20})\s*(?:æ§|ãã)(?:\s|$|ã|ãã|ã®)",
     ]:
         match = re.search(pattern, text)
         if match:
             name = match.group(1).strip()
-            # ÃÂ¦ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ«ÃÂ¥ÃÂÃÂÃÂ¥ÃÂÃÂÃÂ£ÃÂÃÂ§ÃÂ£ÃÂÃÂ¯ÃÂ£ÃÂÃÂªÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ®ÃÂ£ÃÂÃÂÃÂ©ÃÂÃÂ¤ÃÂ¥ÃÂ¤ÃÂÃÂ¯ÃÂ¼ÃÂURLÃÂ£ÃÂÃÂÃÂ©ÃÂÃÂ·ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ¦ÃÂÃÂÃÂ¥ÃÂ­ÃÂÃÂ¥ÃÂÃÂÃÂ¯ÃÂ¼ÃÂ
+            # æããã«ååã§ã¯ãªããã®ãé¤å¤ï¼URLãé·ãããæå­åï¼
             if name and len(name) <= 30 and "http" not in name and "@" not in name:
                 return name
 
@@ -327,14 +321,14 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
     if not webhook_url:
         log("No Slack Webhook URL")
         return False
-    title = "ÃÂ£ÃÂÃÂIndeedÃÂ¥ÃÂ¿ÃÂÃÂ¥ÃÂÃÂÃÂ£ÃÂÃÂ" if source == "indeed" else "ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ¸ÃÂ£ÃÂÃÂ¢ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ£ÃÂ£ÃÂÃÂ¼ÃÂ£ÃÂÃÂ"
+    title = "ãIndeedå¿åã" if source == "indeed" else "ãã¸ã¢ãã£ã¼ã"
     mention_prefix = "<!channel>\n"
 
-    lines = [f"{title} ÃÂ£ÃÂÃÂ{name}ÃÂ£ÃÂÃÂ ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ¥ÃÂ¿ÃÂÃÂ¥ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ¾ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ"]
+    lines = [f"{title} ã{name}ã ããããå¿åãããã¾ããã"]
     if job_title:
-        lines.append(f"ÃÂ¦ÃÂ±ÃÂÃÂ¤ÃÂºÃÂº: {job_title}")
+        lines.append(f"æ±äºº: {job_title}")
     if url:
-        lines.extend(["", "ÃÂ¥ÃÂ¿ÃÂÃÂ¥ÃÂÃÂÃÂ¥ÃÂÃÂÃÂ¥ÃÂ®ÃÂ¹ÃÂ£ÃÂÃÂ¯ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ¡ÃÂ£ÃÂÃÂ:", shorten_url(url)])
+        lines.extend(["", "å¿ååå®¹ã¯ãã¡ã:", shorten_url(url)])
     message = add_test_prefix(mention_prefix + "\n".join(lines))
     for attempt in range(max_retries):
         try:
@@ -358,16 +352,16 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
     if not LINE_CHANNEL_ACCESS_TOKEN or not line_to_id:
         log("LINE Token or TO ID missing")
         return False
-    title = "IndeedÃÂ£ÃÂÃÂ«ÃÂ¥ÃÂ¿ÃÂÃÂ¥ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ¾ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ" if source == "indeed" else "ÃÂ£ÃÂÃÂ¸ÃÂ£ÃÂÃÂ¢ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ£ÃÂ£ÃÂÃÂ¼ÃÂ£ÃÂÃÂ§ÃÂ¦ÃÂÃÂ°ÃÂ§ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ¾ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ"
-    lines = [f"ÃÂ£ÃÂÃÂ{name}ÃÂ£ÃÂÃÂ ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ{title}"]
+    title = "Indeedã«å¿åãããã¾ããã" if source == "indeed" else "ã¸ã¢ãã£ã¼ã§æ°çãããã¾ãã"
+    lines = [f"ã{name}ã ãããã{title}"]
     if job_title:
-        lines.append(f"ÃÂ¦ÃÂ±ÃÂÃÂ¤ÃÂºÃÂº: {job_title}")
+        lines.append(f"æ±äºº: {job_title}")
     if url:
         # Force LINE to open URL in external browser (Chrome/Safari)
         # to avoid Google OAuth blocking in LINE's in-app browser
         separator = "&" if "?" in url else "?"
         external_url = f"{url}{separator}openExternalBrowser=1"
-        lines.extend(["", "ÃÂ¨ÃÂ©ÃÂ³ÃÂ§ÃÂ´ÃÂ°ÃÂ£ÃÂÃÂ¯ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ¡ÃÂ£ÃÂÃÂ:", shorten_url(external_url)])
+        lines.extend(["", "è©³ç´°ã¯ãã¡ã:", shorten_url(external_url)])
     base_message = add_test_prefix("\n".join(lines))
     # Use @all mention to notify all members in the group
     substitution = {
@@ -408,8 +402,8 @@ def imap_connection():
     """Context manager for IMAP connection with timeout protection."""
     old_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(30)
+    mail = imaplib.IMAP4_SSL(GMAIL_IMAP_HOST)
     try:
-        mail = imaplib.IMAP4_SSL(GMAIL_IMAP_HOST)
         mail.login(GMAIL_IMAP_USER, GMAIL_IMAP_PASSWORD)
         mail.select("INBOX", readonly=True)
         yield mail
@@ -442,9 +436,9 @@ def parse_fetch_response(data: list) -> Tuple[Optional[str], Optional[bytes]]:
 
 def determine_source(subject: str) -> Tuple[Optional[str], Optional[str]]:
     """Determine email source and default URL based on subject."""
-    if "ÃÂ¦ÃÂÃÂ°ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ¥ÃÂ¿ÃÂÃÂ¥ÃÂÃÂÃÂ¨ÃÂÃÂÃÂ£ÃÂÃÂ®ÃÂ£ÃÂÃÂÃÂ§ÃÂÃÂ¥ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ" in subject:
+    if "æ°ããå¿åèã®ãç¥ãã" in subject:
         return "indeed", None
-    elif "ÃÂ£ÃÂÃÂ¸ÃÂ£ÃÂÃÂ¢ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ£ÃÂ£ÃÂÃÂ¼" in subject:
+    elif "ã¸ã¢ãã£ã¼" in subject:
         return "jimoty", "https://jmty.jp/web_mail/posts"
     return None, None
 
@@ -502,8 +496,8 @@ def process_mail_by_uid(
     html = extract_html(msg)
     url = extract_indeed_url(html) if source == "indeed" else default_url
 
-    # IndeedÃÂ£ÃÂÃÂ¡ÃÂ£ÃÂÃÂ¼ÃÂ£ÃÂÃÂ«ÃÂ£ÃÂÃÂ¯From=ÃÂ£ÃÂÃÂIndeed <noreply@indeed.com>ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂªÃÂ£ÃÂÃÂ®ÃÂ£ÃÂÃÂ§
-    # ÃÂ£ÃÂÃÂ¡ÃÂ£ÃÂÃÂ¼ÃÂ£ÃÂÃÂ«ÃÂ¦ÃÂÃÂ¬ÃÂ¦ÃÂÃÂHTMLÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ¥ÃÂ¿ÃÂÃÂ¥ÃÂÃÂÃÂ¨ÃÂÃÂÃÂ¥ÃÂÃÂÃÂ£ÃÂÃÂÃÂ¥ÃÂÃÂÃÂ¥ÃÂ¾ÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ¥ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂªÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ°FromÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ¼ÃÂ£ÃÂÃÂ®ÃÂ¥ÃÂÃÂÃÂ¥ÃÂÃÂÃÂ£ÃÂÃÂÃÂ¤ÃÂ½ÃÂ¿ÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ
+    # Indeedã¡ã¼ã«ã¯From=ãIndeed <noreply@indeed.com>ããªã®ã§
+    # ã¡ã¼ã«æ¬æHTMLããå¿åèåãåå¾ãããåããªããã°Fromãããã¼ã®ååãä½¿ãã
     if source == "indeed":
         applicant_name = extract_applicant_name_from_html(html)
         if not applicant_name:
@@ -564,9 +558,6 @@ def check_mail_with_status() -> bool:
 
             # Use UID SEARCH for stable identifiers
             status, data = mail.uid("search", None, "SINCE", since_date)
-            if status != "OK":
-                log(f"UID SEARCH failed with status: {status}")
-                return True
             uid_list = data[0].split()
             log(f"Emails in last {SEARCH_DAYS} days: {len(uid_list)}")
 
@@ -608,7 +599,7 @@ def check_mail_with_status() -> bool:
 
             if truly_new_uids:
                 total_new = len(truly_new_uids)
-                # QUOTA ERRORÃÂ¥ÃÂ¯ÃÂ¾ÃÂ§ÃÂ­ÃÂ: 1ÃÂ£ÃÂÃÂµÃÂ£ÃÂÃÂ¤ÃÂ£ÃÂÃÂ¯ÃÂ£ÃÂÃÂ«ÃÂ£ÃÂÃÂ§ÃÂ¥ÃÂÃÂ¦ÃÂ§ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ¡ÃÂ£ÃÂÃÂ¼ÃÂ£ÃÂÃÂ«ÃÂ¦ÃÂÃÂ°ÃÂ£ÃÂÃÂÃÂ¥ÃÂÃÂ¶ÃÂ©ÃÂÃÂÃÂ£ÃÂÃÂÃÂ£ÃÂÃÂ
+                # QUOTA ERRORå¯¾ç­: 1ãµã¤ã¯ã«ã§å¦çããã¡ã¼ã«æ°ãå¶éãã
                 batch = truly_new_uids[:MAX_EMAILS_PER_CYCLE]
                 if total_new > MAX_EMAILS_PER_CYCLE:
                     log(f"Truly new emails to process: {total_new} (processing {MAX_EMAILS_PER_CYCLE} this cycle, {total_new - MAX_EMAILS_PER_CYCLE} deferred)")
