@@ -135,6 +135,11 @@ def save_processed_ids(processed_ids: Set[str]) -> bool:
     try:
         # Exclude uid: entries - they are session-only cache, gm:/mid: entries handle dedup
         persistent_ids = [item for item in processed_ids if not item.startswith("uid:")]
+        # Limit to latest 5000 entries to prevent JSON growth
+        MAX_PROCESSED_IDS = 5000
+        if len(persistent_ids) > MAX_PROCESSED_IDS:
+            persistent_ids = persistent_ids[-MAX_PROCESSED_IDS:]
+            log(f"Trimmed processed_ids to latest {MAX_PROCESSED_IDS} entries")
         # Atomic write: write to temp file then replace to prevent partial writes on crash
         target_path = Path(PROCESSED_IDS_FILE)
         tmp_path = target_path.with_suffix(".tmp")
