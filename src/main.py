@@ -28,6 +28,7 @@ LINE_TO_ID_TEST = os.getenv("LINE_TO_ID_TEST")
 LINE_TO_ID_PROD = os.getenv("LINE_TO_ID_PROD")
 LOG_DIR = os.getenv("LOG_DIR", "/tmp")
 SLACK_ERROR_WEBHOOK_URL = os.getenv("SLACK_ERROR_WEBHOOK_URL")
+SLACK_DM_WEBHOOK_URL = os.getenv("SLACK_DM_WEBHOOK_URL")
 
 # --- Processed IDs file for duplicate prevention ---
 PROCESSED_IDS_FILE = os.getenv("PROCESSED_IDS_FILE", os.path.join(LOG_DIR, "processed_ids.json"))
