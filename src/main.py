@@ -34,14 +34,14 @@ PROCESSED_IDS_FILE = os.getenv("PROCESSED_IDS_FILE", os.path.join(LOG_DIR, "proc
 
 
 # --- Polling Interval ---
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))  # デフォルト60秒（Gmail API制限対策）
-MAX_BACKOFF_SECONDS = int(os.getenv("MAX_BACKOFF_SECONDS", "900"))  # 最大15分のバックオフ
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))  # ããã©ã«ã60ç§ï¼Gmail APIå¶éå¯¾ç­ï¼
+MAX_BACKOFF_SECONDS = int(os.getenv("MAX_BACKOFF_SECONDS", "900"))  # æå¤§15åã®ããã¯ãªã
 
 # --- Search window for emails (days) ---
-SEARCH_DAYS = int(os.getenv("SEARCH_DAYS", "1"))  # デフォルト1日間（Gmail API制限対策）
+SEARCH_DAYS = int(os.getenv("SEARCH_DAYS", "1"))  # ããã©ã«ã1æ¥éï¼Gmail APIå¶éå¯¾ç­ï¼
 
-# --- Batch limit per cycle (QUOTA ERROR対策) ---
-MAX_EMAILS_PER_CYCLE = int(os.getenv("MAX_EMAILS_PER_CYCLE", "10"))  # 1サイクルで処理する最大メール数
+# --- Batch limit per cycle (QUOTA ERRORå¯¾ç­) ---
+MAX_EMAILS_PER_CYCLE = int(os.getenv("MAX_EMAILS_PER_CYCLE", "10"))  # 1ãµã¤ã¯ã«ã§å¦çããæå¤§ã¡ã¼ã«æ°
 
 
 # --- Logging ---
@@ -150,12 +150,12 @@ def save_processed_ids(processed_ids: Set[str]) -> bool:
 
 
 def notify_error_to_slack(message: str) -> None:
-    """重大なエラーを Slack Webhook に通知する"""
+    """éå¤§ãªã¨ã©ã¼ã Slack Webhook ã«éç¥ãã"""
     webhook_url = SLACK_ERROR_WEBHOOK_URL or SLACK_WEBHOOK_URL_PROD
     if not webhook_url:
         log("ERROR: No Slack webhook URL configured; cannot notify error to Slack")
         return
-    text = f"🚨 Indeed応募通知エラー発生\n{message}"
+    text = f"ð¨ Indeedå¿åéç¥ã¨ã©ã¼çºç\n{message}"
     try:
         resp = requests.post(
             webhook_url,
@@ -165,7 +165,7 @@ def notify_error_to_slack(message: str) -> None:
         if resp.status_code >= 400:
             log(f"ERROR: failed to send error notification to Slack (status={resp.status_code}, body={resp.text})")
     except Exception as e:
-        # 通知時のエラーでさらに例外を投げるとループするのでログのみ
+        # éç¥æã®ã¨ã©ã¼ã§ããã«ä¾å¤ãæããã¨ã«ã¼ãããã®ã§ã­ã°ã®ã¿
         log(f"ERROR: exception while sending error notification to Slack: {e}")
 
 
@@ -193,7 +193,7 @@ def get_line_to_id() -> Optional[str]:
 
 def add_test_prefix(message: str) -> str:
     """Add test version prefix if in test mode."""
-    return f"【テストバージョン】\n{message}" if is_test_mode() else message
+    return f"ããã¹ããã¼ã¸ã§ã³ã\n{message}" if is_test_mode() else message
 
 
 # --- Email Parsing ---
@@ -241,7 +241,7 @@ def extract_indeed_url(html: str) -> str:
         return ""
     soup = BeautifulSoup(html, "html.parser")
     for a in soup.find_all("a"):
-        if "応募内容を確認する" in (a.get_text() or ""):
+        if "å¿ååå®¹ãç¢ºèªãã" in (a.get_text() or ""):
             return a.get("href") or ""
     for a in soup.find_all("a"):
         href = a.get("href") or ""
@@ -251,32 +251,32 @@ def extract_indeed_url(html: str) -> str:
 
 
 def extract_applicant_name_from_html(html: str) -> Optional[str]:
-    """IndeedメールのHTML本文から応募者名を抽出する。
+    """Indeedã¡ã¼ã«ã®HTMLæ¬æããå¿åèåãæ½åºããã
 
-    Indeedのメールはfrom_headerが「Indeed <noreply@indeed.com>」のため
-    ヘッダーからは応募者名を取得できない。代わりにメール本文HTMLから取得する。
+    Indeedã®ã¡ã¼ã«ã¯from_headerããIndeed <noreply@indeed.com>ãã®ãã
+    ãããã¼ããã¯å¿åèåãåå¾ã§ããªããä»£ããã«ã¡ã¼ã«æ¬æHTMLããåå¾ããã
 
-    試みるパターン:
-    1. 「○○さんからの応募」「○○ さんが応募しました」等のテキスト
-    2. 件名「新しい応募者のお知らせ: ○○」のパターン
-    3. td/div/p内に「応募者:」「応募者名:」等のラベルに続く名前
+    è©¦ã¿ããã¿ã¼ã³:
+    1. ãââããããã®å¿åããââ ãããå¿åãã¾ãããç­ã®ãã­ã¹ã
+    2. ä»¶åãæ°ããå¿åèã®ãç¥ãã: ââãã®ãã¿ã¼ã³
+    3. td/div/påã«ãå¿åè:ããå¿åèå:ãç­ã®ã©ãã«ã«ç¶ãåå
     """
     if not html:
         return None
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(separator="\n")
 
-    # パターン1: 「○○さんからの応募」「○○さんが応募しました」
+    # ãã¿ã¼ã³1: ãââããããã®å¿åããââãããå¿åãã¾ããã
     for pattern in [
-        r"([^\s　\n]+(?:\s[^\s　\n]+)?)\s*さん(?:から(?:の)?応募|が応募)",
-        r"新しい応募者(?:のお知らせ)?[:：]\s*([^\n\r]+)",
-        r"応募者(?:名)?[:：]\s*([^\n\r]+)",
-        r"([^\s　\n]{1,20})\s*(?:様|さん)(?:\s|$|が|から|の)",
+        r"([^\sã\n]+(?:\s[^\sã\n]+)?)\s*ãã(?:ãã(?:ã®)?å¿å|ãå¿å)",
+        r"æ°ããå¿åè(?:ã®ãç¥ãã)?[:ï¼]\s*([^\n\r]+)",
+        r"å¿åè(?:å)?[:ï¼]\s*([^\n\r]+)",
+        r"([^\sã\n]{1,20})\s*(?:æ§|ãã)(?:\s|$|ã|ãã|ã®)",
     ]:
         match = re.search(pattern, text)
         if match:
             name = match.group(1).strip()
-            # 明らかに名前ではないものを除外（URLや長すぎる文字列）
+            # æããã«ååã§ã¯ãªããã®ãé¤å¤ï¼URLãé·ãããæå­åï¼
             if name and len(name) <= 30 and "http" not in name and "@" not in name:
                 return name
 
@@ -321,14 +321,14 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
     if not webhook_url:
         log("No Slack Webhook URL")
         return False
-    title = "【Indeed応募】" if source == "indeed" else "【ジモティー】"
+    title = "ãIndeedå¿åã" if source == "indeed" else "ãã¸ã¢ãã£ã¼ã"
     mention_prefix = "<!channel>\n"
 
-    lines = [f"{title} 【{name}】 さんから応募がありました。"]
+    lines = [f"{title} ã{name}ã ããããå¿åãããã¾ããã"]
     if job_title:
-        lines.append(f"求人: {job_title}")
+        lines.append(f"æ±äºº: {job_title}")
     if url:
-        lines.extend(["", "応募内容はこちら:", shorten_url(url)])
+        lines.extend(["", "å¿ååå®¹ã¯ãã¡ã:", shorten_url(url)])
     message = add_test_prefix(mention_prefix + "\n".join(lines))
     for attempt in range(max_retries):
         try:
@@ -352,16 +352,16 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
     if not LINE_CHANNEL_ACCESS_TOKEN or not line_to_id:
         log("LINE Token or TO ID missing")
         return False
-    title = "Indeedに応募がありました。" if source == "indeed" else "ジモティーで新着があります。"
-    lines = [f"【{name}】 さんから{title}"]
+    title = "Indeedã«å¿åãããã¾ããã" if source == "indeed" else "ã¸ã¢ãã£ã¼ã§æ°çãããã¾ãã"
+    lines = [f"ã{name}ã ãããã{title}"]
     if job_title:
-        lines.append(f"求人: {job_title}")
+        lines.append(f"æ±äºº: {job_title}")
     if url:
         # Force LINE to open URL in external browser (Chrome/Safari)
         # to avoid Google OAuth blocking in LINE's in-app browser
         separator = "&" if "?" in url else "?"
         external_url = f"{url}{separator}openExternalBrowser=1"
-        lines.extend(["", "詳細はこちら:", shorten_url(external_url)])
+        lines.extend(["", "è©³ç´°ã¯ãã¡ã:", shorten_url(external_url)])
     base_message = add_test_prefix("\n".join(lines))
     # Use @all mention to notify all members in the group
     substitution = {
@@ -436,9 +436,9 @@ def parse_fetch_response(data: list) -> Tuple[Optional[str], Optional[bytes]]:
 
 def determine_source(subject: str) -> Tuple[Optional[str], Optional[str]]:
     """Determine email source and default URL based on subject."""
-    if "新しい応募者のお知らせ" in subject:
+    if "æ°ããå¿åèã®ãç¥ãã" in subject:
         return "indeed", None
-    elif "ジモティー" in subject:
+    elif "ã¸ã¢ãã£ã¼" in subject:
         return "jimoty", "https://jmty.jp/web_mail/posts"
     return None, None
 
@@ -482,7 +482,8 @@ def process_mail_by_uid(
 
     # Double-check with X-GM-MSGID/Message-ID (in case UID tracking missed it)
     if unique_id in processed_ids:
-        return None  # Already processed, skip silently
+        log(f"Already processed (skip): uid={uid_str}, id={unique_id}")
+        return None
 
     subject = decode_header_value(msg.get("Subject", ""))
     from_header = decode_header_value(msg.get("From", ""))
@@ -495,8 +496,8 @@ def process_mail_by_uid(
     html = extract_html(msg)
     url = extract_indeed_url(html) if source == "indeed" else default_url
 
-    # IndeedメールはFrom=「Indeed <noreply@indeed.com>」なので
-    # メール本文HTMLから応募者名を取得する。取れなければFromヘッダーの名前を使う。
+    # Indeedã¡ã¼ã«ã¯From=ãIndeed <noreply@indeed.com>ããªã®ã§
+    # ã¡ã¼ã«æ¬æHTMLããå¿åèåãåå¾ãããåããªããã°Fromãããã¼ã®ååãä½¿ãã
     if source == "indeed":
         applicant_name = extract_applicant_name_from_html(html)
         if not applicant_name:
@@ -524,9 +525,13 @@ def get_gm_msgid_lightweight(mail: imaplib.IMAP4_SSL, uid: str) -> Optional[str]
     for item in data:
         if isinstance(item, tuple):
             header = item[0].decode() if isinstance(item[0], bytes) else str(item[0])
-            match = re.search(r"X-GM-MSGID (\d+)", header)
-            if match:
-                return f"gm:{match.group(1)}"
+        elif isinstance(item, bytes):
+            header = item.decode(errors="replace")
+        else:
+            continue
+        match = re.search(r"X-GM-MSGID (\d+)", header)
+        if match:
+            return f"gm:{match.group(1)}"
     return None
 
 
@@ -582,10 +587,11 @@ def check_mail_with_status() -> bool:
                     processed_ids.add(f"uid:{uid_str}")
                 if not save_processed_ids(processed_ids):
                     log("ERROR: Failed to save bootstrapped UIDs")
+                    return True  # Not a quota error
 
             if truly_new_uids:
                 total_new = len(truly_new_uids)
-                # QUOTA ERROR対策: 1サイクルで処理するメール数を制限する
+                # QUOTA ERRORå¯¾ç­: 1ãµã¤ã¯ã«ã§å¦çããã¡ã¼ã«æ°ãå¶éãã
                 batch = truly_new_uids[:MAX_EMAILS_PER_CYCLE]
                 if total_new > MAX_EMAILS_PER_CYCLE:
                     log(f"Truly new emails to process: {total_new} (processing {MAX_EMAILS_PER_CYCLE} this cycle, {total_new - MAX_EMAILS_PER_CYCLE} deferred)")
