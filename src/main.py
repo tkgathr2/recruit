@@ -8,7 +8,7 @@ import time
 import json
 import re
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Pathh
 from typing import Optional, Set, Tuple
 import requests
 from bs4 import BeautifulSoup
@@ -522,7 +522,7 @@ def process_mail_by_uid(
             )
             log(f"ALERT: Indeed email detected with unrecognized subject: {subject}")
             notify_error_to_slack(alert_msg)
-            return None  # 処理済みにしない: フォーマット修正まで毎サイクルアラートを出す
+            return unique_id  # アラート1回送信後は処理済みマーク（繰り返し通知を防止）
         else:
             log(f"Skip non-target mail: {subject[:50]}...")
             return unique_id  # 対象外メールは処理済みマーク
