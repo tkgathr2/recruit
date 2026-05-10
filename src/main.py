@@ -155,6 +155,7 @@ def save_processed_ids(processed_ids: Set[str]) -> bool:
         persistent_ids = [item for item in processed_ids if not item.startswith("uid:")]
         # Trim to MAX_PROCESSED_IDS to prevent unbounded growth
         if len(persistent_ids) > MAX_PROCESSED_IDS:
+            persistent_ids.sort()
             persistent_ids = persistent_ids[-MAX_PROCESSED_IDS:]
         # Atomic write: write to temp file then replace to prevent partial writes on crash
         target_path = Path(PROCESSED_IDS_FILE)
@@ -444,12 +445,15 @@ def imap_connection():
         yield mail
     finally:
         socket.setdefaulttimeout(old_timeout)
-        try:
-            if mail:
+        if mail:
+            try:
                 mail.close()
+            except Exception:
+                pass
+            try:
                 mail.logout()
-        except Exception:
-            pass
+            except Exception:
+                pass
 
 
 # --- Mail Processing ---
