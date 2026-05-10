@@ -45,6 +45,22 @@ SEARCH_DAYS = int(os.getenv("SEARCH_DAYS", "1"))  # デフォルト1日間（Gma
 # --- Batch limit per cycle (QUOTA ERROR対策) ---
 MAX_EMAILS_PER_CYCLE = int(os.getenv("MAX_EMAILS_PER_CYCLE", "10"))  # 1サイクルで処理する最大メール数
 
+# --- Known Indeed non-application email patterns (silently ignored) ---
+# These are legitimate Indeed emails that are NOT job applications.
+# Add new patterns here as they are discovered.
+INDEED_NON_APPLICATION_PATTERNS = [
+    "オススメ求人が",
+    "求人への応募状況をお知らせします",
+    "応募状況レポート",
+    "求人パフォーマンス",
+    "求人の掲載が",
+    "Indeed請求",
+    "お支払い",
+    "求人についての最新情報",
+    "求人広告の",
+    "Indeedからのお知らせ",
+]
+
 
 # --- Logging ---
 def log(msg: str) -> None:
@@ -463,6 +479,15 @@ def determine_source(subject: str) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+def is_indeed_non_application_email(subject: str) -> bool:
+    """Check if an Indeed email is a known non-application type.
+
+    These include recommendation emails, status reports, billing notices, etc.
+    Returns True if the subject matches any known non-application pattern.
+    """
+    return any(pattern in subject for pattern in INDEED_NON_APPLICATION_PATTERNS)
+
+
 def get_unique_id(gm_msgid: Optional[str], msg: email.message.Message) -> Optional[str]:
     """Get unique identifier for email. Prefers X-GM-MSGID, falls back to Message-ID."""
     if gm_msgid:
@@ -510,22 +535,28 @@ def process_mail_by_uid(
 
     source, default_url = determine_source(subject)
     if not source:
-        # Indeedが件名フォーマットを変更した場合の検知
         if "indeed" in from_header.lower() or "indeed" in subject.lower():
-            date_header = decode_header_value(msg.get("Date", ""))
-            alert_msg = (
-                "⚠️ 件名不一致のIndeedメールを検知\n"
-                f"件名: {subject}\n"
-                f"From: {from_header}\n"
-                f"日時: {date_header}\n"
-                "Indeedが件名フォーマットを変更した可能性があります。determine_source関数の更新を検討してください。"
-            )
-            log(f"ALERT: Indeed email detected with unrecognized subject: {subject}")
-            notify_error_to_slack(alert_msg)
-            return unique_id  # アラート1回送信後は処理済みマーク（繰り返し通知を防止）
+            # Indeedからのメールだが応募通知ではない
+            if is_indeed_non_application_email(subject):
+                # 既知の非応募パターン（求人レコメンド、応募状況レポート等）→ 静かにスキップ
+                log(f"Skip Indeed non-application mail: {subject[:80]}")
+                return unique_id  # 処理済みマーク、アラートなし
+            else:
+                # 未知のパターン → Indeedが件名フォーマットを変更した可能性があるためアラート送信
+                date_header = decode_header_value(msg.get("Date", ""))
+                alert_msg = (
+                    "⚠️ 件名不一致のIndeedメールを検知\n"
+                    f"件名: {subject}\n"
+                    f"From: {from_header}\n"
+                    f"日時: {date_header}\n"
+                    "Indeedが件名フォーマットを変更した可能性があります。determine_source関数の更新を検討してください。"
+                )
+                log(f"ALERT: Indeed email detected with unrecognized subject: {subject}")
+                notify_error_to_slack(alert_msg)
+                return unique_id  # アラート1回送信後は処理済みマーク（繰り返し通知を防止）
         else:
             log(f"Skip non-target mail: {subject[:50]}...")
-            return unique_id  # 対象外メールは処理済みマーク
+            return unique_id  # Indeed以外の対象外メールは静かにスキップ＋処理済みマーク
 
     html = extract_html(msg)
     url = extract_indeed_url(html) if source == "indeed" else default_url
