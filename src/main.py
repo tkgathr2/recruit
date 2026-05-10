@@ -8,7 +8,7 @@ import time
 import json
 import re
 from contextlib import contextmanager
-from pathlib import Pathh
+from pathlib import Path
 from typing import Optional, Set, Tuple
 import requests
 from bs4 import BeautifulSoup
