@@ -497,33 +497,114 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
 
 
 # --- IMAP Connection ---
+# Backoff schedule for IMAP (re)connection attempts (seconds).
+IMAP_CONNECT_BACKOFF_SECONDS = [5, 10, 20]
+
+
+class IMAPConnectionPool:
+    """Single-connection pool that reuses an IMAP connection across polls.
+
+    A fresh IMAP login per poll cycle is wasteful and brittle: Gmail
+    throttles frequent logins, and the TLS + LOGIN round-trip burns time on
+    every cycle. This pool keeps one connection alive and verifies liveness
+    via NOOP before handing it out. On any failure, the stale connection is
+    closed and a new one is established with exponential backoff
+    (5s, 10s, 20s — three attempts in total).
+    """
+
+    def __init__(self) -> None:
+        self._connection: Optional[imaplib.IMAP4_SSL] = None
+
+    def get(self) -> imaplib.IMAP4_SSL:
+        """Return a live IMAP connection, reusing the existing one if alive."""
+        if self._connection is not None:
+            if self._is_alive(self._connection):
+                return self._connection
+            log(f"IMAP pooled connection to {GMAIL_IMAP_HOST} is dead; reconnecting")
+            self._close_silently()
+        self._connection = self._connect_with_backoff()
+        return self._connection
+
+    def reset(self) -> None:
+        """Force-discard the current connection (call after an IMAP error)."""
+        self._close_silently()
+
+    def _is_alive(self, mail: imaplib.IMAP4_SSL) -> bool:
+        try:
+            status, _ = mail.noop()
+            return status == "OK"
+        except (imaplib.IMAP4.abort, imaplib.IMAP4.error, OSError):
+            return False
+
+    def _close_silently(self) -> None:
+        if self._connection is None:
+            return
+        try:
+            self._connection.close()
+        except Exception:
+            pass
+        try:
+            self._connection.logout()
+        except Exception:
+            pass
+        self._connection = None
+
+    def _connect_with_backoff(self) -> imaplib.IMAP4_SSL:
+        delays = IMAP_CONNECT_BACKOFF_SECONDS
+        max_attempts = len(delays)
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, max_attempts + 1):
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            log(f"IMAP connect attempt {attempt}/{max_attempts} host={GMAIL_IMAP_HOST} ts={ts}")
+            try:
+                mail = imaplib.IMAP4_SSL(GMAIL_IMAP_HOST)
+                mail.login(GMAIL_IMAP_USER, GMAIL_IMAP_PASSWORD)
+                mail.select("INBOX", readonly=True)
+                log(f"IMAP connect success host={GMAIL_IMAP_HOST} attempt={attempt}/{max_attempts}")
+                return mail
+            except (imaplib.IMAP4.error, OSError) as e:
+                last_exc = e
+                fail_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                log(
+                    f"ERROR: IMAP connect failed host={GMAIL_IMAP_HOST} "
+                    f"attempt={attempt}/{max_attempts} ts={fail_ts} error={e!r}"
+                )
+                if attempt < max_attempts:
+                    backoff = delays[attempt - 1]
+                    log(f"Backing off {backoff}s before IMAP reconnect attempt {attempt + 1}")
+                    time.sleep(backoff)
+        log(
+            f"ERROR: IMAP connect exhausted {max_attempts} attempts host={GMAIL_IMAP_HOST} "
+            f"last_error={last_exc!r}"
+        )
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("IMAP connect failed with no exception captured")
+
+
+_imap_pool = IMAPConnectionPool()
+
+
 @contextmanager
 def imap_connection():
-    """Context manager for IMAP connection with timeout protection.
+    """Yield a pooled IMAP connection, reconnecting with backoff on failure.
 
-    IMAP4_SSL に timeout=IMAP_TIMEOUT_SECONDS（既定30秒）を明示的に指定し、
-    Pythonランタイムの socket デフォルトタイムアウトにも同値を設定して
-    login/select/search/fetch 各操作で I/O が無期限ブロックしないようにする。
+    The yielded connection is owned by the module-level pool and is NOT
+    closed on successful exit — the next caller reuses it. Any IMAP/socket
+    error inside the with-block invalidates the pooled connection so the
+    next call reconnects with exponential backoff.
     """
     old_timeout = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(IMAP_TIMEOUT_SECONDS)
-    mail = None
+    socket.setdefaulttimeout(30)
     try:
-        mail = imaplib.IMAP4_SSL(GMAIL_IMAP_HOST, timeout=IMAP_TIMEOUT_SECONDS)
-        mail.login(GMAIL_IMAP_USER, GMAIL_IMAP_PASSWORD)
-        mail.select("INBOX", readonly=True)
-        yield mail
+        mail = _imap_pool.get()
+        try:
+            yield mail
+        except (imaplib.IMAP4.abort, imaplib.IMAP4.error, OSError):
+            _imap_pool.reset()
+            raise
     finally:
         socket.setdefaulttimeout(old_timeout)
-        if mail:
-            try:
-                mail.close()
-            except Exception:
-                pass
-            try:
-                mail.logout()
-            except Exception:
-                pass
 
 
 # --- Mail Processing ---
@@ -951,3 +1032,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
