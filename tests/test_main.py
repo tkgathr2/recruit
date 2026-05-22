@@ -701,3 +701,109 @@ def test_process_mail_by_uid_slack_only_success(tmp_path):
 
     # Slackだけ成功 → unique_idを返す（処理済みにする）
     assert result is not None, "少なくとも1つ成功時はunique_idを返すべき"
+
+
+class TestIMAPConnectionPool:
+    """Tests for the IMAP connection pool (reuse + exponential backoff)."""
+
+    def _make_pool(self):
+        from src.main import IMAPConnectionPool
+        return IMAPConnectionPool()
+
+    def test_reuses_alive_connection(self):
+        pool = self._make_pool()
+        alive = MagicMock()
+        alive.noop.return_value = ("OK", [b"NOOP completed."])
+        pool._connection = alive
+
+        with patch("src.main.imaplib.IMAP4_SSL") as mock_cls:
+            got = pool.get()
+
+        assert got is alive
+        mock_cls.assert_not_called()
+        alive.noop.assert_called_once()
+
+    def test_reconnects_when_noop_fails(self):
+        import imaplib as _imaplib
+        pool = self._make_pool()
+        dead = MagicMock()
+        dead.noop.side_effect = _imaplib.IMAP4.abort("connection broken")
+        pool._connection = dead
+
+        fresh = MagicMock()
+        with patch("src.main.imaplib.IMAP4_SSL", return_value=fresh) as mock_cls, \
+             patch("src.main.GMAIL_IMAP_USER", "u"), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", "p"):
+            got = pool.get()
+
+        assert got is fresh
+        mock_cls.assert_called_once()
+        fresh.login.assert_called_once_with("u", "p")
+        fresh.select.assert_called_once_with("INBOX", readonly=True)
+        # Dead connection should be closed during reconnect.
+        dead.close.assert_called_once()
+        dead.logout.assert_called_once()
+
+    def test_exponential_backoff_then_success(self):
+        import imaplib as _imaplib
+        pool = self._make_pool()
+        fresh = MagicMock()
+
+        with patch("src.main.imaplib.IMAP4_SSL",
+                   side_effect=[_imaplib.IMAP4.error("boom1"),
+                                _imaplib.IMAP4.error("boom2"),
+                                fresh]) as mock_cls, \
+             patch("src.main.time.sleep") as mock_sleep, \
+             patch("src.main.GMAIL_IMAP_USER", "u"), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", "p"):
+            got = pool.get()
+
+        assert got is fresh
+        assert mock_cls.call_count == 3
+        # First two attempts fail → sleeps of 5s then 10s before the 3rd attempt.
+        assert [c.args[0] for c in mock_sleep.call_args_list] == [5, 10]
+
+    def test_all_attempts_fail_raises(self):
+        import imaplib as _imaplib
+        pool = self._make_pool()
+
+        with patch("src.main.imaplib.IMAP4_SSL",
+                   side_effect=_imaplib.IMAP4.error("boom")), \
+             patch("src.main.time.sleep") as mock_sleep, \
+             patch("src.main.GMAIL_IMAP_USER", "u"), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", "p"):
+            with pytest.raises(_imaplib.IMAP4.error):
+                pool.get()
+
+        # Three attempts → two sleeps (5s, 10s); no sleep after the final failure.
+        assert [c.args[0] for c in mock_sleep.call_args_list] == [5, 10]
+
+    def test_reset_closes_and_clears(self):
+        pool = self._make_pool()
+        existing = MagicMock()
+        pool._connection = existing
+
+        pool.reset()
+
+        existing.close.assert_called_once()
+        existing.logout.assert_called_once()
+        assert pool._connection is None
+
+    def test_imap_connection_context_resets_on_error(self):
+        """When the with-block raises an IMAP error, the pool is reset."""
+        import imaplib as _imaplib
+        from src.main import imap_connection, _imap_pool
+
+        live = MagicMock()
+        live.noop.return_value = ("OK", [b"NOOP completed."])
+        _imap_pool._connection = live
+        try:
+            with pytest.raises(_imaplib.IMAP4.abort):
+                with imap_connection() as mail:
+                    assert mail is live
+                    raise _imaplib.IMAP4.abort("server hung up")
+            assert _imap_pool._connection is None, "pool must drop the dead connection"
+            live.close.assert_called_once()
+            live.logout.assert_called_once()
+        finally:
+            _imap_pool._connection = None
