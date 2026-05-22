@@ -45,6 +45,11 @@ SEARCH_DAYS = int(os.getenv("SEARCH_DAYS", "1"))  # デフォルト1日間（Gma
 # --- Batch limit per cycle (QUOTA ERROR対策) ---
 MAX_EMAILS_PER_CYCLE = int(os.getenv("MAX_EMAILS_PER_CYCLE", "10"))  # 1サイクルで処理する最大メール数
 
+# --- Error notification throttling ---
+# 同一タイプのエラー通知が短時間に連続発生した際の通知フラッドを防止する
+ERROR_NOTIFICATION_THROTTLE_SECONDS = int(os.getenv("ERROR_NOTIFICATION_THROTTLE_SECONDS", "600"))  # デフォルト10分
+_last_error_notification_times: dict = {}  # error_type -> last sent timestamp (monotonic seconds)
+
 # --- Known Indeed non-application email patterns (silently ignored) ---
 # These are legitimate Indeed emails that are NOT job applications.
 # Add new patterns here as they are discovered.
@@ -172,8 +177,24 @@ def save_processed_ids(processed_ids: Set[str]) -> bool:
         return False
 
 
-def notify_error_to_slack(message: str) -> None:
-    """重大なエラーを Slack Webhook に通知する"""
+def notify_error_to_slack(message: str, error_type: Optional[str] = None) -> None:
+    """重大なエラーを Slack Webhook に通知する。
+
+    error_type を指定した場合、同一タイプの通知が
+    ERROR_NOTIFICATION_THROTTLE_SECONDS（既定 10 分）以内に既に送られていれば
+    通知をスキップし、通知フラッドを防止する。
+    """
+    if error_type is not None:
+        now = time.monotonic()
+        last_ts = _last_error_notification_times.get(error_type)
+        if last_ts is not None and (now - last_ts) < ERROR_NOTIFICATION_THROTTLE_SECONDS:
+            log(
+                f"Throttled error notification (type={error_type}, "
+                f"elapsed={int(now - last_ts)}s < {ERROR_NOTIFICATION_THROTTLE_SECONDS}s): {message[:120]}"
+            )
+            return
+        _last_error_notification_times[error_type] = now
+
     webhook_url = SLACK_ERROR_WEBHOOK_URL or SLACK_WEBHOOK_URL_PROD
     if not webhook_url:
         log("ERROR: No Slack webhook URL configured; cannot notify error to Slack")
@@ -719,14 +740,14 @@ def check_mail_with_status() -> bool:
         return False  # Other IMAP error, also backoff
     except (imaplib.IMAP4.error, socket.timeout, socket.gaierror) as e:
         log(f"ERROR: IMAP/socket error: {e}")
-        notify_error_to_slack(f"Gmail IMAP connection error: {e}")
+        notify_error_to_slack(f"Gmail IMAP connection error: {e}", error_type="imap_connection")
         return True  # Not necessarily a quota error
     except Exception as e:
         log(f"ERROR: {e}")
         # Check if it's a quota-related error
         if "OVERQUOTA" in str(e):
             return False  # Quota error, trigger backoff
-        notify_error_to_slack(f"Gmail polling error: {e}")
+        notify_error_to_slack(f"Gmail polling error: {e}", error_type="gmail_polling")
         return True  # Non-quota error, don't backoff excessively
 
 
