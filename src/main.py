@@ -45,6 +45,14 @@ SEARCH_DAYS = int(os.getenv("SEARCH_DAYS", "1"))  # デフォルト1日間（Gma
 # --- Batch limit per cycle (QUOTA ERROR対策) ---
 MAX_EMAILS_PER_CYCLE = int(os.getenv("MAX_EMAILS_PER_CYCLE", "10"))  # 1サイクルで処理する最大メール数
 
+# --- IMAP robustness ---
+IMAP_TIMEOUT_SECONDS = int(os.getenv("IMAP_TIMEOUT_SECONDS", "30"))
+IMAP_RETRY_BACKOFFS = [5, 10, 20]  # 接続失敗時のexponential backoff（秒）。長さがリトライ回数。
+
+# --- Error notification deduplication ---
+ERROR_NOTIFICATION_DEDUP_SECONDS = int(os.getenv("ERROR_NOTIFICATION_DEDUP_SECONDS", "600"))  # 同一エラーの再通知抑制（10分）
+_last_error_notification_ts: dict = {}  # dedup_key -> last unix timestamp
+
 # --- Known Indeed non-application email patterns (silently ignored) ---
 # These are legitimate Indeed emails that are NOT job applications.
 # Add new patterns here as they are discovered.
@@ -172,8 +180,23 @@ def save_processed_ids(processed_ids: Set[str]) -> bool:
         return False
 
 
-def notify_error_to_slack(message: str) -> None:
-    """重大なエラーを Slack Webhook に通知する"""
+def notify_error_to_slack(message: str, dedup_key: Optional[str] = None) -> None:
+    """重大なエラーを Slack Webhook に通知する。
+
+    Args:
+        message: 通知メッセージ
+        dedup_key: 重複抑止用キー。指定時、同一キーで前回通知から
+            ERROR_NOTIFICATION_DEDUP_SECONDS（既定600秒=10分）以内ならスキップする。
+            省略時は message 本文を dedup key として使う。
+    """
+    key = dedup_key if dedup_key is not None else message
+    now_ts = time.time()
+    last_ts = _last_error_notification_ts.get(key, 0.0)
+    if now_ts - last_ts < ERROR_NOTIFICATION_DEDUP_SECONDS:
+        log(f"Skipping duplicate error notification within {ERROR_NOTIFICATION_DEDUP_SECONDS}s window: key={key[:80]}")
+        return
+    _last_error_notification_ts[key] = now_ts
+
     webhook_url = SLACK_ERROR_WEBHOOK_URL or SLACK_WEBHOOK_URL_PROD
     if not webhook_url:
         log("ERROR: No Slack webhook URL configured; cannot notify error to Slack")
@@ -435,12 +458,17 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
 # --- IMAP Connection ---
 @contextmanager
 def imap_connection():
-    """Context manager for IMAP connection with timeout protection."""
+    """Context manager for IMAP connection with timeout protection.
+
+    IMAP4_SSL に timeout=IMAP_TIMEOUT_SECONDS（既定30秒）を明示的に指定し、
+    Pythonランタイムの socket デフォルトタイムアウトにも同値を設定して
+    login/select/search/fetch 各操作で I/O が無期限ブロックしないようにする。
+    """
     old_timeout = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(30)
+    socket.setdefaulttimeout(IMAP_TIMEOUT_SECONDS)
     mail = None
     try:
-        mail = imaplib.IMAP4_SSL(GMAIL_IMAP_HOST)
+        mail = imaplib.IMAP4_SSL(GMAIL_IMAP_HOST, timeout=IMAP_TIMEOUT_SECONDS)
         mail.login(GMAIL_IMAP_USER, GMAIL_IMAP_PASSWORD)
         mail.select("INBOX", readonly=True)
         yield mail
@@ -628,8 +656,88 @@ def get_gm_msgid_lightweight(mail: imaplib.IMAP4_SSL, uid: str) -> Optional[str]
     return None
 
 
+def _check_mail_attempt(processed_ids: Set[str]) -> None:
+    """1サイクル分のメール処理本体。接続/IMAPエラーは呼び出し側でリトライさせるため再送出する。
+
+    成功・部分成功・スキップは全て return（None）で抜ける。
+    """
+    with imap_connection() as mail:
+        since_date = (datetime.now(timezone.utc) - timedelta(days=SEARCH_DAYS)).strftime("%d-%b-%Y")
+
+        # Use UID SEARCH for stable identifiers
+        status, data = mail.uid("search", None, "SINCE", since_date)
+        if status != "OK":
+            log(f"ERROR: UID SEARCH failed with status: {status}")
+            return
+        uid_list = data[0].split()
+        log(f"Emails in last {SEARCH_DAYS} days: {len(uid_list)}")
+
+        # Phase 1: Quick filter by UID (for emails we've seen before)
+        uids_to_check = []
+        for uid in uid_list:
+            uid_str = uid.decode() if isinstance(uid, bytes) else uid
+            if f"uid:{uid_str}" not in processed_ids:
+                uids_to_check.append(uid)
+
+        if not uids_to_check:
+            return  # All emails already processed
+
+        log(f"UIDs not in cache: {len(uids_to_check)}")
+
+        # Phase 2: Lightweight check - fetch only X-GM-MSGID to filter by gm: prefix
+        # This avoids full FETCH for emails that are already processed but missing uid: entry
+        truly_new_uids = []
+        uids_to_mark = []  # UIDs that are already processed but need uid: entry added
+
+        for uid in uids_to_check:
+            uid_str = uid.decode() if isinstance(uid, bytes) else uid
+            gm_id = get_gm_msgid_lightweight(mail, uid_str)
+            if gm_id and gm_id in processed_ids:
+                # Already processed (has gm: entry), just need to add uid: entry
+                uids_to_mark.append((uid_str, gm_id))
+            else:
+                # Truly new email, needs full processing
+                truly_new_uids.append(uid)
+
+        # Add uid: entries for already-processed emails (bootstrap)
+        if uids_to_mark:
+            log(f"Bootstrapping {len(uids_to_mark)} UIDs for already-processed emails")
+            for uid_str, gm_id in uids_to_mark:
+                processed_ids.add(f"uid:{uid_str}")
+            if not save_processed_ids(processed_ids):
+                log("ERROR: Failed to save bootstrapped UIDs")
+                return
+
+        if truly_new_uids:
+            total_new = len(truly_new_uids)
+            # QUOTA ERROR対策: 1サイクルで処理するメール数を制限する
+            batch = truly_new_uids[:MAX_EMAILS_PER_CYCLE]
+            if total_new > MAX_EMAILS_PER_CYCLE:
+                log(f"Truly new emails to process: {total_new} (processing {MAX_EMAILS_PER_CYCLE} this cycle, {total_new - MAX_EMAILS_PER_CYCLE} deferred)")
+            else:
+                log(f"Truly new emails to process: {total_new}")
+
+            # Phase 3: Full processing for truly new emails only (batch limited)
+            for uid in batch:
+                uid_str = uid.decode() if isinstance(uid, bytes) else uid
+                unique_id = process_mail_by_uid(mail, uid, processed_ids)
+                if unique_id:
+                    # Store both the unique_id (gm: or mid:) and the uid for efficient filtering
+                    processed_ids.add(unique_id)
+                    processed_ids.add(f"uid:{uid_str}")
+                    # Save immediately after each email to prevent duplicates on crash
+                    if not save_processed_ids(processed_ids):
+                        # If save fails, stop processing to prevent more potential duplicates
+                        log("ERROR: Stopping mail processing due to save failure")
+                        return
+
+
 def check_mail_with_status() -> bool:
-    """Check mailbox for new applications. Returns True if successful, False if quota/error."""
+    """Check mailbox for new applications. Returns True if successful, False if quota/error.
+
+    IMAP 接続/読み取りタイムアウトに対しては IMAP_RETRY_BACKOFFS（5,10,20秒）で
+    リトライし、全て失敗した時のみ notify_error_to_slack() で通知する。
+    """
     try:
         processed_ids, load_success = load_processed_ids()
 
@@ -638,77 +746,31 @@ def check_mail_with_status() -> bool:
             log("ERROR: Skipping mail check due to corrupted processed IDs file")
             return True  # Not a quota error, don't backoff
 
-        with imap_connection() as mail:
-            since_date = (datetime.now(timezone.utc) - timedelta(days=SEARCH_DAYS)).strftime("%d-%b-%Y")
-
-            # Use UID SEARCH for stable identifiers
-            status, data = mail.uid("search", None, "SINCE", since_date)
-            if status != "OK":
-                log(f"ERROR: UID SEARCH failed with status: {status}")
+        total_attempts = len(IMAP_RETRY_BACKOFFS) + 1  # initial + len(backoffs) retries
+        last_conn_error: Optional[BaseException] = None
+        for attempt_idx in range(total_attempts):
+            try:
+                _check_mail_attempt(processed_ids)
                 return True
-            uid_list = data[0].split()
-            log(f"Emails in last {SEARCH_DAYS} days: {len(uid_list)}")
-
-            # Phase 1: Quick filter by UID (for emails we've seen before)
-            uids_to_check = []
-            for uid in uid_list:
-                uid_str = uid.decode() if isinstance(uid, bytes) else uid
-                if f"uid:{uid_str}" not in processed_ids:
-                    uids_to_check.append(uid)
-
-            if not uids_to_check:
-                return True  # All emails already processed
-
-            log(f"UIDs not in cache: {len(uids_to_check)}")
-
-            # Phase 2: Lightweight check - fetch only X-GM-MSGID to filter by gm: prefix
-            # This avoids full FETCH for emails that are already processed but missing uid: entry
-            truly_new_uids = []
-            uids_to_mark = []  # UIDs that are already processed but need uid: entry added
-
-            for uid in uids_to_check:
-                uid_str = uid.decode() if isinstance(uid, bytes) else uid
-                gm_id = get_gm_msgid_lightweight(mail, uid_str)
-                if gm_id and gm_id in processed_ids:
-                    # Already processed (has gm: entry), just need to add uid: entry
-                    uids_to_mark.append((uid_str, gm_id))
-                else:
-                    # Truly new email, needs full processing
-                    truly_new_uids.append(uid)
-
-            # Add uid: entries for already-processed emails (bootstrap)
-            if uids_to_mark:
-                log(f"Bootstrapping {len(uids_to_mark)} UIDs for already-processed emails")
-                for uid_str, gm_id in uids_to_mark:
-                    processed_ids.add(f"uid:{uid_str}")
-                if not save_processed_ids(processed_ids):
-                    log("ERROR: Failed to save bootstrapped UIDs")
-                    return True  # Not a quota error
-
-            if truly_new_uids:
-                total_new = len(truly_new_uids)
-                # QUOTA ERROR対策: 1サイクルで処理するメール数を制限する
-                batch = truly_new_uids[:MAX_EMAILS_PER_CYCLE]
-                if total_new > MAX_EMAILS_PER_CYCLE:
-                    log(f"Truly new emails to process: {total_new} (processing {MAX_EMAILS_PER_CYCLE} this cycle, {total_new - MAX_EMAILS_PER_CYCLE} deferred)")
-                else:
-                    log(f"Truly new emails to process: {total_new}")
-
-                # Phase 3: Full processing for truly new emails only (batch limited)
-                for uid in batch:
-                    uid_str = uid.decode() if isinstance(uid, bytes) else uid
-                    unique_id = process_mail_by_uid(mail, uid, processed_ids)
-                    if unique_id:
-                        # Store both the unique_id (gm: or mid:) and the uid for efficient filtering
-                        processed_ids.add(unique_id)
-                        processed_ids.add(f"uid:{uid_str}")
-                        # Save immediately after each email to prevent duplicates on crash
-                        if not save_processed_ids(processed_ids):
-                            # If save fails, stop processing to prevent more potential duplicates
-                            log("ERROR: Stopping mail processing due to save failure")
-                            return True  # Not a quota error
-
-        return True  # Success
+            except imaplib.IMAP4.abort:
+                # quota / abort は別ハンドラへ
+                raise
+            except (imaplib.IMAP4.error, socket.timeout, socket.gaierror, TimeoutError, ConnectionError, OSError) as e:
+                last_conn_error = e
+                log(f"WARN: IMAP connection/read error on attempt {attempt_idx + 1}/{total_attempts}: {e}")
+                if attempt_idx < len(IMAP_RETRY_BACKOFFS):
+                    backoff = IMAP_RETRY_BACKOFFS[attempt_idx]
+                    log(f"Retrying IMAP in {backoff}s (next attempt {attempt_idx + 2}/{total_attempts})...")
+                    time.sleep(backoff)
+                    continue
+                # All retries exhausted
+                log(f"ERROR: IMAP connection failed after {total_attempts} attempts: {last_conn_error}")
+                notify_error_to_slack(
+                    f"Gmail IMAP connection error (after {total_attempts} attempts): {last_conn_error}",
+                    dedup_key="imap_connection_error",
+                )
+                return True  # Not necessarily a quota error
+        return True
 
     except imaplib.IMAP4.abort as e:
         error_msg = str(e)
@@ -717,16 +779,12 @@ def check_mail_with_status() -> bool:
             return False  # Quota error, trigger backoff
         log(f"ERROR: IMAP abort: {e}")
         return False  # Other IMAP error, also backoff
-    except (imaplib.IMAP4.error, socket.timeout, socket.gaierror) as e:
-        log(f"ERROR: IMAP/socket error: {e}")
-        notify_error_to_slack(f"Gmail IMAP connection error: {e}")
-        return True  # Not necessarily a quota error
     except Exception as e:
         log(f"ERROR: {e}")
         # Check if it's a quota-related error
         if "OVERQUOTA" in str(e):
             return False  # Quota error, trigger backoff
-        notify_error_to_slack(f"Gmail polling error: {e}")
+        notify_error_to_slack(f"Gmail polling error: {e}", dedup_key="gmail_polling_error")
         return True  # Non-quota error, don't backoff excessively
 
 
