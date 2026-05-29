@@ -342,33 +342,50 @@ def extract_applicant_name_from_html(html: str) -> Optional[str]:
     return None
 
 
-def shorten_url(url: str) -> str:
-    """Shorten URL using is.gd (primary) and TinyURL (fallback).
-
-    is.gd is preferred because TinyURL has been observed to time out
-    from Railway (see commit a5b0e85 history). Returns the original URL
-    if both shorteners fail.
-    """
-    if not url:
-        return url
-    # Primary: is.gd
+def _shorten_via_tinyurl(encoded_url: str) -> Optional[str]:
+    """Try to shorten a URL via TinyURL. Returns shortened URL or None."""
     try:
-        api = "https://is.gd/create.php?format=simple&url=" + requests.utils.quote(url, safe="")
+        api = "https://tinyurl.com/api-create.php?url=" + encoded_url
+        resp = requests.get(api, timeout=8)
+        if resp.status_code == 200 and resp.text.strip().startswith("http"):
+            return resp.text.strip()
+        log(f"WARN: TinyURL shorten returned status={resp.status_code}")
+    except Exception as e:
+        log(f"WARN: TinyURL shorten failed: {e}")
+    return None
+
+
+def _shorten_via_isgd(encoded_url: str) -> Optional[str]:
+    """Try to shorten a URL via is.gd. Returns shortened URL or None."""
+    try:
+        api = "https://is.gd/create.php?format=simple&url=" + encoded_url
         resp = requests.get(api, timeout=5)
         if resp.status_code == 200 and resp.text.strip().startswith("http"):
             return resp.text.strip()
         log(f"WARN: is.gd shorten returned status={resp.status_code} body={resp.text[:80]}")
     except Exception as e:
         log(f"WARN: is.gd shorten failed: {e}")
-    # Fallback: TinyURL
-    try:
-        api = "https://tinyurl.com/api-create.php?url=" + requests.utils.quote(url, safe="")
-        resp = requests.get(api, timeout=5)
-        if resp.status_code == 200 and resp.text.strip().startswith("http"):
-            return resp.text.strip()
-        log(f"WARN: TinyURL shorten returned status={resp.status_code}")
-    except Exception as e:
-        log(f"WARN: TinyURL shorten failed: {e}")
+    return None
+
+
+def shorten_url(url: str) -> str:
+    """Shorten URL using TinyURL and is.gd with domain-aware ordering.
+
+    is.gd blocks Indeed domains entirely, so for Indeed URLs we use
+    TinyURL as primary. For other URLs, is.gd is preferred (faster).
+    Returns the original URL if all shorteners fail.
+    """
+    if not url:
+        return url
+    encoded = requests.utils.quote(url, safe="")
+    is_indeed = "indeed" in url.lower()
+    if is_indeed:
+        # is.gd blocks all *.indeed.com domains → TinyURL first
+        result = _shorten_via_tinyurl(encoded) or _shorten_via_isgd(encoded)
+    else:
+        result = _shorten_via_isgd(encoded) or _shorten_via_tinyurl(encoded)
+    if result:
+        return result
     log("WARN: Both URL shorteners failed, using original URL")
     return url
 
