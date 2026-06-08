@@ -20,6 +20,7 @@ from src.main import (
     extract_indeed_url,
     determine_source,
     is_indeed_non_application_email,
+    is_from_indeed,
     parse_fetch_response,
     load_processed_ids,
     save_processed_ids,
@@ -198,6 +199,37 @@ class TestIsIndeedNonApplicationEmail:
             "応募者からのメッセージが届いています",
         ]:
             assert is_indeed_non_application_email(subject) is False, subject
+
+
+class TestIsFromIndeed:
+    """送信者が本当にIndeedドメインかを実アドレスで判定する（件名/表示名の "indeed" では判定しない）。"""
+
+    def test_genuine_indeed_senders(self):
+        for frm in [
+            "Indeed <noreply@indeed.com>",
+            "noreply@indeed.com",
+            "Indeed Apply <apply@indeedemail.com>",
+            "Indeed <no-reply@mail.indeed.com>",  # サブドメインも許可
+        ]:
+            assert is_from_indeed(frm) is True, frm
+
+    def test_display_name_only_indeed_is_not_indeed(self):
+        # 表示名だけ "Indeed"、実アドレスは employer ドメイン → Indeed扱いしない
+        assert is_from_indeed("'Indeed' via 株式会社日本交通誘導 <info@kotsuyudo.com>") is False
+
+    def test_github_and_others_are_not_indeed(self):
+        for frm in [
+            "GitHub <notifications@github.com>",
+            "no-reply@accounts.google.com",
+            "info@example.com",
+            "",
+        ]:
+            assert is_from_indeed(frm) is False, frm
+
+    def test_lookalike_domain_is_not_indeed(self):
+        # indeed.com.evil.com / notindeed.com のような偽装ドメインを弾く
+        assert is_from_indeed("Indeed <noreply@indeed.com.evil.com>") is False
+        assert is_from_indeed("x@notindeed.com") is False
 
 
 class TestParseFetchResponse:
@@ -639,3 +671,84 @@ def test_process_mail_by_uid_indeed_login_code_no_false_alert(tmp_path):
     mock_line.assert_not_called()
     # 再通知ループ防止のため処理済みマークして返す
     assert result is not None, "非応募メールは処理済みマークして返すべき"
+
+
+def _build_mail_mock(subject, from_header, uid_num, gm_msgid):
+    """process_mail_by_uid テスト用の IMAP モックを組み立てるヘルパー。"""
+    import email
+    from unittest.mock import MagicMock
+    msg = email.message.Message()
+    msg["Subject"] = subject
+    msg["From"] = from_header
+    msg.set_payload("body")
+    raw_bytes = msg.as_bytes()
+    mock_mail = MagicMock()
+    mock_mail.uid.return_value = (
+        "OK",
+        [(f"{uid_num} (X-GM-MSGID {gm_msgid} UID {uid_num})".encode(), raw_bytes)],
+    )
+    return mock_mail
+
+
+def test_process_mail_by_uid_github_notification_no_false_alert():
+    """件名に "indeed"（ブランチ名等）を含むGitHub通知メールで誤アラートを出さないこと（本件の回帰）。
+
+    送信者が github.com である以上、件名に "indeed" の文字列が含まれていても Indeed 扱いせず、
+    静かにスキップする（notify_error_to_slack を呼ばない）。
+    """
+    from unittest.mock import patch
+    mock_mail = _build_mail_mock(
+        subject="[tkgathr2/recruit] Run failed: Tests - fix/indeed-login-auth-email-misclassify",
+        from_header="GitHub <notifications@github.com>",
+        uid_num=10,
+        gm_msgid="1010101010101010101",
+    )
+    with patch("src.main.notify_error_to_slack") as mock_alert, \
+         patch("src.main.notify_slack_with_retry", return_value=True) as mock_slack, \
+         patch("src.main.notify_line_with_retry", return_value=True) as mock_line:
+        result = process_mail_by_uid(mock_mail, b"10", set())
+
+    mock_alert.assert_not_called()   # 誤アラートを出さない（最重要）
+    mock_slack.assert_not_called()
+    mock_line.assert_not_called()
+    assert result is not None, "対象外メールは処理済みマークして返すべき"
+
+
+def test_process_mail_by_uid_real_indeed_application_is_processed():
+    """本物のIndeed応募メール（From=indeed.com・応募件名）は従来どおり通知される（取りこぼし厳禁）。"""
+    from unittest.mock import patch
+    mock_mail = _build_mail_mock(
+        subject="新しい応募者のお知らせ - 山田太郎",
+        from_header="Indeed <noreply@indeed.com>",
+        uid_num=11,
+        gm_msgid="1111111111111111111",
+    )
+    with patch("src.main.notify_error_to_slack") as mock_alert, \
+         patch("src.main.notify_slack_with_retry", return_value=True) as mock_slack, \
+         patch("src.main.notify_line_with_retry", return_value=True) as mock_line:
+        result = process_mail_by_uid(mock_mail, b"11", set())
+
+    mock_alert.assert_not_called()
+    mock_slack.assert_called_once()   # 応募として通知される
+    mock_line.assert_called_once()
+    assert result is not None
+
+
+def test_process_mail_by_uid_indeed_unknown_subject_still_alerts():
+    """送信者が本物のIndeed(indeed.com)で件名が未知の場合のみ、フォーマット変更の安全網アラートを出す。"""
+    from unittest.mock import patch
+    mock_mail = _build_mail_mock(
+        subject="重要なお知らせ（新フォーマット）",  # 応募でも既知の非応募でもない
+        from_header="Indeed <noreply@indeed.com>",
+        uid_num=12,
+        gm_msgid="1212121212121212121",
+    )
+    with patch("src.main.notify_error_to_slack") as mock_alert, \
+         patch("src.main.notify_slack_with_retry", return_value=True) as mock_slack, \
+         patch("src.main.notify_line_with_retry", return_value=True) as mock_line:
+        result = process_mail_by_uid(mock_mail, b"12", set())
+
+    mock_alert.assert_called_once()   # 安全網は本物のIndeedドメインに対してのみ働く
+    mock_slack.assert_not_called()
+    mock_line.assert_not_called()
+    assert result is not None
