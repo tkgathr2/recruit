@@ -19,6 +19,7 @@ from src.main import (
     extract_html,
     extract_indeed_url,
     determine_source,
+    is_indeed_non_application_email,
     parse_fetch_response,
     load_processed_ids,
     save_processed_ids,
@@ -28,8 +29,6 @@ from src.main import (
     migrate_old_id_format,
     is_test_mode,
     add_test_prefix,
-    notify_slack,
-    notify_line,
     notify_slack_with_retry,
     notify_line_with_retry,
     process_mail_by_uid,
@@ -148,6 +147,57 @@ class TestDetermineSource:
         source, url = determine_source("Random email subject")
         assert source is None
         assert url is None
+
+    def test_indeed_subject_variants(self):
+        # 件名フォーマットの揺れに追従（応募側は広め）
+        assert determine_source("新しい応募者が1名います")[0] == "indeed"
+        assert determine_source("【Indeed】応募がありました")[0] == "indeed"
+        assert determine_source("応募者からのメッセージが届いています")[0] == "indeed"
+
+    def test_indeed_login_auth_is_not_application(self):
+        # 2段階認証のログインコードメールを応募として誤分類しないこと（本件の回帰）
+        subject = "認証コード (000000) を入力してIndeedにログインしてください"
+        source, url = determine_source(subject)
+        assert source is None
+        assert url is None
+
+
+class TestIsIndeedNonApplicationEmail:
+    """Indeed由来の非応募メールを正しく除外し、本物の応募は除外しないことを保証する回帰テスト。"""
+
+    def test_login_auth_code_email_is_non_application(self):
+        # 本件の事象: 2段階認証のログインコードメール → 非応募として静かにスキップ
+        subject = "認証コード (000000) を入力してIndeedにログインしてください"
+        assert is_indeed_non_application_email(subject) is True
+
+    def test_security_and_account_emails_are_non_application(self):
+        for subject in [
+            "確認コードをご確認ください",
+            "ログインリクエストがありました",
+            "新しいデバイスからのサインインを検知しました",
+            "パスワードの再設定を完了してください",
+            "二段階認証を有効にしてください",
+        ]:
+            assert is_indeed_non_application_email(subject) is True, subject
+
+    def test_recommendation_and_billing_emails_are_non_application(self):
+        for subject in [
+            "あなたにオススメ求人があります",
+            "求人への応募状況をお知らせします",
+            "Indeed請求のお知らせ",
+            "営業職 @ 株式会社サンプル",
+        ]:
+            assert is_indeed_non_application_email(subject) is True, subject
+
+    def test_real_application_email_is_not_excluded(self):
+        # 最重要: 本物の応募通知を絶対に除外しない（取りこぼし厳禁）
+        for subject in [
+            "新しい応募者のお知らせ - 山田太郎",
+            "新しい応募者が1名います",
+            "応募がありました",
+            "応募者からのメッセージが届いています",
+        ]:
+            assert is_indeed_non_application_email(subject) is False, subject
 
 
 class TestParseFetchResponse:
@@ -352,191 +402,10 @@ class TestExtractHtmlEdgeCases:
         assert result == ""
 
 
-class TestNotifySlack:
-    @patch('src.main.requests.post')
-    @patch('src.main.get_slack_webhook_url')
-    @patch('src.main.SLACK_MENTION_ID_1', 'U123')
-    @patch('src.main.SLACK_MENTION_ID_2', 'U456')
-    @patch('src.main.is_test_mode', return_value=False)
-    def test_notify_slack_success(self, mock_test_mode, mock_get_url, mock_post):
-        """Test successful Slack notification"""
-        mock_get_url.return_value = "https://hooks.slack.com/test"
-        mock_post.return_value = MagicMock(status_code=200)
-        
-        notify_slack("indeed", "山田太郎", "https://indeed.com/apply/123")
-        
-        mock_post.assert_called_once()
-        call_args = mock_post.call_args
-        assert "山田太郎" in call_args[1]['json']['text']
-        assert "Indeed応募" in call_args[1]['json']['text']
-
-    @patch('src.main.get_slack_webhook_url')
-    def test_notify_slack_no_webhook(self, mock_get_url):
-        """Test Slack notification when webhook URL is not set"""
-        mock_get_url.return_value = None
-        
-        # Should not raise an exception
-        notify_slack("indeed", "山田太郎", "https://indeed.com/apply/123")
-
-    @patch('src.main.requests.post')
-    @patch('src.main.get_slack_webhook_url')
-    @patch('src.main.notify_error_to_slack')
-    def test_notify_slack_api_error(self, mock_error, mock_get_url, mock_post):
-        """Test Slack notification when API returns error"""
-        mock_get_url.return_value = "https://hooks.slack.com/test"
-        mock_post.return_value = MagicMock(status_code=500, text="Internal Server Error")
-        
-        notify_slack("indeed", "山田太郎", "https://indeed.com/apply/123")
-        
-        mock_error.assert_called_once()
-
-    @patch('src.main.requests.post')
-    @patch('src.main.get_slack_webhook_url')
-    @patch('src.main.notify_error_to_slack')
-    def test_notify_slack_exception(self, mock_error, mock_get_url, mock_post):
-        """Test Slack notification when request raises exception"""
-        mock_get_url.return_value = "https://hooks.slack.com/test"
-        mock_post.side_effect = Exception("Connection error")
-        
-        notify_slack("indeed", "山田太郎", "https://indeed.com/apply/123")
-        
-        mock_error.assert_called_once()
-
-
-class TestNotifyLine:
-    @patch('src.main.requests.post')
-    @patch('src.main.get_line_to_id')
-    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
-    @patch('src.main.LINE_MENTION_ID_1', 'U123')
-    @patch('src.main.LINE_MENTION_ID_2', 'U456')
-    @patch('src.main.is_test_mode', return_value=False)
-    def test_notify_line_success_with_mentions(self, mock_test_mode, mock_get_id, mock_post):
-        """Test successful LINE notification with mentions"""
-        mock_get_id.return_value = "group_id"
-        mock_post.return_value = MagicMock(status_code=200)
-        
-        notify_line("indeed", "山田太郎", "https://indeed.com/apply/123")
-        
-        mock_post.assert_called_once()
-        call_args = mock_post.call_args
-        body = call_args[1]['json']
-        
-        # Check that text_v2 contains placeholders
-        assert "{mention1}" in body['messages'][0]['text']
-        assert "{mention2}" in body['messages'][0]['text']
-        
-        # Check that substitution contains both mentions
-        assert "mention1" in body['messages'][0]['substitution']
-        assert "mention2" in body['messages'][0]['substitution']
-
-    @patch('src.main.requests.post')
-    @patch('src.main.get_line_to_id')
-    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
-    @patch('src.main.LINE_MENTION_ID_1', 'U123')
-    @patch('src.main.LINE_MENTION_ID_2', None)
-    @patch('src.main.is_test_mode', return_value=False)
-    def test_notify_line_url_opens_in_external_browser(self, mock_test_mode, mock_get_id, mock_post):
-        """Test that LINE notification URL includes openExternalBrowser=1 parameter"""
-        mock_get_id.return_value = "group_id"
-        mock_post.return_value = MagicMock(status_code=200)
-        
-        notify_line("indeed", "山田太郎", "https://indeed.com/apply/123")
-        
-        call_args = mock_post.call_args
-        body = call_args[1]['json']
-        text = body['messages'][0]['text']
-        
-        assert "openExternalBrowser=1" in text
-        assert "https://indeed.com/apply/123?openExternalBrowser=1" in text
-
-    @patch('src.main.requests.post')
-    @patch('src.main.get_line_to_id')
-    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
-    @patch('src.main.LINE_MENTION_ID_1', 'U123')
-    @patch('src.main.LINE_MENTION_ID_2', None)
-    @patch('src.main.is_test_mode', return_value=False)
-    def test_notify_line_url_with_query_params_external_browser(self, mock_test_mode, mock_get_id, mock_post):
-        """Test that openExternalBrowser=1 uses & when URL already has query params"""
-        mock_get_id.return_value = "group_id"
-        mock_post.return_value = MagicMock(status_code=200)
-        
-        notify_line("indeed", "山田太郎", "https://indeed.com/apply/123?ref=email")
-        
-        call_args = mock_post.call_args
-        body = call_args[1]['json']
-        text = body['messages'][0]['text']
-        
-        assert "https://indeed.com/apply/123?ref=email&openExternalBrowser=1" in text
-
-    @patch('src.main.requests.post')
-    @patch('src.main.get_line_to_id')
-    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
-    @patch('src.main.LINE_MENTION_ID_1', None)
-    @patch('src.main.LINE_MENTION_ID_2', None)
-    @patch('src.main.is_test_mode', return_value=False)
-    @patch('src.main.log')
-    def test_notify_line_without_mentions(self, mock_log, mock_test_mode, mock_get_id, mock_post):
-        """Test LINE notification without mention IDs - should not include placeholders"""
-        mock_get_id.return_value = "group_id"
-        mock_post.return_value = MagicMock(status_code=200)
-        
-        notify_line("indeed", "山田太郎", "https://indeed.com/apply/123")
-        
-        mock_post.assert_called_once()
-        call_args = mock_post.call_args
-        body = call_args[1]['json']
-        
-        # After fix: text_v2 should NOT contain placeholders when IDs are not set
-        assert "{mention1}" not in body['messages'][0]['text']
-        assert "{mention2}" not in body['messages'][0]['text']
-        
-        # Substitution should be empty
-        assert body['messages'][0]['substitution'] == {}
-
-    @patch('src.main.get_line_to_id')
-    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', None)
-    def test_notify_line_no_token(self, mock_get_id):
-        """Test LINE notification when token is not set"""
-        mock_get_id.return_value = "group_id"
-        
-        # Should not raise an exception
-        notify_line("indeed", "山田太郎", "https://indeed.com/apply/123")
-
-    @patch('src.main.requests.post')
-    @patch('src.main.get_line_to_id')
-    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
-    @patch('src.main.notify_error_to_slack')
-    @patch('src.main.log')
-    def test_notify_line_api_error(self, mock_log, mock_error, mock_get_id, mock_post):
-        """Test LINE notification when API returns error"""
-        mock_get_id.return_value = "group_id"
-        mock_post.return_value = MagicMock(status_code=500, text="Internal Server Error")
-        
-        notify_line("indeed", "山田太郎", "https://indeed.com/apply/123")
-        
-        mock_error.assert_called_once()
-
-    @patch('src.main.requests.post')
-    @patch('src.main.get_line_to_id')
-    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
-    @patch('src.main.notify_error_to_slack')
-    @patch('src.main.log')
-    def test_notify_line_exception(self, mock_log, mock_error, mock_get_id, mock_post):
-        """Test LINE notification when request raises exception"""
-        mock_get_id.return_value = "group_id"
-        mock_post.side_effect = Exception("Connection error")
-        
-        notify_line("indeed", "山田太郎", "https://indeed.com/apply/123")
-        
-        mock_error.assert_called_once()
-
-
 class TestNotifySlackWithRetry:
     @patch('src.main.time.sleep')
     @patch('src.main.requests.post')
     @patch('src.main.get_slack_webhook_url')
-    @patch('src.main.SLACK_MENTION_ID_1', 'U123')
-    @patch('src.main.SLACK_MENTION_ID_2', 'U456')
     @patch('src.main.is_test_mode', return_value=False)
     def test_retry_on_failure_then_success(self, mock_test_mode, mock_get_url, mock_post, mock_sleep):
         """Test that retry works when first attempt fails but second succeeds"""
@@ -639,19 +508,51 @@ class TestNotifyLineWithRetry:
         ]
         
         result = notify_line_with_retry("indeed", "山田太郎", "https://indeed.com/apply/123")
-        
+
         assert result == True
         assert mock_post.call_count == 2
 
+    @patch('src.main.time.sleep')
+    @patch('src.main.shorten_url', side_effect=lambda u: u)
+    @patch('src.main.requests.post')
+    @patch('src.main.get_line_to_id')
+    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
+    @patch('src.main.is_test_mode', return_value=False)
+    def test_url_opens_in_external_browser(self, mock_test_mode, mock_get_id, mock_post, mock_shorten, mock_sleep):
+        """LINE通知のURLに openExternalBrowser=1 を付与すること（LINE内ブラウザのOAuthブロック回避）。"""
+        mock_get_id.return_value = "group_id"
+        mock_post.return_value = MagicMock(status_code=200)
+
+        notify_line_with_retry("indeed", "山田太郎", "https://indeed.com/apply/123")
+
+        body = mock_post.call_args[1]['json']
+        text = body['messages'][0]['text']
+        assert "https://indeed.com/apply/123?openExternalBrowser=1" in text
+
+    @patch('src.main.time.sleep')
+    @patch('src.main.shorten_url', side_effect=lambda u: u)
+    @patch('src.main.requests.post')
+    @patch('src.main.get_line_to_id')
+    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
+    @patch('src.main.is_test_mode', return_value=False)
+    def test_url_external_browser_with_existing_query(self, mock_test_mode, mock_get_id, mock_post, mock_shorten, mock_sleep):
+        """URLに既存クエリがある場合は & で openExternalBrowser=1 を連結すること。"""
+        mock_get_id.return_value = "group_id"
+        mock_post.return_value = MagicMock(status_code=200)
+
+        notify_line_with_retry("indeed", "山田太郎", "https://indeed.com/apply/123?ref=email")
+
+        text = mock_post.call_args[1]['json']['messages'][0]['text']
+        assert "https://indeed.com/apply/123?ref=email&openExternalBrowser=1" in text
 
 
 def test_process_mail_by_uid_both_notifications_fail(tmp_path):
-        """SlackとLINE両方の通知が失敗した場合、Noneを返して未処理にする"""
-        import email
-        from unittest.mock import MagicMock, patch
+    """SlackとLINE両方の通知が失敗した場合、Noneを返して未処理にする"""
+    import email
+    from unittest.mock import MagicMock, patch
 
     # ダミーのメールデータを作成
-        msg = email.message.Message()
+    msg = email.message.Message()
     msg["Subject"] = "Indeed: 新しい応募者のお知らせ - テスト太郎"
     msg["From"] = "テスト太郎 <test@example.com>"
     msg.set_payload("test body")
@@ -660,15 +561,15 @@ def test_process_mail_by_uid_both_notifications_fail(tmp_path):
     mock_mail = MagicMock()
     # UID fetchの戻り値を設定
     mock_mail.uid.return_value = (
-                "OK",
-                [(b"1 (X-GM-MSGID 9999999999999999999 UID 1)", raw_bytes)],
+        "OK",
+        [(b"1 (X-GM-MSGID 9999999999999999999 UID 1)", raw_bytes)],
     )
 
     processed_ids = set()
 
     with patch("src.main.notify_slack_with_retry", return_value=False) as mock_slack, \
          patch("src.main.notify_line_with_retry", return_value=False) as mock_line:
-                     result = process_mail_by_uid(mock_mail, b"1", processed_ids)
+        result = process_mail_by_uid(mock_mail, b"1", processed_ids)
 
     # 両方失敗 → None を返す（未処理扱い）
     assert result is None, "両通知失敗時はNoneを返すべき"
@@ -677,9 +578,9 @@ def test_process_mail_by_uid_both_notifications_fail(tmp_path):
 
 
 def test_process_mail_by_uid_slack_only_success(tmp_path):
-        """Slackだけ成功した場合、unique_idを返して処理済みにする"""
-        import email
-        from unittest.mock import MagicMock, patch
+    """Slackだけ成功した場合、unique_idを返して処理済みにする"""
+    import email
+    from unittest.mock import MagicMock, patch
 
     msg = email.message.Message()
     msg["Subject"] = "Indeed: 新しい応募者のお知らせ - テスト花子"
@@ -689,15 +590,52 @@ def test_process_mail_by_uid_slack_only_success(tmp_path):
 
     mock_mail = MagicMock()
     mock_mail.uid.return_value = (
-                "OK",
-                [(b"2 (X-GM-MSGID 8888888888888888888 UID 2)", raw_bytes)],
+        "OK",
+        [(b"2 (X-GM-MSGID 8888888888888888888 UID 2)", raw_bytes)],
     )
 
     processed_ids = set()
 
     with patch("src.main.notify_slack_with_retry", return_value=True), \
          patch("src.main.notify_line_with_retry", return_value=False):
-                     result = process_mail_by_uid(mock_mail, b"2", processed_ids)
+        result = process_mail_by_uid(mock_mail, b"2", processed_ids)
 
     # Slackだけ成功 → unique_idを返す（処理済みにする）
     assert result is not None, "少なくとも1つ成功時はunique_idを返すべき"
+
+
+def test_process_mail_by_uid_indeed_login_code_no_false_alert(tmp_path):
+    """Indeedの2段階認証ログインコードメールで誤アラートを出さないこと（本件の回帰）。
+
+    From に 'Indeed' を含む非応募メールでも、既知の非応募パターンなら
+    notify_error_to_slack を呼ばず、静かに処理済みマークするのが正しい挙動。
+    """
+    import email
+    from unittest.mock import MagicMock, patch
+
+    msg = email.message.Message()
+    msg["Subject"] = "認証コード (000000) を入力してIndeedにログインしてください"
+    msg["From"] = "'Indeed' via 株式会社日本交通誘導 <info@kotsuyudo.com>"
+    msg.set_payload("login code body")
+    raw_bytes = msg.as_bytes()
+
+    mock_mail = MagicMock()
+    mock_mail.uid.return_value = (
+        "OK",
+        [(b"3 (X-GM-MSGID 7777777777777777777 UID 3)", raw_bytes)],
+    )
+
+    processed_ids = set()
+
+    with patch("src.main.notify_error_to_slack") as mock_alert, \
+         patch("src.main.notify_slack_with_retry", return_value=True) as mock_slack, \
+         patch("src.main.notify_line_with_retry", return_value=True) as mock_line:
+        result = process_mail_by_uid(mock_mail, b"3", processed_ids)
+
+    # 誤アラートを出さない（最重要）
+    mock_alert.assert_not_called()
+    # 応募通知としても送らない（非応募なので）
+    mock_slack.assert_not_called()
+    mock_line.assert_not_called()
+    # 再通知ループ防止のため処理済みマークして返す
+    assert result is not None, "非応募メールは処理済みマークして返すべき"

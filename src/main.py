@@ -56,7 +56,11 @@ _last_error_notification_ts: dict = {}  # dedup_key -> last unix timestamp
 # --- Known Indeed non-application email patterns (silently ignored) ---
 # These are legitimate Indeed emails that are NOT job applications.
 # Add new patterns here as they are discovered.
+# Indeed由来だが「応募通知ではない」既知の件名パターン（=静かにスキップする除外リスト）。
+# 方針: 除外側は厳密に（応募通知の件名と衝突しない固有フレーズだけを入れる）。
+# 「新しい応募者のお知らせ」等の本物の応募通知の件名には絶対に含まれない語のみを列挙すること。
 INDEED_NON_APPLICATION_PATTERNS = [
+    # --- 求人レコメンド・掲載/パフォーマンス・課金系 ---
     "オススメ求人が",
     "求人への応募状況をお知らせします",
     "応募状況レポート",
@@ -68,6 +72,25 @@ INDEED_NON_APPLICATION_PATTERNS = [
     "求人広告の",
     "Indeedからのお知らせ",
     " @ ",  # 求人おすすめメール（「求人名 @ 会社名」形式）
+    # --- アカウント・ログイン・セキュリティ系（2段階認証コード等） ---
+    # 例:「認証コード (xxxxxx) を入力してIndeedにログインしてください」
+    "認証コード",
+    "確認コード",
+    "ログインコード",
+    "セキュリティコード",
+    "ワンタイムパスワード",
+    "ログインしてください",
+    "ログインリクエスト",
+    "サインイン",
+    "パスワードの再設定",
+    "パスワードをリセット",
+    "二段階認証",
+    "2段階認証",
+    "アカウントの保護",
+    "新しいデバイス",
+    # --- 配信設定・通知系 ---
+    "配信を停止",
+    "メール配信設定",
 ]
 
 
@@ -520,9 +543,20 @@ def parse_fetch_response(data: list) -> Tuple[Optional[str], Optional[bytes]]:
     return gm_msgid, body_data
 
 
+# Indeedの「応募通知」と判定する件名パターン（=応募側は広めに）。
+# Indeedが件名フォーマットを多少変えても応募を取りこぼさないよう、本物の応募通知に
+# 固有な語を複数登録する。除外リスト(INDEED_NON_APPLICATION_PATTERNS)と衝突しない語に限る。
+INDEED_APPLICATION_PATTERNS = [
+    "新しい応募者のお知らせ",
+    "新しい応募者",       # 「新しい応募者が1名います」等の言い回し変化に追従
+    "応募がありました",
+    "応募者からのメッセージ",
+]
+
+
 def determine_source(subject: str) -> Tuple[Optional[str], Optional[str]]:
     """Determine email source and default URL based on subject."""
-    if "新しい応募者のお知らせ" in subject:
+    if any(pattern in subject for pattern in INDEED_APPLICATION_PATTERNS):
         return "indeed", None
     elif "ジモティー" in subject:
         return "jimoty", "https://jmty.jp/web_mail/posts"
