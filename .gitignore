@@ -33,3 +33,4 @@ test_mode_test.ps1
 # Environment variables
 .env
 .env.local
+.omc/
