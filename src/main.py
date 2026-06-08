@@ -2,6 +2,7 @@
 import imaplib
 import email
 from email.header import decode_header
+from email.utils import parseaddr
 import os
 import socket
 import time
@@ -563,6 +564,31 @@ def determine_source(subject: str) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+# Indeed が実際にメールを送ってくるドメイン（送信者の「実アドレス」で判定する）。
+# 表示名に "Indeed" が入っているだけ（例: 'Indeed' via 株式会社○○ <info@employer.com>）や、
+# 件名に "indeed" の文字列を含むだけ（例: GitHub通知メールでブランチ名に indeed が入る）の
+# メールを Indeed 扱いして誤アラートを出さないために、ホワイトリスト方式で厳格に判定する。
+INDEED_SENDER_DOMAINS = (
+    "indeed.com",
+    "indeedemail.com",
+)
+
+
+def is_from_indeed(from_header: str) -> bool:
+    """送信者が本当に Indeed のドメインかを、表示名ではなく From の実アドレスで判定する。
+
+    例:
+      "Indeed <noreply@indeed.com>"                         -> True
+      "'Indeed' via 株式会社日本交通誘導 <info@kotsuyudo.com>" -> False（実アドレスは employer ドメイン）
+      "GitHub <notifications@github.com>"（件名に indeed）    -> False
+    """
+    addr = parseaddr(from_header or "")[1].lower()
+    if "@" not in addr:
+        return False
+    domain = addr.rsplit("@", 1)[-1]
+    return any(domain == d or domain.endswith("." + d) for d in INDEED_SENDER_DOMAINS)
+
+
 def is_indeed_non_application_email(subject: str) -> bool:
     """Check if an Indeed email is a known non-application type.
 
@@ -619,8 +645,11 @@ def process_mail_by_uid(
 
     source, default_url = determine_source(subject)
     if not source:
-        if "indeed" in from_header.lower() or "indeed" in subject.lower():
-            # Indeedからのメールだが応募通知ではない
+        # 「Indeed扱い」は送信者の実ドメインだけで判定する（件名/表示名の "indeed" 文字列では判定しない）。
+        # これにより、件名に "indeed" を含むだけのGitHub通知メールや、表示名だけ "Indeed" の
+        # 認証コード/セキュリティ通知（実アドレスは別ドメイン）に対して誤アラートを出さない。
+        if is_from_indeed(from_header):
+            # 送信者は本当にIndeedだが応募通知ではない
             if is_indeed_non_application_email(subject):
                 # 既知の非応募パターン（求人レコメンド、応募状況レポート等）→ 静かにスキップ
                 log(f"Skip Indeed non-application mail: {subject[:80]}")
