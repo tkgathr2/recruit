@@ -33,6 +33,8 @@ from src.main import (
     notify_slack_with_retry,
     notify_line_with_retry,
     process_mail_by_uid,
+    extract_job_title_from_subject,
+    extract_job_title_from_html,
 )
 
 
@@ -858,4 +860,65 @@ class TestIMAPConnectionPool:
             live.logout.assert_called_once()
         finally:
             _imap_pool._connection = None
+
+
+class TestExtractJobTitleFromSubject:
+    def test_typical_indeed_subject(self):
+        subject = "新しい応募者のお知らせ: 警備員 | 日本交通誘導警備株式会社"
+        assert extract_job_title_from_subject(subject) == "警備員"
+
+    def test_subject_without_company(self):
+        subject = "新しい応募者のお知らせ: 交通誘導警備員A"
+        assert extract_job_title_from_subject(subject) == "交通誘導警備員A"
+
+    def test_applied_pattern(self):
+        subject = "応募がありました - 夜間警備員"
+        result = extract_job_title_from_subject(subject)
+        assert result is not None
+
+    def test_no_match_returns_none(self):
+        subject = "新しい応募者のお知らせ"
+        assert extract_job_title_from_subject(subject) is None
+
+    def test_non_application_subject(self):
+        assert extract_job_title_from_subject("Indeed請求書") is None
+
+
+class TestExtractJobTitleFromHtml:
+    def test_extract_from_html_with_job_label(self):
+        html = "<html><body><p>求人名: 交通誘導警備員</p></body></html>"
+        assert extract_job_title_from_html(html) == "交通誘導警備員"
+
+    def test_empty_html_returns_none(self):
+        assert extract_job_title_from_html("") is None
+        assert extract_job_title_from_html(None) is None
+
+    def test_no_job_title_in_html_returns_none(self):
+        html = "<html><body><p>○○さんからの応募がありました</p></body></html>"
+        assert extract_job_title_from_html(html) is None
+
+
+class TestNotifyLineWithRetryFallback:
+    def test_textv2_success_no_fallback(self):
+        with patch("src.main.LINE_CHANNEL_ACCESS_TOKEN", "token"), \
+             patch("src.main.LINE_TO_ID_PROD", "U123"), \
+             patch("src.main.MODE", "prod"), \
+             patch("requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200)
+            result = notify_line_with_retry("indeed", "田中", "https://indeed.com/x")
+            assert result is True
+            call_body = mock_post.call_args[1]["json"]
+            assert call_body["messages"][0]["type"] == "textV2"
+
+    def test_textv2_400_falls_back_to_plain(self):
+        responses = [
+            MagicMock(status_code=400, text="textV2 not supported"),
+            MagicMock(status_code=200),
+        ]
+        with patch("src.main.LINE_CHANNEL_ACCESS_TOKEN", "token"), \
+             patch("src.main.LINE_TO_ID_PROD", "U123"), \
+             patch("src.main.MODE", "prod"), \
+             patch("requests.post", side_effect=responses):
+            result = notify_line_with_retry("indeed", "田中", "https://indeed.com/x")
+            assert result is True
 

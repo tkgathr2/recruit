@@ -366,6 +366,48 @@ def extract_applicant_name_from_html(html: str) -> Optional[str]:
     return None
 
 
+def extract_job_title_from_subject(subject: str) -> Optional[str]:
+    """Indeed件名から求人名を抽出する。
+
+    Indeed件名パターン例:
+    - 「新しい応募者のお知らせ: 警備員 | 日本交通誘導」
+    - 「応募がありました - 警備員」
+    「:」や「-」の後の求人名部分を返す。「|」以降の会社名は除外。
+    """
+    for pattern in [
+        r"(?:のお知らせ|がありました)\s*[：:\-‐]\s*([^|\n\r]+?)(?:\s*\||\s*$)",
+        r"新しい応募者[：:]\s*([^|\n\r]+?)(?:\s*\||\s*$)",
+        r"応募者[のお知らせ]+[：:]\s*([^|\n\r]+?)(?:\s*\||\s*$)",
+    ]:
+        match = re.search(pattern, subject)
+        if match:
+            title = match.group(1).strip()
+            if title and len(title) <= 60:
+                return title
+    return None
+
+
+def extract_job_title_from_html(html: str) -> Optional[str]:
+    """IndeedメールHTML本文から求人名を抽出する。"""
+    if not html:
+        return None
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(separator="\n")
+
+    for pattern in [
+        r"求人(?:名|タイトル)?[：:]\s*([^\n\r]+)",
+        r"Job[Tt]itle[：:]\s*([^\n\r]+)",
+        r"ポジション[：:]\s*([^\n\r]+)",
+        r"に応募がありました",  # このパターンの直前行が求人名の可能性あり
+    ]:
+        match = re.search(pattern, text)
+        if match and match.lastindex:
+            title = match.group(1).strip()
+            if title and len(title) <= 60 and "http" not in title:
+                return title
+    return None
+
+
 def _shorten_via_tinyurl(encoded_url: str) -> Optional[str]:
     """Try to shorten a URL via TinyURL. Returns shortened URL or None."""
     try:
@@ -463,35 +505,51 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
         external_url = f"{url}{separator}openExternalBrowser=1"
         lines.extend(["", "詳細はこちら:", shorten_url(external_url)])
     base_message = add_test_prefix("\n".join(lines))
-    # Use @all mention to notify all members in the group
-    substitution = {
-        "mention_all": {
-            "type": "mention",
-            "mentionee": {"type": "all"},
-        }
-    }
-    text_v2 = "{mention_all} " + base_message
-    body = {
-        "to": line_to_id,
-        "messages": [{"type": "textV2", "text": text_v2, "substitution": substitution}],
-    }
     headers = {
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
+
+    def _build_body_v2() -> dict:
+        substitution = {
+            "mention_all": {
+                "type": "mention",
+                "mentionee": {"type": "all"},
+            }
+        }
+        return {
+            "to": line_to_id,
+            "messages": [{"type": "textV2", "text": "{mention_all} " + base_message, "substitution": substitution}],
+        }
+
+    def _build_body_plain() -> dict:
+        return {
+            "to": line_to_id,
+            "messages": [{"type": "text", "text": base_message}],
+        }
+
     for attempt in range(max_retries):
-        try:
-            resp = requests.post("https://api.line.me/v2/bot/message/push", json=body, headers=headers, timeout=10)
-            log(f"LINE API response: status={resp.status_code}")
-            if resp.status_code < 400:
-                return True
-            log(f"ERROR: LINE notify failed (status={resp.status_code}, body={resp.text}, attempt={attempt + 1}/{max_retries})")
-        except requests.exceptions.Timeout:
-            log(f"ERROR: LINE notify timeout (attempt={attempt + 1}/{max_retries})")
-        except Exception as e:
-            log(f"ERROR: LINE notify exception: {e} (attempt={attempt + 1}/{max_retries})")
+        # textV2 (@all mention) を試み、失敗したら plain text にフォールバック
+        for body_builder, label in [(_build_body_v2, "textV2+mention"), (_build_body_plain, "text(fallback)")]:
+            try:
+                resp = requests.post("https://api.line.me/v2/bot/message/push", json=body_builder(), headers=headers, timeout=10)
+                log(f"LINE API response: status={resp.status_code} type={label}")
+                if resp.status_code < 400:
+                    return True
+                log(f"LINE notify {label} failed (status={resp.status_code}, body={resp.text[:200]})")
+                if resp.status_code == 400:
+                    # 400はtextV2未対応や不正メンション → plainにフォールバック
+                    break
+                # 4xx以外（5xx等）はリトライ
+                break
+            except requests.exceptions.Timeout:
+                log(f"ERROR: LINE notify timeout type={label} (attempt={attempt + 1}/{max_retries})")
+                break
+            except Exception as e:
+                log(f"ERROR: LINE notify exception type={label}: {e}")
+                break
         if attempt < max_retries - 1:
-            time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s
+            time.sleep(2 ** attempt)
     notify_error_to_slack(f"LINE notify failed after {max_retries} attempts for {name}")
     return False
 
@@ -761,13 +819,16 @@ def process_mail_by_uid(
         applicant_name = extract_applicant_name_from_html(html)
         if not applicant_name:
             applicant_name = extract_name(from_header)
+        # 求人名: 件名から優先的に取得、なければHTML本文から取得
+        job_title = extract_job_title_from_subject(subject) or extract_job_title_from_html(html)
     else:
         applicant_name = extract_name(from_header)
+        job_title = None
 
-    log(f"Notify {source}: {applicant_name}, url={url}, id={unique_id}")
+    log(f"Notify {source}: {applicant_name}, job={job_title}, url={url}, id={unique_id}")
 
-    slack_ok = notify_slack_with_retry(source, applicant_name, url)
-    line_ok = notify_line_with_retry(source, applicant_name, url)
+    slack_ok = notify_slack_with_retry(source, applicant_name, url, job_title=job_title)
+    line_ok = notify_line_with_retry(source, applicant_name, url, job_title=job_title)
 
     if not slack_ok and not line_ok:
         log(f"ERROR: All notifications failed for {applicant_name} ({unique_id}), will retry next cycle")
