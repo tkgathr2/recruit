@@ -922,3 +922,40 @@ class TestNotifyLineWithRetryFallback:
             result = notify_line_with_retry("indeed", "田中", "https://indeed.com/x")
             assert result is True
 
+    def test_textv2_success_contains_no_mention_all_literal_in_text_field(self):
+        """textV2 成功時: テキストフィールドに {mention_all} リテラルが含まれないこと。
+        メンションは substitution で解決されるため、text フィールドは
+        '{mention_all} メッセージ本文' の形式であることを確認する。"""
+        with patch("src.main.LINE_CHANNEL_ACCESS_TOKEN", "token"), \
+             patch("src.main.LINE_TO_ID_PROD", "U123"), \
+             patch("src.main.MODE", "prod"), \
+             patch("requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200)
+            notify_line_with_retry("indeed", "田中", "https://indeed.com/x")
+            call_body = mock_post.call_args[1]["json"]
+            msg = call_body["messages"][0]
+            # textV2 の text フィールドは '{mention_all} ...' という形式（substitution で解決される）
+            assert msg["type"] == "textV2"
+            # substitution キーが '{mention_all}' として設定されている
+            assert "mention_all" in msg["substitution"]
+
+    def test_textv2_400_fallback_text_has_no_mention_all_literal(self):
+        """textV2 が 400 で失敗した場合のフォールバック: テキストに {mention_all} リテラルが含まれないこと。
+        これが本修正の対象バグ: フォールバック時に '{mention_all} 【田中】...' がそのまま送信される問題。"""
+        responses = [
+            MagicMock(status_code=400, text="textV2 not supported"),
+            MagicMock(status_code=200),
+        ]
+        with patch("src.main.LINE_CHANNEL_ACCESS_TOKEN", "token"), \
+             patch("src.main.LINE_TO_ID_PROD", "U123"), \
+             patch("src.main.MODE", "prod"), \
+             patch("requests.post", side_effect=responses) as mock_post:
+            result = notify_line_with_retry("indeed", "田中", "https://indeed.com/x")
+            assert result is True
+            # 2回目の呼び出し（フォールバック）のボディを検証
+            fallback_call_body = mock_post.call_args_list[1][1]["json"]
+            fallback_text = fallback_call_body["messages"][0]["text"]
+            assert "{mention_all}" not in fallback_text, (
+                f"フォールバック時に {{mention_all}} リテラルが残っている: {fallback_text!r}"
+            )
+

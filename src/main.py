@@ -523,9 +523,11 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
         }
 
     def _build_body_plain() -> dict:
+        # textV2 フォールバック時: {mention_all} リテラルを除去して plain text を送信
+        plain_text = base_message.replace("{mention_all} ", "").replace("{mention_all}", "")
         return {
             "to": line_to_id,
-            "messages": [{"type": "text", "text": base_message}],
+            "messages": [{"type": "text", "text": plain_text}],
         }
 
     for attempt in range(max_retries):
@@ -538,8 +540,8 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
                     return True
                 log(f"LINE notify {label} failed (status={resp.status_code}, body={resp.text[:200]})")
                 if resp.status_code == 400:
-                    # 400はtextV2未対応や不正メンション → plainにフォールバック
-                    break
+                    # 400はtextV2未対応や不正メンション → 内側ループの次builder(plain)へ即フォールバック
+                    continue
                 # 4xx以外（5xx等）はリトライ
                 break
             except requests.exceptions.Timeout:
