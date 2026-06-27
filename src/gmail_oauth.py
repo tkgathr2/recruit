@@ -13,8 +13,11 @@ XOAUTH2 認証に使う。社内標準も Google OAuth（[[feedback_google_auth_
 
 必要な環境変数:
 - GMAIL_OAUTH_CLIENT_ID
-- GMAIL_OAUTH_CLIENT_SECRET
 - GMAIL_OAUTH_REFRESH_TOKEN
+- GMAIL_OAUTH_CLIENT_SECRET（任意）
+  デスクトップアプリ型クライアントは PKCE 方式で取得した refresh token を
+  client_secret 無しでも refresh できる（client_secret は Google 上 "Optional"）。
+  secret が設定されていれば併用し、無ければ送らない（PKCE のみ）。
 （GMAIL_IMAP_USER は IMAP のユーザー＝Gmail アドレスとして既存のまま使う）
 """
 import os
@@ -42,12 +45,12 @@ _cached_expires_at: float = 0.0
 
 
 def has_oauth_credentials() -> bool:
-    """OAuth2(refresh token) 方式に必要な資格情報が全て設定されているか。"""
-    return bool(
-        GMAIL_OAUTH_CLIENT_ID
-        and GMAIL_OAUTH_CLIENT_SECRET
-        and GMAIL_OAUTH_REFRESH_TOKEN
-    )
+    """OAuth2(refresh token) 方式に必要な資格情報が設定されているか。
+
+    PKCE 方式では client_secret は不要なため、CLIENT_ID と REFRESH_TOKEN が
+    揃っていれば OAuth 有効と判定する（client_secret は任意・設定時のみ併用）。
+    """
+    return bool(GMAIL_OAUTH_CLIENT_ID and GMAIL_OAUTH_REFRESH_TOKEN)
 
 
 def _refresh_access_token() -> str:
@@ -59,14 +62,18 @@ def _refresh_access_token() -> str:
     """
     if not has_oauth_credentials():
         raise RuntimeError("Gmail OAuth credentials are not fully configured")
+    # PKCE 方式では client_secret 不要。設定されていれば併用し、無ければ送らない
+    # （デスクトップアプリ型は refresh で client_secret が "Optional"）。
+    refresh_data = {
+        "client_id": GMAIL_OAUTH_CLIENT_ID,
+        "refresh_token": GMAIL_OAUTH_REFRESH_TOKEN,
+        "grant_type": "refresh_token",
+    }
+    if GMAIL_OAUTH_CLIENT_SECRET:
+        refresh_data["client_secret"] = GMAIL_OAUTH_CLIENT_SECRET
     resp = requests.post(
         GOOGLE_TOKEN_URI,
-        data={
-            "client_id": GMAIL_OAUTH_CLIENT_ID,
-            "client_secret": GMAIL_OAUTH_CLIENT_SECRET,
-            "refresh_token": GMAIL_OAUTH_REFRESH_TOKEN,
-            "grant_type": "refresh_token",
-        },
+        data=refresh_data,
         timeout=15,
     )
     if resp.status_code >= 400:
