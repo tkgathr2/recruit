@@ -52,7 +52,27 @@ IMAP_RETRY_BACKOFFS = [5, 10, 20]  # 接続失敗時のexponential backoff（秒
 
 # --- Error notification deduplication ---
 ERROR_NOTIFICATION_DEDUP_SECONDS = int(os.getenv("ERROR_NOTIFICATION_DEDUP_SECONDS", "600"))  # 同一エラーの再通知抑制（10分）
+# 認証失敗の通知抑制（既定6時間）。アプリパスワード失効は人手による再発行が必要で
+# すぐには直らないため、10分おきに通知を垂れ流さず長めの間隔に集約する。
+AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS = int(os.getenv("AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS", "21600"))
 _last_error_notification_ts: dict = {}  # dedup_key -> last unix timestamp
+
+
+def is_auth_failure(error: object) -> bool:
+    """IMAP のエラーが「認証失敗（資格情報が無効/失効）」かどうかを判定する。
+
+    Gmail はアプリパスワードが失効/削除されると
+    `[AUTHENTICATIONFAILED] Invalid credentials (Failure)` を返す。
+    これはネットワーク瞬断などの一時障害とは異なり、人手によるアプリパスワード
+    再発行が必要なため、通常の接続エラーとは別扱いで分かりやすく通知する。
+    """
+    text = str(error).upper()
+    return "AUTHENTICATIONFAILED" in text or "INVALID CREDENTIALS" in text
+
+
+def has_imap_credentials() -> bool:
+    """IMAP 接続に必要な資格情報（ユーザー名・パスワード）が設定されているか。"""
+    return bool(GMAIL_IMAP_USER) and bool(GMAIL_IMAP_PASSWORD)
 
 # --- Known Indeed non-application email patterns (silently ignored) ---
 # These are legitimate Indeed emails that are NOT job applications.
@@ -204,20 +224,24 @@ def save_processed_ids(processed_ids: Set[str]) -> bool:
         return False
 
 
-def notify_error_to_slack(message: str, dedup_key: Optional[str] = None) -> None:
+def notify_error_to_slack(message: str, dedup_key: Optional[str] = None,
+                          dedup_seconds: Optional[int] = None) -> None:
     """重大なエラーを Slack Webhook に通知する。
 
     Args:
         message: 通知メッセージ
         dedup_key: 重複抑止用キー。指定時、同一キーで前回通知から
-            ERROR_NOTIFICATION_DEDUP_SECONDS（既定600秒=10分）以内ならスキップする。
-            省略時は message 本文を dedup key として使う。
+            dedup_seconds（既定 ERROR_NOTIFICATION_DEDUP_SECONDS=600秒=10分）以内なら
+            スキップする。省略時は message 本文を dedup key として使う。
+        dedup_seconds: 重複抑止の窓（秒）。省略時は ERROR_NOTIFICATION_DEDUP_SECONDS。
+            認証失効など長く続く障害は長めの窓を指定して通知フラッドを防ぐ。
     """
     key = dedup_key if dedup_key is not None else message
+    window = dedup_seconds if dedup_seconds is not None else ERROR_NOTIFICATION_DEDUP_SECONDS
     now_ts = time.time()
     last_ts = _last_error_notification_ts.get(key, 0.0)
-    if now_ts - last_ts < ERROR_NOTIFICATION_DEDUP_SECONDS:
-        log(f"Skipping duplicate error notification within {ERROR_NOTIFICATION_DEDUP_SECONDS}s window: key={key[:80]}")
+    if now_ts - last_ts < window:
+        log(f"Skipping duplicate error notification within {window}s window: key={key[:80]}")
         return
     _last_error_notification_ts[key] = now_ts
 
@@ -693,12 +717,38 @@ INDEED_APPLICATION_PATTERNS = [
     "新しい応募者",       # 「新しい応募者が1名います」等の言い回し変化に追従
     "応募がありました",
     "応募者からのメッセージ",
+    "応募を受け付けました",   # 件名フォーマット変化への追従
+    "新規応募",
+    "応募が届きました",
 ]
+
+# Indeed が件名フォーマットを変えても応募通知を取りこぼさないための正規表現フォールバック。
+# 固定フレーズ（INDEED_APPLICATION_PATTERNS）に一致しなくても、「応募」と
+# 「あった/来た/受付/届いた/者」等の動き・対象を表す語が同じ件名に共起していれば応募とみなす。
+# 誤検知防止のため、この共起判定は INDEED_NON_APPLICATION_PATTERNS（レコメンド・課金・
+# 認証コード等）に一致しない件名にのみ適用する。
+_INDEED_APPLICATION_FALLBACK_RE = re.compile(
+    r"応募(?:者|を|が|の)?.{0,12}"
+    r"(?:ありました|きました|来ました|届きました|受け付け|受付|お知らせ|通知|1名|名います)"
+)
+
+
+def _looks_like_indeed_application(subject: str) -> bool:
+    """件名が Indeed の応募通知らしいかを、固定フレーズ＋正規表現フォールバックで判定する。
+
+    既知の非応募パターン（認証コード・課金・レコメンド等）に該当する件名は、
+    フォーマット変化に強くしても応募と誤判定しないよう先に除外する。
+    """
+    if any(pattern in subject for pattern in INDEED_APPLICATION_PATTERNS):
+        return True
+    if is_indeed_non_application_email(subject):
+        return False
+    return bool(_INDEED_APPLICATION_FALLBACK_RE.search(subject))
 
 
 def determine_source(subject: str) -> Tuple[Optional[str], Optional[str]]:
     """Determine email source and default URL based on subject."""
-    if any(pattern in subject for pattern in INDEED_APPLICATION_PATTERNS):
+    if _looks_like_indeed_application(subject):
         return "indeed", None
     elif "ジモティー" in subject:
         return "jimoty", "https://jmty.jp/web_mail/posts"
@@ -963,6 +1013,23 @@ def check_mail_with_status() -> bool:
     リトライし、全て失敗した時のみ notify_error_to_slack() で通知する。
     """
     try:
+        # 資格情報が未設定なら、リトライで叩かず即座に分かりやすく通知する
+        if not has_imap_credentials():
+            missing = []
+            if not GMAIL_IMAP_USER:
+                missing.append("GMAIL_IMAP_USER")
+            if not GMAIL_IMAP_PASSWORD:
+                missing.append("GMAIL_IMAP_PASSWORD")
+            log(f"ERROR: Missing IMAP credentials: {', '.join(missing)}")
+            notify_error_to_slack(
+                "Gmail IMAP の資格情報が未設定です。\n"
+                f"未設定の環境変数: {', '.join(missing)}\n"
+                "Railway の Variables に Gmail アドレスとアプリパスワードを設定してください。",
+                dedup_key="imap_missing_credentials",
+                dedup_seconds=AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS,
+            )
+            return True  # 設定待ち。quotaエラーではないので過度なbackoffはしない
+
         processed_ids, load_success = load_processed_ids()
 
         # If file exists but is corrupted, skip processing to prevent mass re-notifications
@@ -989,10 +1056,23 @@ def check_mail_with_status() -> bool:
                     continue
                 # All retries exhausted
                 log(f"ERROR: IMAP connection failed after {total_attempts} attempts: {last_conn_error}")
-                notify_error_to_slack(
-                    f"Gmail IMAP connection error (after {total_attempts} attempts): {last_conn_error}",
-                    dedup_key="imap_connection_error",
-                )
+                if is_auth_failure(last_conn_error):
+                    # 資格情報の失効/無効。人手によるアプリパスワード再発行が必要なので、
+                    # 接続瞬断とは別の分かりやすいメッセージ＋長めの抑止窓で通知する。
+                    notify_error_to_slack(
+                        "Gmail IMAP の認証に失敗しました（資格情報が無効/失効）。\n"
+                        f"エラー: {last_conn_error}\n"
+                        "対処: Google アカウントでアプリパスワードを再発行し、Railway 環境変数 "
+                        "`GMAIL_IMAP_PASSWORD` を更新してください。"
+                        "（アプリパスワードが Google 側で削除/失効した可能性があります）",
+                        dedup_key="imap_auth_failure",
+                        dedup_seconds=AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS,
+                    )
+                else:
+                    notify_error_to_slack(
+                        f"Gmail IMAP connection error (after {total_attempts} attempts): {last_conn_error}",
+                        dedup_key="imap_connection_error",
+                    )
                 return True  # Not necessarily a quota error
         return True
 
