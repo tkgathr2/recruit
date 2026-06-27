@@ -21,6 +21,9 @@ from src.main import (
     determine_source,
     is_indeed_non_application_email,
     is_from_indeed,
+    is_auth_failure,
+    has_imap_credentials,
+    check_mail_with_status,
     parse_fetch_response,
     load_processed_ids,
     save_processed_ids,
@@ -36,6 +39,7 @@ from src.main import (
     extract_job_title_from_subject,
     extract_job_title_from_html,
 )
+import imaplib
 
 
 class TestDecodeHeaderValue:
@@ -163,6 +167,26 @@ class TestDetermineSource:
         source, url = determine_source(subject)
         assert source is None
         assert url is None
+
+    def test_indeed_subject_format_drift_fallback(self):
+        # 件名フォーマットが変わっても「応募」+動き/対象語の共起で応募と判定する（取りこぼし防止）
+        for subject in [
+            "【Indeed】新しい求人への応募が届きました",
+            "あなたの求人に応募を受け付けました",
+            "求人「警備員」に新規応募がありました",
+            "応募者が1名います（要対応）",
+        ]:
+            assert determine_source(subject)[0] == "indeed", subject
+
+    def test_fallback_does_not_misclassify_non_application(self):
+        # フォールバックを入れても、課金・レコメンド・認証系を応募と誤判定しないこと
+        for subject in [
+            "求人への応募状況をお知らせします",   # 応募状況レポート（非応募）
+            "認証コードを入力してログインしてください",
+            "Indeed請求のお知らせ",
+            "あなたにオススメ求人があります",
+        ]:
+            assert determine_source(subject)[0] is None, subject
 
 
 class TestIsIndeedNonApplicationEmail:
@@ -958,4 +982,86 @@ class TestNotifyLineWithRetryFallback:
             assert "{mention_all}" not in fallback_text, (
                 f"フォールバック時に {{mention_all}} リテラルが残っている: {fallback_text!r}"
             )
+
+
+class TestIsAuthFailure:
+    """`[AUTHENTICATIONFAILED]`/Invalid credentials を一時障害と区別できること。"""
+
+    def test_authenticationfailed_error(self):
+        err = imaplib.IMAP4.error(b"[AUTHENTICATIONFAILED] Invalid credentials (Failure)")
+        assert is_auth_failure(err) is True
+
+    def test_invalid_credentials_plain(self):
+        assert is_auth_failure("Invalid credentials") is True
+
+    def test_transient_errors_are_not_auth_failure(self):
+        for err in [
+            "The read operation timed out",
+            imaplib.IMAP4.abort("server hung up"),
+            OSError("connection reset"),
+            "[OVERQUOTA] limit exceeded",
+        ]:
+            assert is_auth_failure(err) is False, err
+
+
+class TestHasImapCredentials:
+    def test_present(self):
+        with patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", "pw"):
+            assert has_imap_credentials() is True
+
+    def test_missing_password(self):
+        with patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", None):
+            assert has_imap_credentials() is False
+
+    def test_missing_user(self):
+        with patch("src.main.GMAIL_IMAP_USER", None), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", "pw"):
+            assert has_imap_credentials() is False
+
+
+class TestCheckMailAuthHandling:
+    """check_mail_with_status の認証/資格情報まわりの通知挙動。"""
+
+    @patch("src.main.notify_error_to_slack")
+    @patch("src.main.log")
+    def test_missing_credentials_sends_distinct_alert(self, mock_log, mock_error):
+        with patch("src.main.GMAIL_IMAP_USER", None), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", None):
+            result = check_mail_with_status()
+        assert result is True  # 設定待ち。quota扱いで過度にbackoffしない
+        mock_error.assert_called_once()
+        assert mock_error.call_args.kwargs.get("dedup_key") == "imap_missing_credentials"
+
+    @patch("src.main.time.sleep")
+    @patch("src.main.notify_error_to_slack")
+    @patch("src.main.log")
+    def test_auth_failure_sends_credential_alert(self, mock_log, mock_error, mock_sleep):
+        auth_err = imaplib.IMAP4.error(b"[AUTHENTICATIONFAILED] Invalid credentials (Failure)")
+        with patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", "pw"), \
+             patch("src.main.load_processed_ids", return_value=(set(), True)), \
+             patch("src.main._check_mail_attempt", side_effect=auth_err):
+            result = check_mail_with_status()
+        assert result is True
+        mock_error.assert_called_once()
+        kwargs = mock_error.call_args.kwargs
+        assert kwargs.get("dedup_key") == "imap_auth_failure"
+        # アプリパスワード再発行を促す文言が含まれること
+        assert "GMAIL_IMAP_PASSWORD" in mock_error.call_args.args[0]
+
+    @patch("src.main.time.sleep")
+    @patch("src.main.notify_error_to_slack")
+    @patch("src.main.log")
+    def test_transient_failure_uses_generic_key(self, mock_log, mock_error, mock_sleep):
+        timeout_err = TimeoutError("The read operation timed out")
+        with patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", "pw"), \
+             patch("src.main.load_processed_ids", return_value=(set(), True)), \
+             patch("src.main._check_mail_attempt", side_effect=timeout_err):
+            result = check_mail_with_status()
+        assert result is True
+        mock_error.assert_called_once()
+        assert mock_error.call_args.kwargs.get("dedup_key") == "imap_connection_error"
 
