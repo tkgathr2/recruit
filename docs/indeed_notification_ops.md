@@ -34,7 +34,15 @@ Slack Webhook & LINE Messaging API
 |-----------|------|---------------|------|
 | `GMAIL_IMAP_HOST` | Gmail IMAP サーバー | `imap.gmail.com` | ○ |
 | `GMAIL_IMAP_USER` | Gmail アカウント | `recruit@example.com` | ○ |
-| `GMAIL_IMAP_PASSWORD` | Gmail アプリパスワード | `abcd efgh ijkl mnop` | ○ |
+| `GMAIL_OAUTH_CLIENT_ID` | OAuth クライアント ID（推奨） | `1234.apps.googleusercontent.com` | OAuth時○ |
+| `GMAIL_OAUTH_CLIENT_SECRET` | OAuth クライアントシークレット（推奨） | `GOCSPX-...` | OAuth時○ |
+| `GMAIL_OAUTH_REFRESH_TOKEN` | OAuth refresh token（推奨） | `1//0g...` | OAuth時○ |
+| `GMAIL_IMAP_PASSWORD` | Gmail アプリパスワード（OAuth未設定時のフォールバック） | `abcd efgh ijkl mnop` | OAuth時は不要 |
+
+> **認証方式の推奨**: アプリパスワード(IMAP)は数週間で失効再発するため、原則失効しない
+> **OAuth2 refresh token 方式を推奨**。OAuth の3変数（CLIENT_ID/CLIENT_SECRET/REFRESH_TOKEN）が
+> 揃っていれば自動で OAuth(XOAUTH2)、未設定ならアプリパスワード IMAP にフォールバックする。
+> セットアップ手順は [`docs/gmail_oauth_setup.md`](./gmail_oauth_setup.md) を参照。
 
 ### 2-2. Slack 関連
 

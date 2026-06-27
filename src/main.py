@@ -15,10 +15,26 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 
+# gmail_oauth は「python src/main.py」（Procfile・src/ がトップに乗る）でも
+# 「from src.main import ...」（テスト・リポジトリルートが乗る）でも import できるよう両対応。
+try:
+    from src import gmail_oauth  # tests / パッケージとして import された場合
+except ImportError:  # pragma: no cover - 実行形態による分岐
+    import gmail_oauth  # `python src/main.py` で src/ が sys.path 先頭にある場合
+
 # --- Env Vars (Railway Variables) ---
 GMAIL_IMAP_HOST = os.getenv("GMAIL_IMAP_HOST", "imap.gmail.com")
 GMAIL_IMAP_USER = os.getenv("GMAIL_IMAP_USER")
 GMAIL_IMAP_PASSWORD = os.getenv("GMAIL_IMAP_PASSWORD")
+
+# --- OAuth2 (refresh token) 認証 ---
+# アプリパスワード(IMAP)は数週間で失効再発するため、原則失効しない OAuth2 refresh token
+# 方式へ移行する（[[feedback_google_auth_standard]]）。OAuth の資格情報が揃っていれば
+# IMAP XOAUTH2 で認証し、未設定ならアプリパスワード IMAP にフォールバックする（移行期の安全網）。
+# 実体は src/gmail_oauth.py。利用する Gmail アドレスは GMAIL_IMAP_USER を共用する。
+def use_oauth() -> bool:
+    """OAuth2(refresh token) 方式が利用可能か（資格情報が全て設定済みか）。"""
+    return gmail_oauth.has_oauth_credentials()
 
 # MODE-based configuration
 MODE = os.getenv("MODE", "prod")  # "test" or "prod" (default: prod)
@@ -67,12 +83,26 @@ def is_auth_failure(error: object) -> bool:
     再発行が必要なため、通常の接続エラーとは別扱いで分かりやすく通知する。
     """
     text = str(error).upper()
-    return "AUTHENTICATIONFAILED" in text or "INVALID CREDENTIALS" in text
+    return (
+        "AUTHENTICATIONFAILED" in text
+        or "INVALID CREDENTIALS" in text
+        # OAuth2: refresh token が失効/取消されると invalid_grant が返る（要再同意）。
+        or "INVALID_GRANT" in text
+    )
 
 
 def has_imap_credentials() -> bool:
-    """IMAP 接続に必要な資格情報（ユーザー名・パスワード）が設定されているか。"""
-    return bool(GMAIL_IMAP_USER) and bool(GMAIL_IMAP_PASSWORD)
+    """IMAP 接続に必要な資格情報が設定されているか。
+
+    OAuth2(refresh token) 方式が揃っていれば GMAIL_IMAP_USER のみで足りる
+    （パスワードは access token で代替）。OAuth が未設定の場合は従来どおり
+    ユーザー名＋アプリパスワードの両方が必要。
+    """
+    if not GMAIL_IMAP_USER:
+        return False
+    if use_oauth():
+        return True
+    return bool(GMAIL_IMAP_PASSWORD)
 
 # --- Known Indeed non-application email patterns (silently ignored) ---
 # These are legitimate Indeed emails that are NOT job applications.
@@ -642,11 +672,21 @@ class IMAPConnectionPool:
             log(f"IMAP connect attempt {attempt}/{max_attempts} host={GMAIL_IMAP_HOST} ts={ts}")
             try:
                 mail = imaplib.IMAP4_SSL(GMAIL_IMAP_HOST)
-                mail.login(GMAIL_IMAP_USER, GMAIL_IMAP_PASSWORD)
+                if use_oauth():
+                    # OAuth2(refresh token) → IMAP XOAUTH2。原則失効しないので
+                    # アプリパスワードの再発行が不要になる。
+                    gmail_oauth.imap_authenticate(mail, GMAIL_IMAP_USER)
+                    auth_method = "XOAUTH2"
+                else:
+                    # フォールバック: 従来のアプリパスワード IMAP（移行期の安全網）。
+                    mail.login(GMAIL_IMAP_USER, GMAIL_IMAP_PASSWORD)
+                    auth_method = "app-password"
                 mail.select("INBOX", readonly=True)
-                log(f"IMAP connect success host={GMAIL_IMAP_HOST} attempt={attempt}/{max_attempts}")
+                log(f"IMAP connect success host={GMAIL_IMAP_HOST} auth={auth_method} attempt={attempt}/{max_attempts}")
                 return mail
-            except (imaplib.IMAP4.error, OSError) as e:
+            # RuntimeError/RequestException は OAuth トークン取得失敗（refresh token 失効や
+            # ネットワーク断）。接続失敗と同様に backoff＋上位の認証失敗判定に乗せる。
+            except (imaplib.IMAP4.error, OSError, RuntimeError, requests.RequestException) as e:
                 last_exc = e
                 fail_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 log(
@@ -1018,13 +1058,16 @@ def check_mail_with_status() -> bool:
             missing = []
             if not GMAIL_IMAP_USER:
                 missing.append("GMAIL_IMAP_USER")
+            # OAuth も アプリパスワードも無い → どちらの認証手段も成立しない。
             if not GMAIL_IMAP_PASSWORD:
-                missing.append("GMAIL_IMAP_PASSWORD")
+                missing.append("GMAIL_IMAP_PASSWORD（または GMAIL_OAUTH_CLIENT_ID/SECRET/REFRESH_TOKEN）")
             log(f"ERROR: Missing IMAP credentials: {', '.join(missing)}")
             notify_error_to_slack(
-                "Gmail IMAP の資格情報が未設定です。\n"
+                "Gmail の資格情報が未設定です。\n"
                 f"未設定の環境変数: {', '.join(missing)}\n"
-                "Railway の Variables に Gmail アドレスとアプリパスワードを設定してください。",
+                "推奨: OAuth2 方式（GMAIL_OAUTH_CLIENT_ID / GMAIL_OAUTH_CLIENT_SECRET / "
+                "GMAIL_OAUTH_REFRESH_TOKEN）を Railway の Variables に設定してください。"
+                "（アプリパスワード GMAIL_IMAP_PASSWORD は失効しやすいため非推奨）",
                 dedup_key="imap_missing_credentials",
                 dedup_seconds=AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS,
             )
@@ -1046,7 +1089,7 @@ def check_mail_with_status() -> bool:
             except imaplib.IMAP4.abort:
                 # quota / abort は別ハンドラへ
                 raise
-            except (imaplib.IMAP4.error, socket.timeout, socket.gaierror, TimeoutError, ConnectionError, OSError) as e:
+            except (imaplib.IMAP4.error, socket.timeout, socket.gaierror, TimeoutError, ConnectionError, OSError, RuntimeError, requests.RequestException) as e:
                 last_conn_error = e
                 log(f"WARN: IMAP connection/read error on attempt {attempt_idx + 1}/{total_attempts}: {e}")
                 if attempt_idx < len(IMAP_RETRY_BACKOFFS):
@@ -1057,14 +1100,29 @@ def check_mail_with_status() -> bool:
                 # All retries exhausted
                 log(f"ERROR: IMAP connection failed after {total_attempts} attempts: {last_conn_error}")
                 if is_auth_failure(last_conn_error):
-                    # 資格情報の失効/無効。人手によるアプリパスワード再発行が必要なので、
-                    # 接続瞬断とは別の分かりやすいメッセージ＋長めの抑止窓で通知する。
+                    # 資格情報の失効/無効。OAuth 方式と アプリパスワード方式で対処が異なるため、
+                    # 現在の認証方式に応じた案内を出す。接続瞬断とは別の分かりやすいメッセージ＋
+                    # 長めの抑止窓で通知する。
+                    if use_oauth():
+                        auth_alert = (
+                            "Gmail OAuth の認証に失敗しました（refresh token が無効/失効＝要再同意）。\n"
+                            f"エラー: {last_conn_error}\n"
+                            "対処: scripts/get-gmail-refresh-token.py で再度同意し、Railway 環境変数 "
+                            "`GMAIL_OAUTH_REFRESH_TOKEN` を更新してください。"
+                            "（refresh token は通常失効しませんが、取消・パスワード変更・"
+                            "6か月未使用で無効になることがあります）"
+                        )
+                    else:
+                        auth_alert = (
+                            "Gmail IMAP の認証に失敗しました（資格情報が無効/失効）。\n"
+                            f"エラー: {last_conn_error}\n"
+                            "対処: OAuth2 方式（GMAIL_OAUTH_*）への移行を推奨します。"
+                            "暫定対応として Google アカウントでアプリパスワードを再発行し、"
+                            "Railway 環境変数 `GMAIL_IMAP_PASSWORD` を更新してください。"
+                            "（アプリパスワードが Google 側で削除/失効した可能性があります）"
+                        )
                     notify_error_to_slack(
-                        "Gmail IMAP の認証に失敗しました（資格情報が無効/失効）。\n"
-                        f"エラー: {last_conn_error}\n"
-                        "対処: Google アカウントでアプリパスワードを再発行し、Railway 環境変数 "
-                        "`GMAIL_IMAP_PASSWORD` を更新してください。"
-                        "（アプリパスワードが Google 側で削除/失効した可能性があります）",
+                        auth_alert,
                         dedup_key="imap_auth_failure",
                         dedup_seconds=AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS,
                     )
@@ -1140,6 +1198,7 @@ def main() -> None:
     """Main polling loop with exponential backoff for quota errors."""
     log(f"Starting Gmail polling with POLL_INTERVAL_SECONDS={POLL_INTERVAL_SECONDS}")
     log(f"MODE={MODE}, SEARCH_DAYS={SEARCH_DAYS}, MAX_BACKOFF_SECONDS={MAX_BACKOFF_SECONDS}, MAX_EMAILS_PER_CYCLE={MAX_EMAILS_PER_CYCLE}")
+    log(f"Gmail auth method: {'OAuth2 (XOAUTH2 refresh token)' if use_oauth() else 'app-password (IMAP LOGIN)'}")
 
     # Verify storage is working
     if not verify_storage():

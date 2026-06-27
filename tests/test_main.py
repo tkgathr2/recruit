@@ -1007,18 +1007,116 @@ class TestIsAuthFailure:
 class TestHasImapCredentials:
     def test_present(self):
         with patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
-             patch("src.main.GMAIL_IMAP_PASSWORD", "pw"):
+             patch("src.main.GMAIL_IMAP_PASSWORD", "pw"), \
+             patch("src.main.use_oauth", return_value=False):
             assert has_imap_credentials() is True
 
     def test_missing_password(self):
         with patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
-             patch("src.main.GMAIL_IMAP_PASSWORD", None):
+             patch("src.main.GMAIL_IMAP_PASSWORD", None), \
+             patch("src.main.use_oauth", return_value=False):
             assert has_imap_credentials() is False
 
     def test_missing_user(self):
         with patch("src.main.GMAIL_IMAP_USER", None), \
-             patch("src.main.GMAIL_IMAP_PASSWORD", "pw"):
+             patch("src.main.GMAIL_IMAP_PASSWORD", "pw"), \
+             patch("src.main.use_oauth", return_value=False):
             assert has_imap_credentials() is False
+
+    def test_oauth_only_is_sufficient(self):
+        # OAuth2 方式が揃っていれば、アプリパスワード無しでも資格情報あり扱い。
+        with patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", None), \
+             patch("src.main.use_oauth", return_value=True):
+            assert has_imap_credentials() is True
+
+    def test_oauth_without_user_is_insufficient(self):
+        # OAuth が揃っていても Gmail アドレス(GMAIL_IMAP_USER)が無ければ不可。
+        with patch("src.main.GMAIL_IMAP_USER", None), \
+             patch("src.main.use_oauth", return_value=True):
+            assert has_imap_credentials() is False
+
+
+class TestGmailOAuth:
+    """src/gmail_oauth.py の refresh token → access token フロー。"""
+
+    def test_has_oauth_credentials_all_present(self):
+        import src.gmail_oauth as go
+        with patch.object(go, "GMAIL_OAUTH_CLIENT_ID", "cid"), \
+             patch.object(go, "GMAIL_OAUTH_CLIENT_SECRET", "sec"), \
+             patch.object(go, "GMAIL_OAUTH_REFRESH_TOKEN", "rt"):
+            assert go.has_oauth_credentials() is True
+
+    def test_has_oauth_credentials_missing(self):
+        import src.gmail_oauth as go
+        with patch.object(go, "GMAIL_OAUTH_CLIENT_ID", "cid"), \
+             patch.object(go, "GMAIL_OAUTH_CLIENT_SECRET", "sec"), \
+             patch.object(go, "GMAIL_OAUTH_REFRESH_TOKEN", None):
+            assert go.has_oauth_credentials() is False
+
+    def test_build_xoauth2_string_format(self):
+        import src.gmail_oauth as go
+        s = go.build_xoauth2_string("user@example.com", "TOKEN123")
+        assert s == "user=user@example.com\x01auth=Bearer TOKEN123\x01\x01"
+
+    def test_refresh_access_token_caches(self):
+        import src.gmail_oauth as go
+        # キャッシュをクリア
+        go._cached_access_token = None
+        go._cached_expires_at = 0.0
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"access_token": "AT", "expires_in": 3600}
+        with patch.object(go, "GMAIL_OAUTH_CLIENT_ID", "cid"), \
+             patch.object(go, "GMAIL_OAUTH_CLIENT_SECRET", "sec"), \
+             patch.object(go, "GMAIL_OAUTH_REFRESH_TOKEN", "rt"), \
+             patch("src.gmail_oauth.requests.post", return_value=mock_resp) as mock_post:
+            tok1 = go.get_access_token()
+            tok2 = go.get_access_token()  # 2回目はキャッシュから（postは増えない）
+        assert tok1 == "AT"
+        assert tok2 == "AT"
+        mock_post.assert_called_once()
+
+    def test_refresh_invalid_grant_raises_runtime_error(self):
+        import src.gmail_oauth as go
+        go._cached_access_token = None
+        go._cached_expires_at = 0.0
+        mock_resp = MagicMock(status_code=400, text='{"error": "invalid_grant"}')
+        with patch.object(go, "GMAIL_OAUTH_CLIENT_ID", "cid"), \
+             patch.object(go, "GMAIL_OAUTH_CLIENT_SECRET", "sec"), \
+             patch.object(go, "GMAIL_OAUTH_REFRESH_TOKEN", "rt"), \
+             patch("src.gmail_oauth.requests.post", return_value=mock_resp):
+            with pytest.raises(RuntimeError) as exc:
+                go.get_access_token(force_refresh=True)
+        # invalid_grant は is_auth_failure で認証失効として扱われること
+        assert is_auth_failure(exc.value) is True
+
+    def test_imap_authenticate_uses_xoauth2(self):
+        import src.gmail_oauth as go
+        go._cached_access_token = "AT"
+        go._cached_expires_at = float("inf")
+        mock_mail = MagicMock()
+        go.imap_authenticate(mock_mail, "user@example.com")
+        mock_mail.authenticate.assert_called()
+        # 第1引数が XOAUTH2 であること
+        assert mock_mail.authenticate.call_args.args[0] == "XOAUTH2"
+
+
+class TestIMAPConnectionPoolOAuth:
+    """OAuth が有効なときに pool が XOAUTH2 で認証すること。"""
+
+    def test_connect_uses_oauth_when_enabled(self):
+        from src.main import IMAPConnectionPool
+        pool = IMAPConnectionPool()
+        fresh = MagicMock()
+        with patch("src.main.imaplib.IMAP4_SSL", return_value=fresh), \
+             patch("src.main.use_oauth", return_value=True), \
+             patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
+             patch("src.main.gmail_oauth.imap_authenticate") as mock_auth:
+            got = pool.get()
+        assert got is fresh
+        mock_auth.assert_called_once_with(fresh, "u@example.com")
+        fresh.login.assert_not_called()  # アプリパスワード login は使わない
+        fresh.select.assert_called_once_with("INBOX", readonly=True)
 
 
 class TestCheckMailAuthHandling:
