@@ -1047,11 +1047,26 @@ class TestGmailOAuth:
              patch.object(go, "GMAIL_OAUTH_REFRESH_TOKEN", "rt"):
             assert go.has_oauth_credentials() is True
 
+    def test_has_oauth_credentials_without_secret_is_sufficient(self):
+        # PKCE 方式: client_secret が無くても CLIENT_ID + REFRESH_TOKEN で OAuth 有効。
+        import src.gmail_oauth as go
+        with patch.object(go, "GMAIL_OAUTH_CLIENT_ID", "cid"), \
+             patch.object(go, "GMAIL_OAUTH_CLIENT_SECRET", None), \
+             patch.object(go, "GMAIL_OAUTH_REFRESH_TOKEN", "rt"):
+            assert go.has_oauth_credentials() is True
+
     def test_has_oauth_credentials_missing(self):
         import src.gmail_oauth as go
         with patch.object(go, "GMAIL_OAUTH_CLIENT_ID", "cid"), \
              patch.object(go, "GMAIL_OAUTH_CLIENT_SECRET", "sec"), \
              patch.object(go, "GMAIL_OAUTH_REFRESH_TOKEN", None):
+            assert go.has_oauth_credentials() is False
+
+    def test_has_oauth_credentials_missing_client_id(self):
+        import src.gmail_oauth as go
+        with patch.object(go, "GMAIL_OAUTH_CLIENT_ID", None), \
+             patch.object(go, "GMAIL_OAUTH_CLIENT_SECRET", None), \
+             patch.object(go, "GMAIL_OAUTH_REFRESH_TOKEN", "rt"):
             assert go.has_oauth_credentials() is False
 
     def test_build_xoauth2_string_format(self):
@@ -1075,6 +1090,41 @@ class TestGmailOAuth:
         assert tok1 == "AT"
         assert tok2 == "AT"
         mock_post.assert_called_once()
+
+    def test_refresh_without_secret_omits_client_secret(self):
+        # PKCE 方式: client_secret が未設定なら refresh リクエストに含めない。
+        import src.gmail_oauth as go
+        go._cached_access_token = None
+        go._cached_expires_at = 0.0
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"access_token": "AT", "expires_in": 3600}
+        with patch.object(go, "GMAIL_OAUTH_CLIENT_ID", "cid"), \
+             patch.object(go, "GMAIL_OAUTH_CLIENT_SECRET", None), \
+             patch.object(go, "GMAIL_OAUTH_REFRESH_TOKEN", "rt"), \
+             patch("src.gmail_oauth.requests.post", return_value=mock_resp) as mock_post:
+            tok = go.get_access_token()
+        assert tok == "AT"
+        sent = mock_post.call_args.kwargs["data"]
+        assert "client_secret" not in sent
+        assert sent["client_id"] == "cid"
+        assert sent["refresh_token"] == "rt"
+        assert sent["grant_type"] == "refresh_token"
+
+    def test_refresh_with_secret_includes_client_secret(self):
+        # client_secret が設定されていれば併用する（後方互換）。
+        import src.gmail_oauth as go
+        go._cached_access_token = None
+        go._cached_expires_at = 0.0
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"access_token": "AT", "expires_in": 3600}
+        with patch.object(go, "GMAIL_OAUTH_CLIENT_ID", "cid"), \
+             patch.object(go, "GMAIL_OAUTH_CLIENT_SECRET", "sec"), \
+             patch.object(go, "GMAIL_OAUTH_REFRESH_TOKEN", "rt"), \
+             patch("src.gmail_oauth.requests.post", return_value=mock_resp) as mock_post:
+            tok = go.get_access_token()
+        assert tok == "AT"
+        sent = mock_post.call_args.kwargs["data"]
+        assert sent["client_secret"] == "sec"
 
     def test_refresh_invalid_grant_raises_runtime_error(self):
         import src.gmail_oauth as go
@@ -1162,4 +1212,129 @@ class TestCheckMailAuthHandling:
         assert result is True
         mock_error.assert_called_once()
         assert mock_error.call_args.kwargs.get("dedup_key") == "imap_connection_error"
+
+
+class TestUseOauthEnablement:
+    """src/main.py の OAuth 有効化条件（PKCE: secret 任意）と後方互換。"""
+
+    def test_use_oauth_true_without_secret(self):
+        # CLIENT_ID + REFRESH_TOKEN が揃えば secret 無しでも OAuth 有効。
+        import src.gmail_oauth as go
+        from src.main import use_oauth
+        with patch.object(go, "GMAIL_OAUTH_CLIENT_ID", "cid"), \
+             patch.object(go, "GMAIL_OAUTH_CLIENT_SECRET", None), \
+             patch.object(go, "GMAIL_OAUTH_REFRESH_TOKEN", "rt"):
+            assert use_oauth() is True
+
+    def test_use_oauth_false_when_oauth_unset_falls_back_to_app_password(self):
+        # OAuth 変数が無ければ OAuth 無効 → アプリパスワード IMAP にフォールバック（後方互換）。
+        import src.gmail_oauth as go
+        from src.main import use_oauth, has_imap_credentials
+        with patch.object(go, "GMAIL_OAUTH_CLIENT_ID", None), \
+             patch.object(go, "GMAIL_OAUTH_CLIENT_SECRET", None), \
+             patch.object(go, "GMAIL_OAUTH_REFRESH_TOKEN", None):
+            assert use_oauth() is False
+        # アプリパスワードが設定されていれば従来どおり資格情報ありと判定される。
+        with patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", "pw"), \
+             patch("src.main.use_oauth", return_value=False):
+            assert has_imap_credentials() is True
+
+
+class TestGetRefreshTokenScriptPKCE:
+    """scripts/get-gmail-refresh-token.py の PKCE 生成・client_id 既定・secret 任意。"""
+
+    def _load_script_module(self):
+        import importlib.util
+        script_path = os.path.join(
+            os.path.dirname(__file__), "..", "scripts", "get-gmail-refresh-token.py"
+        )
+        spec = importlib.util.spec_from_file_location("get_gmail_refresh_token", script_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_pkce_pair_valid_s256(self):
+        import base64
+        import hashlib
+        mod = self._load_script_module()
+        verifier, challenge = mod.generate_pkce_pair()
+        # RFC 7636: verifier は 43〜128 文字
+        assert 43 <= len(verifier) <= 128
+        # challenge = BASE64URL(SHA256(verifier)) パディング無し
+        expected = base64.urlsafe_b64encode(
+            hashlib.sha256(verifier.encode("ascii")).digest()
+        ).decode("ascii").rstrip("=")
+        assert challenge == expected
+        assert "=" not in challenge
+
+    def test_pkce_pair_is_random(self):
+        mod = self._load_script_module()
+        v1, _ = mod.generate_pkce_pair()
+        v2, _ = mod.generate_pkce_pair()
+        assert v1 != v2
+
+    def test_default_client_id_constant(self):
+        mod = self._load_script_module()
+        assert mod.DEFAULT_CLIENT_ID == (
+            "235822259813-7jdk1qosim8dj1lvej712br6e2i5iuam.apps.googleusercontent.com"
+        )
+
+    def test_token_exchange_sends_code_verifier_without_secret(self):
+        # PKCE のみ: token 交換に code_verifier を送り client_secret は送らない。
+        mod = self._load_script_module()
+        captured = {}
+
+        def fake_post(url, data=None, timeout=None):
+            captured["data"] = data
+            resp = MagicMock(status_code=200)
+            resp.json.return_value = {"refresh_token": "RT"}
+            return resp
+
+        # callback で code を受け取った状態を擬似する
+        mod._auth_code_holder["code"] = "AUTHCODE"
+        mod._auth_code_holder["error"] = None
+        with patch.object(mod, "webbrowser"), \
+             patch.object(mod.http.server, "HTTPServer") as mock_server_cls, \
+             patch.object(mod.threading, "Thread") as mock_thread_cls, \
+             patch.object(mod.requests, "post", side_effect=fake_post), \
+             patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GMAIL_OAUTH_CLIENT_SECRET", None)
+            os.environ.pop("GMAIL_OAUTH_CLIENT_ID", None)
+            mock_server_cls.return_value = MagicMock()
+            mock_thread_cls.return_value = MagicMock()
+            rc = mod.main(argv=[])
+        assert rc == 0
+        sent = captured["data"]
+        assert sent["code"] == "AUTHCODE"
+        assert sent["grant_type"] == "authorization_code"
+        assert "code_verifier" in sent and sent["code_verifier"]
+        assert "client_secret" not in sent
+        # 既定 client_id が使われる
+        assert sent["client_id"] == mod.DEFAULT_CLIENT_ID
+
+    def test_token_exchange_includes_secret_when_set(self):
+        mod = self._load_script_module()
+        captured = {}
+
+        def fake_post(url, data=None, timeout=None):
+            captured["data"] = data
+            resp = MagicMock(status_code=200)
+            resp.json.return_value = {"refresh_token": "RT"}
+            return resp
+
+        mod._auth_code_holder["code"] = "AUTHCODE"
+        mod._auth_code_holder["error"] = None
+        with patch.object(mod, "webbrowser"), \
+             patch.object(mod.http.server, "HTTPServer") as mock_server_cls, \
+             patch.object(mod.threading, "Thread") as mock_thread_cls, \
+             patch.object(mod.requests, "post", side_effect=fake_post), \
+             patch.dict(os.environ, {"GMAIL_OAUTH_CLIENT_SECRET": "sec"}, clear=False):
+            mock_server_cls.return_value = MagicMock()
+            mock_thread_cls.return_value = MagicMock()
+            rc = mod.main(argv=["custom-client-id"])
+        assert rc == 0
+        sent = captured["data"]
+        assert sent["client_secret"] == "sec"
+        assert sent["client_id"] == "custom-client-id"
 
