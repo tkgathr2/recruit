@@ -1280,38 +1280,18 @@ class TestGetRefreshTokenScriptPKCE:
             "235822259813-7jdk1qosim8dj1lvej712br6e2i5iuam.apps.googleusercontent.com"
         )
 
-    def test_token_exchange_sends_code_verifier_without_secret(self):
-        # PKCE のみ: token 交換に code_verifier を送り client_secret は送らない。
+    def test_missing_secret_returns_error(self):
+        # client_secret が未設定のとき rc == 1 でエラー終了すること。
+        # このクライアント（デスクトップアプリ型）は PKCE のみでは動作しない
+        # （Google が 400 invalid_request: client_secret is missing を返す）。
         mod = self._load_script_module()
-        captured = {}
 
-        def fake_post(url, data=None, timeout=None):
-            captured["data"] = data
-            resp = MagicMock(status_code=200)
-            resp.json.return_value = {"refresh_token": "RT"}
-            return resp
-
-        # callback で code を受け取った状態を擬似する
-        mod._auth_code_holder["code"] = "AUTHCODE"
-        mod._auth_code_holder["error"] = None
         with patch.object(mod, "webbrowser"), \
-             patch.object(mod.http.server, "HTTPServer") as mock_server_cls, \
-             patch.object(mod.threading, "Thread") as mock_thread_cls, \
-             patch.object(mod.requests, "post", side_effect=fake_post), \
              patch.dict(os.environ, {}, clear=False):
             os.environ.pop("GMAIL_OAUTH_CLIENT_SECRET", None)
-            os.environ.pop("GMAIL_OAUTH_CLIENT_ID", None)
-            mock_server_cls.return_value = MagicMock()
-            mock_thread_cls.return_value = MagicMock()
+            os.environ.pop("GMAIL_OAUTH_CLIENT_JSON", None)
             rc = mod.main(argv=[])
-        assert rc == 0
-        sent = captured["data"]
-        assert sent["code"] == "AUTHCODE"
-        assert sent["grant_type"] == "authorization_code"
-        assert "code_verifier" in sent and sent["code_verifier"]
-        assert "client_secret" not in sent
-        # 既定 client_id が使われる
-        assert sent["client_id"] == mod.DEFAULT_CLIENT_ID
+        assert rc == 1, "client_secret 未設定のとき rc == 1 でエラー終了すべき"
 
     def test_token_exchange_includes_secret_when_set(self):
         mod = self._load_script_module()
