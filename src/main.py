@@ -1085,11 +1085,15 @@ def _check_mail_attempt(processed_ids: Set[str]) -> None:
                         return
 
 
-def check_mail_with_status() -> bool:
+def check_mail_with_status(processed_ids: Optional[Set[str]] = None) -> bool:
     """Check mailbox for new applications. Returns True if successful, False if quota/error.
 
     IMAP 接続/読み取りタイムアウトに対しては IMAP_RETRY_BACKOFFS（5,10,20秒）で
     リトライし、全て失敗した時のみ notify_error_to_slack() で通知する。
+
+    Args:
+        processed_ids: 起動時にロード済みの処理済みID集合。Noneのとき（後方互換・テスト用）は
+            従来どおり内部でロードする。main()からはこの引数で渡してサイクル間でメモリ保持する。
     """
     try:
         # 資格情報が未設定なら、リトライで叩かず即座に分かりやすく通知する
@@ -1114,12 +1118,13 @@ def check_mail_with_status() -> bool:
             )
             return True  # 設定待ち。quotaエラーではないので過度なbackoffはしない
 
-        processed_ids, load_success = load_processed_ids()
-
-        # If file exists but is corrupted, skip processing to prevent mass re-notifications
-        if not load_success:
-            log("ERROR: Skipping mail check due to corrupted processed IDs file")
-            return True  # Not a quota error, don't backoff
+        if processed_ids is None:
+            # 後方互換 / テスト用: 引数なしで呼ばれた場合はその場でロード
+            processed_ids, load_success = load_processed_ids()
+            # If file exists but is corrupted, skip processing to prevent mass re-notifications
+            if not load_success:
+                log("ERROR: Skipping mail check due to corrupted processed IDs file")
+                return True  # Not a quota error, don't backoff
 
         total_attempts = len(IMAP_RETRY_BACKOFFS) + 1  # initial + len(backoffs) retries
         last_conn_error: Optional[BaseException] = None
@@ -1247,11 +1252,22 @@ def main() -> None:
         notify_error_to_slack("CRITICAL: Storage verification failed at startup. Service stopped.")
         return
 
+    # processed_ids を起動時に一度だけロードしてサイクル間でメモリ保持する。
+    # これにより: (a) 毎ポーリングのディスク全再読込＋migrate_old_id_format 全件再実行を排除、
+    # (b) uid: セッションキャッシュがサイクルをまたいで生き続けるため無駄な IMAP 往復が減る。
+    # 破損ファイル時は verify_storage() が先に検出して return するため、ここでは成功前提。
+    startup_ids, load_success = load_processed_ids()
+    if not load_success:
+        log("CRITICAL: Failed to load processed IDs at startup. Exiting.")
+        notify_error_to_slack("CRITICAL: Failed to load processed IDs at startup. Service stopped.")
+        return
+    log(f"Loaded {len(startup_ids)} processed IDs into memory at startup")
+
     consecutive_errors = 0
     quota_notified = False
     while True:
         try:
-            success = check_mail_with_status()
+            success = check_mail_with_status(startup_ids)
             if success:
                 consecutive_errors = 0
                 quota_notified = False
