@@ -666,6 +666,10 @@ class IMAPConnectionPool:
             pass
         self._connection = None
 
+    # プロセス内フラグ: OAuth が invalid_grant で失効していることが判明したら True に立てる。
+    # これ以降は OAuth を試さずに app-password に直行し、毎ポーリングで無駄な 400 を食わない。
+    _oauth_known_invalid: bool = False
+
     def _connect_with_backoff(self) -> imaplib.IMAP4_SSL:
         delays = IMAP_CONNECT_BACKOFF_SECONDS
         max_attempts = len(delays)
@@ -675,13 +679,34 @@ class IMAPConnectionPool:
             log(f"IMAP connect attempt {attempt}/{max_attempts} host={GMAIL_IMAP_HOST} ts={ts}")
             try:
                 mail = imaplib.IMAP4_SSL(GMAIL_IMAP_HOST)
-                if use_oauth():
-                    # OAuth2(refresh token) → IMAP XOAUTH2。原則失効しないので
-                    # アプリパスワードの再発行が不要になる。
-                    gmail_oauth.imap_authenticate(mail, GMAIL_IMAP_USER)
-                    auth_method = "XOAUTH2"
+                if use_oauth() and not IMAPConnectionPool._oauth_known_invalid:
+                    # OAuth2(refresh token) → IMAP XOAUTH2 を試みる。
+                    # 認証失敗（invalid_grant / AUTHENTICATIONFAILED）が返ったら
+                    # app-password にフォールバックし、以降は OAuth を再試行しない。
+                    try:
+                        gmail_oauth.imap_authenticate(mail, GMAIL_IMAP_USER)
+                        auth_method = "XOAUTH2"
+                    except Exception as oauth_err:
+                        if is_auth_failure(oauth_err):
+                            # OAuth refresh token が失効/無効 → app-password に切り替える。
+                            IMAPConnectionPool._oauth_known_invalid = True
+                            log(
+                                f"WARN: OAuth auth failed ({oauth_err!r}); "
+                                "falling back to app-password for this process lifetime"
+                            )
+                            # 壊れた接続を捨てて新規接続を張り直す。
+                            try:
+                                mail.logout()
+                            except Exception:
+                                pass
+                            mail = imaplib.IMAP4_SSL(GMAIL_IMAP_HOST)
+                            mail.login(GMAIL_IMAP_USER, GMAIL_IMAP_PASSWORD)
+                            auth_method = "app-password(oauth-fallback)"
+                        else:
+                            # ネットワーク断等の一時障害はそのまま上位に再送出してリトライさせる。
+                            raise
                 else:
-                    # フォールバック: 従来のアプリパスワード IMAP（移行期の安全網）。
+                    # OAuth 未設定、または既に失効確定済み → 従来のアプリパスワード IMAP。
                     mail.login(GMAIL_IMAP_USER, GMAIL_IMAP_PASSWORD)
                     auth_method = "app-password"
                 mail.select("INBOX", readonly=True)
