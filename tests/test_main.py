@@ -761,7 +761,11 @@ def test_process_mail_by_uid_real_indeed_application_is_processed():
 
 
 def test_process_mail_by_uid_indeed_unknown_subject_still_alerts():
-    """送信者が本物のIndeed(indeed.com)で件名が未知の場合のみ、フォーマット変更の安全網アラートを出す。"""
+    """送信者が本物のIndeed(indeed.com)で件名が未知の場合:
+    - エラーチャネルにフォーマット変更アラートを出す
+    - 通常チャネル（Slack/LINE）にも「⚠️未分類」として通知する（取りこぼし防止・バグ1修正）
+    - return None（処理済みにしない＝次サイクルでも再処理可能）
+    """
     from unittest.mock import patch
     mock_mail = _build_mail_mock(
         subject="重要なお知らせ（新フォーマット）",  # 応募でも既知の非応募でもない
@@ -774,10 +778,65 @@ def test_process_mail_by_uid_indeed_unknown_subject_still_alerts():
          patch("src.main.notify_line_with_retry", return_value=True) as mock_line:
         result = process_mail_by_uid(mock_mail, b"12", set())
 
-    mock_alert.assert_called_once()   # 安全網は本物のIndeedドメインに対してのみ働く
-    mock_slack.assert_not_called()
-    mock_line.assert_not_called()
-    assert result is not None
+    mock_alert.assert_called_once()   # 安全網アラート（エラーチャネル）は本物のIndeedドメインに対してのみ
+    mock_slack.assert_called_once()   # 通常チャネルにも通知（取りこぼし防止）
+    mock_line.assert_called_once()    # 通常チャネルにも通知（取りこぼし防止）
+    assert result is None             # 処理済みにしない（次サイクルで再処理可能）
+
+
+# ---- バグ1: 未分類IndeedメールのSlack/LINE通知 ----------------------------------------
+
+def test_process_mail_by_uid_unclassified_indeed_notifies_normal_channels():
+    """未分類のIndeedメール（応募でも既知の非応募でもない件名）は
+    Slack/LINEの通常チャネルに通知され、取りこぼされないこと（バグ1の回帰テスト）。
+
+    修正前: notify_error_to_slack だけ呼んで return unique_id（永久抑制）。
+    修正後: Slack/LINE にも通知し、return None（次サイクルで再処理可能）。
+    """
+    from unittest.mock import patch
+    mock_mail = _build_mail_mock(
+        subject="重要なお知らせ（新フォーマット）",  # 応募でも既知の非応募でもない
+        from_header="Indeed <noreply@indeed.com>",
+        uid_num=20,
+        gm_msgid="2020202020202020202",
+    )
+    with patch("src.main.notify_error_to_slack") as mock_alert, \
+         patch("src.main.notify_slack_with_retry", return_value=True) as mock_slack, \
+         patch("src.main.notify_line_with_retry", return_value=True) as mock_line:
+        result = process_mail_by_uid(mock_mail, b"20", set())
+
+    # エラーアラートも出る（フォーマット変更の可能性を管理者に知らせる）
+    mock_alert.assert_called_once()
+    # 通常チャネルにも通知される（取りこぼし防止）
+    mock_slack.assert_called_once()
+    mock_line.assert_called_once()
+    # return None → processed_ids に入らず次サイクルでも再処理可能
+    assert result is None, "未分類メールは processed_ids に入れず None を返すべき"
+
+
+# ---- バグ2: processed_ids のメモリ保持 -----------------------------------------------
+
+def test_check_mail_with_status_reuses_passed_processed_ids():
+    """check_mail_with_status に processed_ids を渡した場合、load_processed_ids を
+    呼ばずに渡されたセットをそのまま利用すること（バグ2の回帰テスト）。
+
+    修正前: 毎サイクルで load_processed_ids() を呼んでいた。
+    修正後: 引数で渡された processed_ids をそのまま _check_mail_attempt に転送する。
+    """
+    from unittest.mock import patch, MagicMock
+    from src.main import check_mail_with_status
+
+    existing_ids = {"gm:111", "uid:5"}
+
+    with patch("src.main.has_imap_credentials", return_value=True), \
+         patch("src.main.load_processed_ids") as mock_load, \
+         patch("src.main._check_mail_attempt") as mock_attempt:
+        check_mail_with_status(existing_ids)
+
+    # load_processed_ids は一切呼ばれない
+    mock_load.assert_not_called()
+    # 渡したセットがそのまま _check_mail_attempt に渡される
+    mock_attempt.assert_called_once_with(existing_ids)
 
 
 class TestIMAPConnectionPool:
