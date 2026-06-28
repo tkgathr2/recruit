@@ -49,30 +49,37 @@ client_secret の供給方法（スクリプトが優先順に読み込む）:
 
 | 環境変数名 | 用途 | 必須 |
 |-----------|------|------|
-| `GMAIL_IMAP_USER` | Gmail アドレス（IMAP ユーザー＝`recruit@takagi.bz`）。OAuth でも共用 | ○ |
+| `GMAIL_IMAP_USER` | Gmail アドレス（IMAP ユーザー）。**現本番値 = `atsuhiro@takagi.bz`**。`recruit@takagi.bz` は存在しないアドレスのため使用不可。OAuth でも共用 | ○ |
 | `GMAIL_OAUTH_CLIENT_ID` | GCP OAuth クライアント ID | OAuth時○ |
 | `GMAIL_OAUTH_REFRESH_TOKEN` | 同意フローで取得した refresh token | OAuth時○ |
 | `GMAIL_OAUTH_CLIENT_SECRET` | GCP OAuth クライアントシークレット（**token交換に必須**） | **必須** |
 | `GMAIL_IMAP_PASSWORD` | アプリパスワード（OAuth未設定時のフォールバック） | OAuth時は不要 |
 
-スコープは **`https://www.googleapis.com/auth/gmail.readonly`（読み取り専用・最小権限）** のみ。
+スコープは **`https://mail.google.com/`（フルメールアクセス）** が必須。
+`gmail.readonly` では Gmail IMAP の XOAUTH2 認証が `AUTHENTICATIONFAILED` で失敗する（実機確認済み）。
+**`gmail.readonly` は使用不可。**
 
 ---
 
 ## A. GCP の OAuth クライアント（既存の Desktop 型をそのまま使う）
 
-既定で使うのは既存の Desktop 型クライアント `recruit-gmail-oauth3`:
+既定で使うのは **既存の Desktop 型クライアント「Claude Code MCP Desktop」**:
 
 ```
-client_id = 235822259813-7jdk1qosim8dj1lvej712br6e2i5iuam.apps.googleusercontent.com
+client_id = 235822259813-c9851j36ke8n0ne2jnclai4irktjr76d.apps.googleusercontent.com
 ```
 
-スクリプトはこの client_id を既定値として持っているため、GCP 側で新しいクライアントを
+> **[2026-06-28 実態確認]** 本番 Railway (`desirable-smile / recruit`) で稼働中の
+> `GMAIL_OAUTH_CLIENT_ID` はこの値。`recruit-gmail-oauth3` クライアント
+> (`235822259813-7jdk1qosim8dj1lvej712br6e2i5iuam.apps...`) は代替（任意）であり、
+> 現本番では使用していない。
+
+スクリプトの `DEFAULT_CLIENT_ID` はこの値に設定されている。GCP 側で新しいクライアントを
 作成する必要はない。**ただし client_secret の取得は必要**:
 
 1. GCP コンソール →「APIとサービス」→「認証情報」
-2. 「recruit-gmail-oauth3」をクリック
-3. 「JSONをダウンロード」→ ローカルに保存（例: `~/recruit-gmail-oauth3.json`）
+2. 「Claude Code MCP Desktop」をクリック
+3. 「JSONをダウンロード」→ ローカルに保存
 4. このパスを `GMAIL_OAUTH_CLIENT_JSON` に指定する（JSONに client_id も含まれるため
    `GMAIL_OAUTH_CLIENT_ID` の手動入力も不要になる）
 
@@ -81,7 +88,7 @@ client_id = 235822259813-7jdk1qosim8dj1lvej712br6e2i5iuam.apps.googleusercontent
 - **OAuth 同意画面が「本番（In production）」に publish 済みであること**
   （Testing のままだと refresh token が**7日で失効**する＝根本原因と同じ問題が再発する。
   必ず In production に変更すること）。
-- スコープに `.../auth/gmail.readonly` が含まれること。
+- スコープに **`https://mail.google.com/`** が含まれること（`gmail.readonly` は IMAP XOAUTH2 で失敗するため不可）。
 - デスクトップアプリ型はループバック redirect `http://127.0.0.1:<port>/` を自動許可するため、
   redirect URI の手動登録は不要。
 
@@ -106,7 +113,8 @@ python scripts/get-gmail-refresh-token.py <client_id> <client_secret>
 ```
 
 1. 実行するとブラウザが開く（開かなければ表示された URL を手動で開く）。
-2. **`recruit@takagi.bz` でログイン → 「許可」をクリック**（←社長の一手はここだけ）。
+2. **監視対象の受信箱を持つアカウント（現本番 = `atsuhiro@takagi.bz`）でログイン → 「許可」をクリック**（←社長の一手はここだけ）。
+   `recruit@takagi.bz` は存在しないアドレスのため使用不可。
 3. ローカルサーバーが callback を受け取り、ターミナルに以下を表示する:
    ```
    GMAIL_OAUTH_CLIENT_ID=...
@@ -135,7 +143,7 @@ railway variables \
   --set "GMAIL_OAUTH_CLIENT_SECRET=<値>"
 ```
 
-- `GMAIL_IMAP_USER`（=`recruit@takagi.bz`）は据え置き。
+- `GMAIL_IMAP_USER`（現本番値 = `atsuhiro@takagi.bz`）は据え置き。`recruit@takagi.bz` は存在しないため使用不可。
 - 設定後にデプロイ/再起動 → 起動ログに `Gmail auth method: OAuth2 (XOAUTH2 refresh token)` が
   出ること、IMAP connect の `auth=XOAUTH2 ... success` が出ることを確認する。
 - 動作確認後、フォールバック用の `GMAIL_IMAP_PASSWORD` は残しても消してもよい
@@ -163,3 +171,4 @@ railway variables \
 | 2026-06-27 | OAuth2 refresh token 方式へ移行（アプリパスワード失効根絶） |
 | 2026-06-28 | PKCE 方式へ変更（client_secret 不要・既定 Desktop client を内蔵）← **[誤記]** |
 | 2026-06-28 | client_secret 必須に訂正（Google が 400 を返す事実を実機確認）。スクリプトをループ型サーバー・3経路secret供給に堅牢化 |
+| 2026-06-28 | 本番実態に合わせて全面是正：監視アドレス=`atsuhiro@takagi.bz`（`recruit@takagi.bz`は存在しない）、OAuthクライアント=「Claude Code MCP Desktop」、スコープ=`https://mail.google.com/`必須（`gmail.readonly`はIMAPで失敗） |

@@ -30,7 +30,8 @@
        GMAIL_OAUTH_CLIENT_SECRET=xxx python scripts/get-gmail-refresh-token.py
        # client_id が JSON と違う場合のみ引数で override:
        python scripts/get-gmail-refresh-token.py <client_id> <client_secret>
-  3. 表示された URL をブラウザで開き、recruit@takagi.bz でログイン → 許可。
+  3. 表示された URL をブラウザで開き、監視対象の受信箱を持つアカウント（現本番 = atsuhiro@takagi.bz）でログイン → 許可。
+     （recruit@takagi.bz は存在しないアドレスのため使用不可）
      ローカルサーバーが callback を受け取り refresh token を表示する。
   4. 出力された GMAIL_OAUTH_CLIENT_ID と GMAIL_OAUTH_REFRESH_TOKEN と
      GMAIL_OAUTH_CLIENT_SECRET を Railway に設定する。
@@ -54,13 +55,16 @@ import webbrowser
 
 import requests
 
-GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+# https://mail.google.com/ が必須。gmail.readonly では IMAP XOAUTH2 が AUTHENTICATIONFAILED で失敗する。
+GMAIL_READONLY_SCOPE = "https://mail.google.com/"
 AUTH_URI = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 
-# 既定のデスクトップアプリ型クライアント（recruit-gmail-oauth3）。
+# 既定のデスクトップアプリ型クライアント（「Claude Code MCP Desktop」= 本番稼働中の実値）。
 # client_secret は必須（下記の供給経路を参照）。
-DEFAULT_CLIENT_ID = "235822259813-7jdk1qosim8dj1lvej712br6e2i5iuam.apps.googleusercontent.com"
+# ※ recruit-gmail-oauth3 クライアント (235822259813-7jdk1qosim8dj1lvej712br6e2i5iuam...) は
+#   代替（任意）。現本番では「Claude Code MCP Desktop」を使用。
+DEFAULT_CLIENT_ID = "235822259813-c9851j36ke8n0ne2jnclai4irktjr76d.apps.googleusercontent.com"
 
 # デスクトップアプリ型クライアントで使うループバック redirect。
 REDIRECT_HOST = "127.0.0.1"
@@ -246,7 +250,7 @@ def main(argv=None) -> int:
         "code_challenge_method": "S256",
     }
     auth_url = AUTH_URI + "?" + urllib.parse.urlencode(auth_params)
-    print("\n以下の URL をブラウザで開いて、recruit@takagi.bz でログイン→許可してください:\n", flush=True)
+    print("\n以下の URL をブラウザで開いて、監視対象の受信箱を持つアカウント（現本番 = atsuhiro@takagi.bz）でログイン→許可してください:\n", flush=True)
     print(auth_url + "\n", flush=True)
     print(f"使用する client_id: {client_id}", flush=True)
     print("認証方式: PKCE + client_secret（両方必須）\n", flush=True)

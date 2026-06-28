@@ -12,13 +12,15 @@ XOAUTH2 認証に使う。社内標準も Google OAuth（[[feedback_google_auth_
   パスワード IMAP にフォールバックする＝移行期の安全網）。
 
 必要な環境変数:
-- GMAIL_OAUTH_CLIENT_ID
+- GMAIL_OAUTH_CLIENT_ID  （本番値 = 「Claude Code MCP Desktop」クライアントのID）
 - GMAIL_OAUTH_REFRESH_TOKEN
-- GMAIL_OAUTH_CLIENT_SECRET（任意）
-  デスクトップアプリ型クライアントは PKCE 方式で取得した refresh token を
-  client_secret 無しでも refresh できる（client_secret は Google 上 "Optional"）。
-  secret が設定されていれば併用し、無ければ送らない（PKCE のみ）。
-（GMAIL_IMAP_USER は IMAP のユーザー＝Gmail アドレスとして既存のまま使う）
+- GMAIL_OAUTH_CLIENT_SECRET  （必須。初回 token 交換・refresh 両方で使用）
+  ※「PKCE 方式のため client_secret 不要」は誤り。実機確認で Google が
+    `400 invalid_request: client_secret is missing` を返すことが判明。
+    client_secret が設定されていれば送信し、なければ refresh を試みるが
+    Google 側で弾かれる可能性がある。
+（GMAIL_IMAP_USER は IMAP のユーザー＝Gmail アドレスとして既存のまま使う。
+ 本番値 = `atsuhiro@takagi.bz`。`recruit@takagi.bz` は存在しないため不可。）
 """
 import os
 import time
@@ -47,8 +49,10 @@ _cached_expires_at: float = 0.0
 def has_oauth_credentials() -> bool:
     """OAuth2(refresh token) 方式に必要な資格情報が設定されているか。
 
-    PKCE 方式では client_secret は不要なため、CLIENT_ID と REFRESH_TOKEN が
-    揃っていれば OAuth 有効と判定する（client_secret は任意・設定時のみ併用）。
+    CLIENT_ID と REFRESH_TOKEN が揃っていれば OAuth 有効と判定する。
+    client_secret は本来必須だが、refresh フェーズでは token エンドポイントへの
+    リクエストを試みてから Google 側のエラーで判明するため、ここでは CLIENT_ID /
+    REFRESH_TOKEN の有無のみで判定する（呼び出し側で secret 未設定のエラーを捕捉）。
     """
     return bool(GMAIL_OAUTH_CLIENT_ID and GMAIL_OAUTH_REFRESH_TOKEN)
 
@@ -62,8 +66,8 @@ def _refresh_access_token() -> str:
     """
     if not has_oauth_credentials():
         raise RuntimeError("Gmail OAuth credentials are not fully configured")
-    # PKCE 方式では client_secret 不要。設定されていれば併用し、無ければ送らない
-    # （デスクトップアプリ型は refresh で client_secret が "Optional"）。
+    # client_secret は refresh フェーズでも実質必須（本番実機確認済み）。
+    # 設定されていれば送信する。未設定の場合は Google 側で弾かれる可能性がある。
     refresh_data = {
         "client_id": GMAIL_OAUTH_CLIENT_ID,
         "refresh_token": GMAIL_OAUTH_REFRESH_TOKEN,
