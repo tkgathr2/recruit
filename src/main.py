@@ -5,6 +5,7 @@ from email.header import decode_header
 from email.utils import parseaddr
 import os
 import socket
+import sys
 import time
 import json
 import re
@@ -81,6 +82,9 @@ _last_error_notification_ts: dict = {}  # dedup_key -> last unix timestamp
 # エラーチャネル（notify_error_to_slack）は10分dedupで管理者へのリマインダーを兼ねるため
 # 従来どおり10分間隔で送り続けるが、通常チャネルへの再送はスパムになるため抑制する。
 _unclassified_normal_notified: Set[str] = set()  # unique_id -> 通常チャネル送信済み
+
+# --- Shared HTTP session (M-9: connection reuse across requests) ---
+_http_session = requests.Session()
 
 
 def is_auth_failure(error: object) -> bool:
@@ -275,6 +279,13 @@ def notify_error_to_slack(message: str, dedup_key: Optional[str] = None,
         dedup_seconds: 重複抑止の窓（秒）。省略時は ERROR_NOTIFICATION_DEDUP_SECONDS。
             認証失効など長く続く障害は長めの窓を指定して通知フラッドを防ぐ。
     """
+    # サイズ上限（古いエントリを自動削除）
+    if len(_last_error_notification_ts) > 500:
+        cutoff = time.time() - (dedup_seconds if dedup_seconds is not None else ERROR_NOTIFICATION_DEDUP_SECONDS)
+        expired = [k for k, v in _last_error_notification_ts.items() if v < cutoff]
+        for k in expired:
+            del _last_error_notification_ts[k]
+
     key = dedup_key if dedup_key is not None else message
     window = dedup_seconds if dedup_seconds is not None else ERROR_NOTIFICATION_DEDUP_SECONDS
     now_ts = time.time()
@@ -290,7 +301,7 @@ def notify_error_to_slack(message: str, dedup_key: Optional[str] = None,
         return
     text = f"🚨 Indeed応募通知エラー発生\n{message}"
     try:
-        resp = requests.post(
+        resp = _http_session.post(
             webhook_url,
             json={"text": text},
             timeout=5,
@@ -304,7 +315,7 @@ def notify_error_to_slack(message: str, dedup_key: Optional[str] = None,
     # DM にも同じメッセージを送信
     if SLACK_DM_WEBHOOK_URL:
         try:
-            dm_resp = requests.post(
+            dm_resp = _http_session.post(
                 SLACK_DM_WEBHOOK_URL,
                 json={"text": text},
                 timeout=5,
@@ -475,7 +486,7 @@ def _shorten_via_tinyurl(encoded_url: str) -> Optional[str]:
     """Try to shorten a URL via TinyURL. Returns shortened URL or None."""
     try:
         api = "https://tinyurl.com/api-create.php?url=" + encoded_url
-        resp = requests.get(api, timeout=8)
+        resp = _http_session.get(api, timeout=8)
         if resp.status_code == 200 and resp.text.strip().startswith("http"):
             return resp.text.strip()
         log(f"WARN: TinyURL shorten returned status={resp.status_code}")
@@ -488,7 +499,7 @@ def _shorten_via_isgd(encoded_url: str) -> Optional[str]:
     """Try to shorten a URL via is.gd. Returns shortened URL or None."""
     try:
         api = "https://is.gd/create.php?format=simple&url=" + encoded_url
-        resp = requests.get(api, timeout=5)
+        resp = _http_session.get(api, timeout=5)
         if resp.status_code == 200 and resp.text.strip().startswith("http"):
             return resp.text.strip()
         log(f"WARN: is.gd shorten returned status={resp.status_code} body={resp.text[:80]}")
@@ -537,7 +548,7 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
     message = add_test_prefix(mention_prefix + "\n".join(lines))
     for attempt in range(max_retries):
         try:
-            resp = requests.post(webhook_url, json={"text": message}, timeout=10)
+            resp = _http_session.post(webhook_url, json={"text": message}, timeout=10)
             if resp.status_code < 400:
                 return True
             log(f"ERROR: Slack notify failed (status={resp.status_code}, body={resp.text}, attempt={attempt + 1}/{max_retries})")
@@ -597,7 +608,7 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
         # textV2 (@all mention) を試み、失敗したら plain text にフォールバック
         for body_builder, label in [(_build_body_v2, "textV2+mention"), (_build_body_plain, "text(fallback)")]:
             try:
-                resp = requests.post("https://api.line.me/v2/bot/message/push", json=body_builder(), headers=headers, timeout=10)
+                resp = _http_session.post("https://api.line.me/v2/bot/message/push", json=body_builder(), headers=headers, timeout=10)
                 log(f"LINE API response: status={resp.status_code} type={label}")
                 if resp.status_code < 400:
                     return True
@@ -946,6 +957,8 @@ def process_mail_by_uid(
                     notify_slack_with_retry("indeed", unclassified_name, url)
                     notify_line_with_retry("indeed", unclassified_name, url)
                     _unclassified_normal_notified.add(unique_id)
+                    processed_ids.add(f"unclf:{unique_id}")
+                    save_processed_ids(processed_ids)
                     log(f"Normal channel notified (first time) for unclassified: {unique_id}")
                 else:
                     log(f"Normal channel skip (already notified) for unclassified: {unique_id}")
@@ -969,13 +982,13 @@ def process_mail_by_uid(
         applicant_name = extract_name(from_header)
         job_title = None
 
-    log(f"Notify {source}: {applicant_name}, job={job_title}, url={url}, id={unique_id}")
+    log(f"Notify {source}: job={job_title}, id={unique_id}")
 
     slack_ok = notify_slack_with_retry(source, applicant_name, url, job_title=job_title)
     line_ok = notify_line_with_retry(source, applicant_name, url, job_title=job_title)
 
     if not slack_ok and not line_ok:
-        log(f"ERROR: All notifications failed for {applicant_name} ({unique_id}), will retry next cycle")
+        log(f"ERROR: All notifications failed for id={unique_id}, will retry next cycle")
         return None
 
     # 片方成功・片方失敗: 処理済みマークしつつDMで通知（重複送信防止が最優先）
@@ -985,19 +998,18 @@ def process_mail_by_uid(
             failed_channels.append("Slack")
         if not line_ok:
             failed_channels.append("LINE")
-        log(f"WARNING: Partial success for {applicant_name} ({unique_id}): {', '.join(failed_channels)} failed. Marking as processed to prevent duplicates.")
+        log(f"WARNING: Partial success for id={unique_id}: {', '.join(failed_channels)} failed. Marking as processed to prevent duplicates.")
         dm_detail = (
-            f"\u26a0\ufe0f 通知一部失敗\uff08処理済みマーク済み・手動確認してください\uff09\n"
+            f"⚠️ 通知一部失敗（処理済みマーク済み・手動確認してください）\n"
             f"失敗チャンネル: {', '.join(failed_channels)}\n"
             f"メール件名: {subject}\n"
             f"送信者: {from_header}\n"
-            f"応募者名: {applicant_name}\n"
             f"ソース: {source}\n"
             f"unique_id: {unique_id}"
         )
         if SLACK_DM_WEBHOOK_URL:
             try:
-                requests.post(SLACK_DM_WEBHOOK_URL, json={"text": dm_detail}, timeout=5)
+                _http_session.post(SLACK_DM_WEBHOOK_URL, json={"text": dm_detail}, timeout=5)
             except Exception as e:
                 log(f"ERROR: Failed to send detail DM: {e}")
 
@@ -1263,28 +1275,30 @@ def main() -> None:
     if not verify_storage():
         log("CRITICAL: Storage verification failed. Exiting to prevent duplicate notifications.")
         notify_error_to_slack("CRITICAL: Storage verification failed at startup. Service stopped.")
-        return
+        sys.exit(1)
 
     # processed_ids を起動時に一度だけロードしてサイクル間でメモリ保持する。
     # これにより: (a) 毎ポーリングのディスク全再読込＋migrate_old_id_format 全件再実行を排除、
     # (b) uid: セッションキャッシュがサイクルをまたいで生き続けるため無駄な IMAP 往復が減る。
-    # 破損ファイル時は verify_storage() が先に検出して return するため、ここでは成功前提。
+    # 破損ファイル時は verify_storage() が先に検出して sys.exit(1) するため、ここでは成功前提。
     startup_ids, load_success = load_processed_ids()
     if not load_success:
         log("CRITICAL: Failed to load processed IDs at startup. Exiting.")
         notify_error_to_slack("CRITICAL: Failed to load processed IDs at startup. Service stopped.")
-        return
+        sys.exit(1)
     log(f"Loaded {len(startup_ids)} processed IDs into memory at startup")
 
     consecutive_errors = 0
     quota_notified = False
     while True:
         try:
+            _cycle_start = time.monotonic()
             success = check_mail_with_status(startup_ids)
+            _elapsed = time.monotonic() - _cycle_start
             if success:
                 consecutive_errors = 0
                 quota_notified = False
-                time.sleep(POLL_INTERVAL_SECONDS)
+                time.sleep(max(0, POLL_INTERVAL_SECONDS - _elapsed))
             else:
                 # Error occurred, apply exponential backoff
                 consecutive_errors += 1
@@ -1294,7 +1308,7 @@ def main() -> None:
                 if not quota_notified:
                     notify_error_to_slack(f"Gmail quota exceeded. Applying backoff ({backoff}s). Will retry automatically.")
                     quota_notified = True
-                time.sleep(backoff)
+                time.sleep(max(0, backoff - _elapsed))
         except Exception as e:
             log(f"ERROR in main loop: {e}")
             consecutive_errors += 1
@@ -1304,4 +1318,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
