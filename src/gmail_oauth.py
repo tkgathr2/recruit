@@ -82,8 +82,12 @@ def _refresh_access_token() -> str:
     )
     if resp.status_code >= 400:
         # invalid_grant は refresh token 自体が失効/取り消された場合（要再同意）。
+        try:
+            _err_code = resp.json().get("error", "unknown")
+        except Exception:
+            _err_code = "parse_error"
         raise RuntimeError(
-            f"Gmail OAuth token refresh failed (status={resp.status_code}): {resp.text[:300]}"
+            f"Gmail OAuth token refresh failed (status={resp.status_code}, error={_err_code})"
         )
     payload = resp.json()
     access_token = payload.get("access_token")
