@@ -75,6 +75,12 @@ ERROR_NOTIFICATION_DEDUP_SECONDS = int(os.getenv("ERROR_NOTIFICATION_DEDUP_SECON
 # すぐには直らないため、10分おきに通知を垂れ流さず長めの間隔に集約する。
 AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS = int(os.getenv("AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS", "21600"))
 _last_error_notification_ts: dict = {}  # dedup_key -> last unix timestamp
+# --- Unclassified mail normal-channel dedup ---
+# 未分類Indeedメール（determine_source が None を返したもの）について、
+# 通常チャネル（Slack/LINE 応募通知）への送信を「1メール=1回限り」に制限する。
+# エラーチャネル（notify_error_to_slack）は10分dedupで管理者へのリマインダーを兼ねるため
+# 従来どおり10分間隔で送り続けるが、通常チャネルへの再送はスパムになるため抑制する。
+_unclassified_normal_notified: Set[str] = set()  # unique_id -> 通常チャネル送信済み
 
 
 def is_auth_failure(error: object) -> bool:
@@ -917,8 +923,10 @@ def process_mail_by_uid(
                 # 未知のパターン → Indeedが件名フォーマットを変更した可能性がある。
                 # エラーチャネルにアラートを出しつつ、通常の応募通知チャネル（Slack/LINE）にも
                 # 「⚠️未分類」として通知して人間が必ず気づけるようにする。
-                # return None にして processed_ids に入れないことで、次サイクルでも再通知される
-                # （重複スパム防止は dedup_key によるエラーアラートの抑制で担保）。
+                # return None にして processed_ids に入れないことで、次サイクルでも再処理される
+                # （エラーチャネルは dedup_key で10分間隔リマインダーとして残す）。
+                # ただし通常チャネルへの送信は _unclassified_normal_notified で「1メール=1回」
+                # に制限する（未対処のまま ~60秒ポーリングが続くと最大1440回/日のスパムになるため）。
                 date_header = decode_header_value(msg.get("Date", ""))
                 alert_msg = (
                     "⚠️ 件名不一致のIndeedメールを検知\n"
@@ -930,13 +938,18 @@ def process_mail_by_uid(
                 log(f"ALERT: Indeed email detected with unrecognized subject: {subject}")
                 dedup_key = f"indeed_unclassified:{unique_id}"
                 notify_error_to_slack(alert_msg, dedup_key=dedup_key)
-                # 通常チャネルにも通知して人間が必ず確認できるようにする
-                html = extract_html(msg)
-                url = extract_indeed_url(html) or ""
-                unclassified_name = "⚠️未分類のIndeedメール（要確認）"
-                notify_slack_with_retry("indeed", unclassified_name, url)
-                notify_line_with_retry("indeed", unclassified_name, url)
-                return None  # 処理済みにしない＝次サイクルでも拾い直す（無限通知はdedup_keyで抑制）
+                # 通常チャネルには初回のみ送信（2サイクル目以降は抑制）
+                if unique_id not in _unclassified_normal_notified:
+                    html = extract_html(msg)
+                    url = extract_indeed_url(html) or ""
+                    unclassified_name = "⚠️未分類のIndeedメール（要確認）"
+                    notify_slack_with_retry("indeed", unclassified_name, url)
+                    notify_line_with_retry("indeed", unclassified_name, url)
+                    _unclassified_normal_notified.add(unique_id)
+                    log(f"Normal channel notified (first time) for unclassified: {unique_id}")
+                else:
+                    log(f"Normal channel skip (already notified) for unclassified: {unique_id}")
+                return None  # 処理済みにしない＝次サイクルでも拾い直す（エラーチャネルでリマインド継続）
         else:
             log(f"Skip non-target mail: {subject[:50]}...")
             return unique_id  # Indeed以外の対象外メールは静かにスキップ＋処理済みマーク

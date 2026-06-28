@@ -814,6 +814,51 @@ def test_process_mail_by_uid_unclassified_indeed_notifies_normal_channels():
     assert result is None, "未分類メールは processed_ids に入れず None を返すべき"
 
 
+def test_unclassified_indeed_normal_channel_notified_only_once():
+    """未分類Indeedメールの通常チャネル（Slack/LINE）通知は「1メール=1回だけ」であること。
+
+    同一 unique_id のメールが2サイクル処理されても、Slack/LINE への通知は初回のみ。
+    エラーチャネル（notify_error_to_slack）は10分dedup制御なので2回呼ばれる想定。
+    """
+    import src.main as main_module
+    from unittest.mock import patch, call
+
+    # テスト間でグローバル state が汚染しないよう明示クリア
+    main_module._unclassified_normal_notified.discard("gm:3030303030303030303")
+
+    mock_mail = _build_mail_mock(
+        subject="全く新しいフォーマットのIndeedメール",
+        from_header="Indeed <noreply@indeed.com>",
+        uid_num=30,
+        gm_msgid="3030303030303030303",
+    )
+
+    # --- 1サイクル目 ---
+    with patch("src.main.notify_error_to_slack") as mock_alert, \
+         patch("src.main.notify_slack_with_retry", return_value=True) as mock_slack, \
+         patch("src.main.notify_line_with_retry", return_value=True) as mock_line:
+        result1 = process_mail_by_uid(mock_mail, b"30", set())
+
+    assert result1 is None, "1サイクル目: 処理済みにしない"
+    mock_alert.assert_called_once()   # エラーチャネルは通知される
+    mock_slack.assert_called_once()   # 1サイクル目: 通常チャネルも通知される
+    mock_line.assert_called_once()    # 1サイクル目: 通常チャネルも通知される
+
+    # --- 2サイクル目（同一メール・同一 unique_id）---
+    with patch("src.main.notify_error_to_slack") as mock_alert2, \
+         patch("src.main.notify_slack_with_retry", return_value=True) as mock_slack2, \
+         patch("src.main.notify_line_with_retry", return_value=True) as mock_line2:
+        result2 = process_mail_by_uid(mock_mail, b"30", set())
+
+    assert result2 is None, "2サイクル目: 引き続き処理済みにしない"
+    mock_alert2.assert_called_once()       # エラーチャネルは10分dedup制御（モック上は呼ばれる）
+    mock_slack2.assert_not_called()        # 2サイクル目: 通常チャネルは呼ばれない
+    mock_line2.assert_not_called()         # 2サイクル目: 通常チャネルは呼ばれない
+
+    # 後片付け
+    main_module._unclassified_normal_notified.discard("gm:3030303030303030303")
+
+
 # ---- バグ2: processed_ids のメモリ保持 -----------------------------------------------
 
 def test_check_mail_with_status_reuses_passed_processed_ids():
