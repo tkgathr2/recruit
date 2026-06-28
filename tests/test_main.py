@@ -1276,8 +1276,11 @@ class TestGetRefreshTokenScriptPKCE:
 
     def test_default_client_id_constant(self):
         mod = self._load_script_module()
+        # 本番稼働中の「Claude Code MCP Desktop」クライアントの実値（2026-06-28 本番確認済み）。
+        # recruit-gmail-oauth3 クライアント (235822259813-7jdk1qosim8dj1lvej712br6e2i5iuam...) は
+        # 代替（任意）。現本番では使用していない。
         assert mod.DEFAULT_CLIENT_ID == (
-            "235822259813-7jdk1qosim8dj1lvej712br6e2i5iuam.apps.googleusercontent.com"
+            "235822259813-c9851j36ke8n0ne2jnclai4irktjr76d.apps.googleusercontent.com"
         )
 
     def test_missing_secret_returns_error(self):

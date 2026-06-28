@@ -32,7 +32,9 @@ GMAIL_IMAP_PASSWORD = os.getenv("GMAIL_IMAP_PASSWORD")
 # 方式へ移行する（[[feedback_google_auth_standard]]）。OAuth の資格情報が揃っていれば
 # IMAP XOAUTH2 で認証し、未設定ならアプリパスワード IMAP にフォールバックする（移行期の安全網）。
 # 実体は src/gmail_oauth.py。利用する Gmail アドレスは GMAIL_IMAP_USER を共用する。
-# OAuth 有効化条件は CLIENT_ID + REFRESH_TOKEN（client_secret は PKCE 方式のため任意）。
+# OAuth 有効化条件は CLIENT_ID + REFRESH_TOKEN（client_secret も実質必須・本番実機確認済み）。
+# 必要スコープ = https://mail.google.com/（gmail.readonly は IMAP XOAUTH2 で AUTHENTICATIONFAILED）。
+# 監視メールボックス（GMAIL_IMAP_USER）= atsuhiro@takagi.bz（recruit@takagi.bz は存在しない）。
 def use_oauth() -> bool:
     """OAuth2(refresh token) 方式が利用可能か（資格情報が全て設定済みか）。"""
     return gmail_oauth.has_oauth_credentials()
@@ -1066,9 +1068,10 @@ def check_mail_with_status() -> bool:
             notify_error_to_slack(
                 "Gmail の資格情報が未設定です。\n"
                 f"未設定の環境変数: {', '.join(missing)}\n"
-                "推奨: OAuth2(PKCE) 方式（GMAIL_OAUTH_CLIENT_ID / "
-                "GMAIL_OAUTH_REFRESH_TOKEN。client_secret は不要）を Railway の Variables に "
-                "設定してください。"
+                "推奨: OAuth2 方式（GMAIL_OAUTH_CLIENT_ID / GMAIL_OAUTH_REFRESH_TOKEN / "
+                "GMAIL_OAUTH_CLIENT_SECRET）を Railway の Variables に設定してください。"
+                "スコープは https://mail.google.com/ が必須（gmail.readonly は IMAP で失敗）。"
+                "監視アドレス（GMAIL_IMAP_USER）は atsuhiro@takagi.bz を使用。"
                 "（アプリパスワード GMAIL_IMAP_PASSWORD は失効しやすいため非推奨）",
                 dedup_key="imap_missing_credentials",
                 dedup_seconds=AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS,
