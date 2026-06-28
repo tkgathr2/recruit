@@ -1162,13 +1162,14 @@ def check_mail_with_status(processed_ids: Optional[Set[str]] = None) -> bool:
                 raise
             except (imaplib.IMAP4.error, socket.timeout, socket.gaierror, TimeoutError, ConnectionError, OSError, RuntimeError, requests.RequestException) as e:
                 last_conn_error = e
-                if "AUTHENTICATIONFAILED" in str(e):
+                if is_auth_failure(e):
                     log(f"ERROR: IMAP authentication failed (credentials invalid or expired): {e}")
                     notify_error_to_slack(
                         "🔑 Gmail IMAP 認証エラー: 認証情報が無効または期限切れです。\n"
                         "Gmailのアプリパスワード（またはOAuth認証情報）を確認・再設定してください。\n"
                         f"エラー詳細: {e}",
                         dedup_key="imap_auth_error",
+                        dedup_seconds=AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS,
                     )
                     return True  # Auth failures won't self-heal with retries
                 log(f"WARN: IMAP connection/read error on attempt {attempt_idx + 1}/{total_attempts}: {e}")
@@ -1179,38 +1180,10 @@ def check_mail_with_status(processed_ids: Optional[Set[str]] = None) -> bool:
                     continue
                 # All retries exhausted
                 log(f"ERROR: IMAP connection failed after {total_attempts} attempts: {last_conn_error}")
-                if is_auth_failure(last_conn_error):
-                    # 資格情報の失効/無効。OAuth 方式と アプリパスワード方式で対処が異なるため、
-                    # 現在の認証方式に応じた案内を出す。接続瞬断とは別の分かりやすいメッセージ＋
-                    # 長めの抑止窓で通知する。
-                    if use_oauth():
-                        auth_alert = (
-                            "Gmail OAuth の認証に失敗しました（refresh token が無効/失効＝要再同意）。\n"
-                            f"エラー: {last_conn_error}\n"
-                            "対処: scripts/get-gmail-refresh-token.py で再度同意し、Railway 環境変数 "
-                            "`GMAIL_OAUTH_REFRESH_TOKEN` を更新してください。"
-                            "（refresh token は通常失効しませんが、取消・パスワード変更・"
-                            "6か月未使用で無効になることがあります）"
-                        )
-                    else:
-                        auth_alert = (
-                            "Gmail IMAP の認証に失敗しました（資格情報が無効/失効）。\n"
-                            f"エラー: {last_conn_error}\n"
-                            "対処: OAuth2 方式（GMAIL_OAUTH_*）への移行を推奨します。"
-                            "暫定対応として Google アカウントでアプリパスワードを再発行し、"
-                            "Railway 環境変数 `GMAIL_IMAP_PASSWORD` を更新してください。"
-                            "（アプリパスワードが Google 側で削除/失効した可能性があります）"
-                        )
-                    notify_error_to_slack(
-                        auth_alert,
-                        dedup_key="imap_auth_failure",
-                        dedup_seconds=AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS,
-                    )
-                else:
-                    notify_error_to_slack(
-                        f"Gmail IMAP connection error (after {total_attempts} attempts): {last_conn_error}",
-                        dedup_key="imap_connection_error",
-                    )
+                notify_error_to_slack(
+                    f"Gmail IMAP connection error (after {total_attempts} attempts): {last_conn_error}",
+                    dedup_key="imap_connection_error",
+                )
                 return True  # Not necessarily a quota error
         return True
 

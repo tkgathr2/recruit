@@ -1095,7 +1095,8 @@ class TestCheckMailWithStatusAuthError:
     @patch("src.main.notify_error_to_slack")
     @patch("src.main.has_imap_credentials", return_value=True)
     @patch("src.main.load_processed_ids", return_value=(set(), True))
-    def test_auth_error_sends_distinct_alert_and_does_not_retry(self, mock_load, mock_creds, mock_notify):
+    @patch("src.main.time.sleep")
+    def test_auth_error_sends_distinct_alert_and_does_not_retry(self, mock_sleep, mock_load, mock_creds, mock_notify):
         import imaplib as _imaplib
         auth_exc = _imaplib.IMAP4.error("[AUTHENTICATIONFAILED] Invalid credentials (Failure)")
         with patch("src.main._check_mail_attempt", side_effect=auth_exc):
@@ -1107,6 +1108,7 @@ class TestCheckMailWithStatusAuthError:
         assert call_kwargs[1]["dedup_key"] == "imap_auth_error"
         msg = call_kwargs[0][0]
         assert "認証" in msg
+        mock_sleep.assert_not_called()
 
     @patch("src.main.notify_error_to_slack")
     @patch("src.main.has_imap_credentials", return_value=True)
