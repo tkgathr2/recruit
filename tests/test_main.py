@@ -1547,3 +1547,120 @@ class TestGetRefreshTokenScriptPKCE:
         assert sent["client_secret"] == "sec"
         assert sent["client_id"] == "custom-client-id"
 
+
+# ---- H-4: _check_mail_attempt の dedup 機能テスト ------------------------------------
+
+class TestCheckMailAttemptDedup:
+    """_check_mail_attempt の UID/GM-MSGID dedup 機能テスト。
+
+    _check_mail_attempt(processed_ids) は内部で imap_connection() を使って IMAP に
+    接続するため、imap_connection コンテキストマネージャーをモックして IMAP オブジェクトを
+    注入する形でテストする。
+    """
+
+    def _make_imap_mock(self, uid_list, gm_msgid_map=None):
+        """uid_list を返す IMAP モックを作成する。
+
+        Args:
+            uid_list: UID の整数リスト（空リストの場合は空の受信トレイ）
+            gm_msgid_map: {uid: gm_msgid} のマッピング（省略時は uid*1000 を使用）
+        """
+        mail = MagicMock()
+        gm_msgid_map = gm_msgid_map or {}
+
+        # UID SEARCH レスポンス
+        if uid_list:
+            uid_bytes = b" ".join(str(u).encode() for u in uid_list)
+        else:
+            uid_bytes = b""
+
+        def fake_uid(cmd, *args):
+            if cmd == "search":
+                return ("OK", [uid_bytes])
+            elif cmd == "fetch":
+                # get_gm_msgid_lightweight 用の軽量フェッチ
+                uid_str = args[0].decode() if isinstance(args[0], bytes) else args[0]
+                uid_int = int(uid_str)
+                gm_id = gm_msgid_map.get(uid_int, uid_int * 1000)
+                header = f"{uid_int} (X-GM-MSGID {gm_id})".encode()
+                return ("OK", [(header, b"")])
+            return ("NO", [b""])
+
+        mail.uid.side_effect = fake_uid
+        return mail
+
+    def test_empty_mailbox_returns_without_processing(self):
+        """空の受信トレイでは process_mail_by_uid が呼ばれないこと。"""
+        from src.main import _check_mail_attempt
+        from contextlib import contextmanager
+
+        mail = self._make_imap_mock([])
+
+        @contextmanager
+        def mock_imap_connection():
+            yield mail
+
+        with patch("src.main.imap_connection", mock_imap_connection), \
+             patch("src.main.process_mail_by_uid") as mock_process:
+            _check_mail_attempt(set())
+
+        mock_process.assert_not_called()
+
+    def test_uid_cache_skips_already_processed(self):
+        """uid:X が processed_ids にある場合は軽量フェッチもスキップされること。"""
+        from src.main import _check_mail_attempt
+        from contextlib import contextmanager
+
+        mail = self._make_imap_mock([100, 101])
+        processed = {"uid:100", "uid:101"}
+
+        @contextmanager
+        def mock_imap_connection():
+            yield mail
+
+        with patch("src.main.imap_connection", mock_imap_connection), \
+             patch("src.main.process_mail_by_uid") as mock_process:
+            _check_mail_attempt(processed)
+
+        # uid: キャッシュがあるのでフル処理は不要
+        mock_process.assert_not_called()
+
+    def test_gm_msgid_dedup_skips_already_processed(self):
+        """gm:X が processed_ids にある UID は process_mail_by_uid が呼ばれないこと。"""
+        from src.main import _check_mail_attempt
+        from contextlib import contextmanager
+
+        # UID=200 → GM-MSGID=999002
+        mail = self._make_imap_mock([200], gm_msgid_map={200: 999002})
+        # gm:999002 は処理済み（uid:200 はキャッシュなし）
+        processed = {"gm:999002"}
+
+        @contextmanager
+        def mock_imap_connection():
+            yield mail
+
+        with patch("src.main.imap_connection", mock_imap_connection), \
+             patch("src.main.process_mail_by_uid") as mock_process, \
+             patch("src.main.save_processed_ids", return_value=True):
+            _check_mail_attempt(processed)
+
+        # gm: dedup が効いてフル処理は呼ばれない
+        mock_process.assert_not_called()
+
+    def test_new_uid_triggers_full_processing(self):
+        """未処理の UID は process_mail_by_uid が呼ばれること。"""
+        from src.main import _check_mail_attempt
+        from contextlib import contextmanager
+
+        mail = self._make_imap_mock([300], gm_msgid_map={300: 888001})
+
+        @contextmanager
+        def mock_imap_connection():
+            yield mail
+
+        with patch("src.main.imap_connection", mock_imap_connection), \
+             patch("src.main.process_mail_by_uid", return_value="gm:888001") as mock_process, \
+             patch("src.main.save_processed_ids", return_value=True):
+            _check_mail_attempt(set())
+
+        mock_process.assert_called_once()
