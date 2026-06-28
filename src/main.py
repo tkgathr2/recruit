@@ -914,7 +914,11 @@ def process_mail_by_uid(
                 log(f"Skip Indeed non-application mail: {subject[:80]}")
                 return unique_id  # 処理済みマーク、アラートなし
             else:
-                # 未知のパターン → Indeedが件名フォーマットを変更した可能性があるためアラート送信
+                # 未知のパターン → Indeedが件名フォーマットを変更した可能性がある。
+                # エラーチャネルにアラートを出しつつ、通常の応募通知チャネル（Slack/LINE）にも
+                # 「⚠️未分類」として通知して人間が必ず気づけるようにする。
+                # return None にして processed_ids に入れないことで、次サイクルでも再通知される
+                # （重複スパム防止は dedup_key によるエラーアラートの抑制で担保）。
                 date_header = decode_header_value(msg.get("Date", ""))
                 alert_msg = (
                     "⚠️ 件名不一致のIndeedメールを検知\n"
@@ -924,8 +928,15 @@ def process_mail_by_uid(
                     "Indeedが件名フォーマットを変更した可能性があります。determine_source関数の更新を検討してください。"
                 )
                 log(f"ALERT: Indeed email detected with unrecognized subject: {subject}")
-                notify_error_to_slack(alert_msg)
-                return unique_id  # アラート1回送信後は処理済みマーク（繰り返し通知を防止）
+                dedup_key = f"indeed_unclassified:{unique_id}"
+                notify_error_to_slack(alert_msg, dedup_key=dedup_key)
+                # 通常チャネルにも通知して人間が必ず確認できるようにする
+                html = extract_html(msg)
+                url = extract_indeed_url(html) or ""
+                unclassified_name = "⚠️未分類のIndeedメール（要確認）"
+                notify_slack_with_retry("indeed", unclassified_name, url)
+                notify_line_with_retry("indeed", unclassified_name, url)
+                return None  # 処理済みにしない＝次サイクルでも拾い直す（無限通知はdedup_keyで抑制）
         else:
             log(f"Skip non-target mail: {subject[:50]}...")
             return unique_id  # Indeed以外の対象外メールは静かにスキップ＋処理済みマーク
