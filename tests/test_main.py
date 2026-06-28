@@ -462,7 +462,7 @@ class TestExtractHtmlEdgeCases:
 
 class TestNotifySlackWithRetry:
     @patch('src.main.time.sleep')
-    @patch('src.main.requests.post')
+    @patch('src.main._http_session.post')
     @patch('src.main.get_slack_webhook_url')
     @patch('src.main.is_test_mode', return_value=False)
     def test_retry_on_failure_then_success(self, mock_test_mode, mock_get_url, mock_post, mock_sleep):
@@ -480,7 +480,7 @@ class TestNotifySlackWithRetry:
         mock_sleep.assert_called_once_with(1)  # 2^0 = 1 second backoff
 
     @patch('src.main.time.sleep')
-    @patch('src.main.requests.post')
+    @patch('src.main._http_session.post')
     @patch('src.main.get_slack_webhook_url')
     @patch('src.main.notify_error_to_slack')
     def test_all_retries_fail(self, mock_error, mock_get_url, mock_post, mock_sleep):
@@ -495,7 +495,7 @@ class TestNotifySlackWithRetry:
         mock_error.assert_called_once()
 
     @patch('src.main.time.sleep')
-    @patch('src.main.requests.post')
+    @patch('src.main._http_session.post')
     @patch('src.main.get_slack_webhook_url')
     @patch('src.main.notify_error_to_slack')
     def test_timeout_triggers_retry(self, mock_error, mock_get_url, mock_post, mock_sleep):
@@ -515,7 +515,7 @@ class TestNotifySlackWithRetry:
 
 class TestNotifyLineWithRetry:
     @patch('src.main.time.sleep')
-    @patch('src.main.requests.post')
+    @patch('src.main._http_session.post')
     @patch('src.main.get_line_to_id')
     @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
     @patch('src.main.is_test_mode', return_value=False)
@@ -534,7 +534,7 @@ class TestNotifyLineWithRetry:
         mock_sleep.assert_called_once_with(1)  # 2^0 = 1 second backoff
 
     @patch('src.main.time.sleep')
-    @patch('src.main.requests.post')
+    @patch('src.main._http_session.post')
     @patch('src.main.get_line_to_id')
     @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
     @patch('src.main.notify_error_to_slack')
@@ -551,7 +551,7 @@ class TestNotifyLineWithRetry:
         mock_error.assert_called_once()
 
     @patch('src.main.time.sleep')
-    @patch('src.main.requests.post')
+    @patch('src.main._http_session.post')
     @patch('src.main.get_line_to_id')
     @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
     @patch('src.main.notify_error_to_slack')
@@ -572,7 +572,7 @@ class TestNotifyLineWithRetry:
 
     @patch('src.main.time.sleep')
     @patch('src.main.shorten_url', side_effect=lambda u: u)
-    @patch('src.main.requests.post')
+    @patch('src.main._http_session.post')
     @patch('src.main.get_line_to_id')
     @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
     @patch('src.main.is_test_mode', return_value=False)
@@ -589,7 +589,7 @@ class TestNotifyLineWithRetry:
 
     @patch('src.main.time.sleep')
     @patch('src.main.shorten_url', side_effect=lambda u: u)
-    @patch('src.main.requests.post')
+    @patch('src.main._http_session.post')
     @patch('src.main.get_line_to_id')
     @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
     @patch('src.main.is_test_mode', return_value=False)
@@ -1031,7 +1031,7 @@ class TestNotifyLineWithRetryFallback:
         with patch("src.main.LINE_CHANNEL_ACCESS_TOKEN", "token"), \
              patch("src.main.LINE_TO_ID_PROD", "U123"), \
              patch("src.main.MODE", "prod"), \
-             patch("requests.post") as mock_post:
+             patch('src.main._http_session.post') as mock_post:
             mock_post.return_value = MagicMock(status_code=200)
             result = notify_line_with_retry("indeed", "田中", "https://indeed.com/x")
             assert result is True
@@ -1046,7 +1046,7 @@ class TestNotifyLineWithRetryFallback:
         with patch("src.main.LINE_CHANNEL_ACCESS_TOKEN", "token"), \
              patch("src.main.LINE_TO_ID_PROD", "U123"), \
              patch("src.main.MODE", "prod"), \
-             patch("requests.post", side_effect=responses):
+             patch('src.main._http_session.post', side_effect=responses):
             result = notify_line_with_retry("indeed", "田中", "https://indeed.com/x")
             assert result is True
 
@@ -1057,7 +1057,7 @@ class TestNotifyLineWithRetryFallback:
         with patch("src.main.LINE_CHANNEL_ACCESS_TOKEN", "token"), \
              patch("src.main.LINE_TO_ID_PROD", "U123"), \
              patch("src.main.MODE", "prod"), \
-             patch("requests.post") as mock_post:
+             patch('src.main._http_session.post') as mock_post:
             mock_post.return_value = MagicMock(status_code=200)
             notify_line_with_retry("indeed", "田中", "https://indeed.com/x")
             call_body = mock_post.call_args[1]["json"]
@@ -1077,7 +1077,7 @@ class TestNotifyLineWithRetryFallback:
         with patch("src.main.LINE_CHANNEL_ACCESS_TOKEN", "token"), \
              patch("src.main.LINE_TO_ID_PROD", "U123"), \
              patch("src.main.MODE", "prod"), \
-             patch("requests.post", side_effect=responses) as mock_post:
+             patch('src.main._http_session.post', side_effect=responses) as mock_post:
             result = notify_line_with_retry("indeed", "田中", "https://indeed.com/x")
             assert result is True
             # 2回目の呼び出し（フォールバック）のボディを検証
@@ -1235,6 +1235,7 @@ class TestGmailOAuth:
         go._cached_access_token = None
         go._cached_expires_at = 0.0
         mock_resp = MagicMock(status_code=400, text='{"error": "invalid_grant"}')
+        mock_resp.json.return_value = {"error": "invalid_grant"}
         with patch.object(go, "GMAIL_OAUTH_CLIENT_ID", "cid"), \
              patch.object(go, "GMAIL_OAUTH_CLIENT_SECRET", "sec"), \
              patch.object(go, "GMAIL_OAUTH_REFRESH_TOKEN", "rt"), \
@@ -1664,3 +1665,4 @@ class TestCheckMailAttemptDedup:
             _check_mail_attempt(set())
 
         mock_process.assert_called_once()
+
