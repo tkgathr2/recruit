@@ -1169,6 +1169,128 @@ class TestIMAPConnectionPoolOAuth:
         fresh.select.assert_called_once_with("INBOX", readonly=True)
 
 
+class TestIMAPConnectionPoolOAuthFallback:
+    """OAuth refresh token が失効したとき app-password にフォールバックすること。"""
+
+    def setup_method(self):
+        # 各テスト前にクラス変数フラグをリセット
+        from src.main import IMAPConnectionPool
+        IMAPConnectionPool._oauth_known_invalid = False
+
+    def teardown_method(self):
+        from src.main import IMAPConnectionPool
+        IMAPConnectionPool._oauth_known_invalid = False
+
+    def test_oauth_invalid_grant_falls_back_to_app_password(self):
+        """OAuth が invalid_grant で失敗した場合、同一接続試行内で app-password に切り替わること。"""
+        from src.main import IMAPConnectionPool
+        import imaplib as _imaplib
+
+        pool = IMAPConnectionPool()
+        # IMAP4_SSL は2回呼ばれる: 1回目=OAuth試行用、2回目=フォールバック用
+        fresh1 = MagicMock()
+        fresh2 = MagicMock()
+        imap_instances = [fresh1, fresh2]
+
+        auth_err = _imaplib.IMAP4.error(b"[AUTHENTICATIONFAILED] Invalid credentials (Failure)")
+
+        def fake_imap_authenticate(mail, user):
+            raise auth_err
+
+        with patch("src.main.imaplib.IMAP4_SSL", side_effect=imap_instances), \
+             patch("src.main.use_oauth", return_value=True), \
+             patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", "app-pw"), \
+             patch("src.main.gmail_oauth.imap_authenticate", side_effect=fake_imap_authenticate):
+            got = pool.get()
+
+        # フォールバック後の接続が返されること
+        assert got is fresh2
+        # app-password でログインされること
+        fresh2.login.assert_called_once_with("u@example.com", "app-pw")
+        fresh2.select.assert_called_once_with("INBOX", readonly=True)
+        # フラグが立っていること（以降 OAuth を試みない）
+        assert IMAPConnectionPool._oauth_known_invalid is True
+
+    def test_oauth_known_invalid_skips_oauth_directly(self):
+        """_oauth_known_invalid フラグが立っている場合は OAuth を試みず直接 app-password を使うこと。"""
+        from src.main import IMAPConnectionPool
+
+        IMAPConnectionPool._oauth_known_invalid = True
+        pool = IMAPConnectionPool()
+        fresh = MagicMock()
+
+        with patch("src.main.imaplib.IMAP4_SSL", return_value=fresh), \
+             patch("src.main.use_oauth", return_value=True), \
+             patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", "app-pw"), \
+             patch("src.main.gmail_oauth.imap_authenticate") as mock_auth:
+            got = pool.get()
+
+        assert got is fresh
+        mock_auth.assert_not_called()  # OAuth は試みない
+        fresh.login.assert_called_once_with("u@example.com", "app-pw")
+
+    def test_oauth_transient_error_does_not_fallback(self):
+        """一時的なネットワーク断は fallback せず通常の IMAP エラーとして上位に伝播すること。"""
+        from src.main import IMAPConnectionPool
+        import imaplib as _imaplib
+
+        pool = IMAPConnectionPool()
+        fresh = MagicMock()
+
+        # AUTHENTICATIONFAILED ではなく abort（一時障害）
+        transient_err = _imaplib.IMAP4.abort("connection reset by server")
+
+        with patch("src.main.imaplib.IMAP4_SSL", return_value=fresh), \
+             patch("src.main.use_oauth", return_value=True), \
+             patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", "app-pw"), \
+             patch("src.main.gmail_oauth.imap_authenticate", side_effect=transient_err), \
+             patch("src.main.time.sleep"):
+            with pytest.raises(_imaplib.IMAP4.abort):
+                pool.get()
+
+        # フラグは立てない（一時障害なので OAuth を諦めない）
+        assert IMAPConnectionPool._oauth_known_invalid is False
+
+    def test_oauth_failure_both_auth_fail_raises(self):
+        """OAuth も app-password も失敗した場合は例外を送出すること。
+
+        _connect_with_backoff は max_attempts=3 回試みる。
+        各試行で: OAuth 失敗 → フォールバック用新規接続 → login 失敗 → except で last_exc に記録。
+        3回全て失敗すると last_exc を raise する。
+        """
+        from src.main import IMAPConnectionPool
+        import imaplib as _imaplib
+
+        pool = IMAPConnectionPool()
+
+        auth_err = _imaplib.IMAP4.error(b"[AUTHENTICATIONFAILED] Invalid credentials (Failure)")
+        pw_err = _imaplib.IMAP4.error(b"[AUTHENTICATIONFAILED] App password invalid (Failure)")
+
+        def fake_imap_authenticate(mail, user):
+            raise auth_err
+
+        # IMAP4_SSL は各試行で2回 (OAuth用+フォールバック用) 呼ばれる → 3試行で最大6回
+        def make_fresh():
+            m = MagicMock()
+            m.login.side_effect = pw_err
+            m.logout.return_value = None
+            return m
+
+        imap_instances = [make_fresh() for _ in range(6)]
+
+        with patch("src.main.imaplib.IMAP4_SSL", side_effect=imap_instances), \
+             patch("src.main.use_oauth", return_value=True), \
+             patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", "bad-pw"), \
+             patch("src.main.gmail_oauth.imap_authenticate", side_effect=fake_imap_authenticate), \
+             patch("src.main.time.sleep"):
+            with pytest.raises(_imaplib.IMAP4.error):
+                pool.get()
+
+
 class TestCheckMailAuthHandling:
     """check_mail_with_status の認証/資格情報まわりの通知挙動。"""
 
