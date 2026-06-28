@@ -21,6 +21,9 @@ from src.main import (
     determine_source,
     is_indeed_non_application_email,
     is_from_indeed,
+    is_auth_failure,
+    has_imap_credentials,
+    check_mail_with_status,
     parse_fetch_response,
     load_processed_ids,
     save_processed_ids,
@@ -37,6 +40,7 @@ from src.main import (
     extract_job_title_from_html,
     check_mail_with_status,
 )
+import imaplib
 
 
 class TestDecodeHeaderValue:
@@ -164,6 +168,26 @@ class TestDetermineSource:
         source, url = determine_source(subject)
         assert source is None
         assert url is None
+
+    def test_indeed_subject_format_drift_fallback(self):
+        # 件名フォーマットが変わっても「応募」+動き/対象語の共起で応募と判定する（取りこぼし防止）
+        for subject in [
+            "【Indeed】新しい求人への応募が届きました",
+            "あなたの求人に応募を受け付けました",
+            "求人「警備員」に新規応募がありました",
+            "応募者が1名います（要対応）",
+        ]:
+            assert determine_source(subject)[0] == "indeed", subject
+
+    def test_fallback_does_not_misclassify_non_application(self):
+        # フォールバックを入れても、課金・レコメンド・認証系を応募と誤判定しないこと
+        for subject in [
+            "求人への応募状況をお知らせします",   # 応募状況レポート（非応募）
+            "認証コードを入力してログインしてください",
+            "Indeed請求のお知らせ",
+            "あなたにオススメ求人があります",
+        ]:
+            assert determine_source(subject)[0] is None, subject
 
 
 class TestIsIndeedNonApplicationEmail:
@@ -439,7 +463,7 @@ class TestExtractHtmlEdgeCases:
 
 class TestNotifySlackWithRetry:
     @patch('src.main.time.sleep')
-    @patch('src.main.requests.post')
+    @patch('src.main._http_session.post')
     @patch('src.main.get_slack_webhook_url')
     @patch('src.main.is_test_mode', return_value=False)
     def test_retry_on_failure_then_success(self, mock_test_mode, mock_get_url, mock_post, mock_sleep):
@@ -457,7 +481,7 @@ class TestNotifySlackWithRetry:
         mock_sleep.assert_called_once_with(1)  # 2^0 = 1 second backoff
 
     @patch('src.main.time.sleep')
-    @patch('src.main.requests.post')
+    @patch('src.main._http_session.post')
     @patch('src.main.get_slack_webhook_url')
     @patch('src.main.notify_error_to_slack')
     def test_all_retries_fail(self, mock_error, mock_get_url, mock_post, mock_sleep):
@@ -472,7 +496,7 @@ class TestNotifySlackWithRetry:
         mock_error.assert_called_once()
 
     @patch('src.main.time.sleep')
-    @patch('src.main.requests.post')
+    @patch('src.main._http_session.post')
     @patch('src.main.get_slack_webhook_url')
     @patch('src.main.notify_error_to_slack')
     def test_timeout_triggers_retry(self, mock_error, mock_get_url, mock_post, mock_sleep):
@@ -492,7 +516,7 @@ class TestNotifySlackWithRetry:
 
 class TestNotifyLineWithRetry:
     @patch('src.main.time.sleep')
-    @patch('src.main.requests.post')
+    @patch('src.main._http_session.post')
     @patch('src.main.get_line_to_id')
     @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
     @patch('src.main.is_test_mode', return_value=False)
@@ -511,7 +535,7 @@ class TestNotifyLineWithRetry:
         mock_sleep.assert_called_once_with(1)  # 2^0 = 1 second backoff
 
     @patch('src.main.time.sleep')
-    @patch('src.main.requests.post')
+    @patch('src.main._http_session.post')
     @patch('src.main.get_line_to_id')
     @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
     @patch('src.main.notify_error_to_slack')
@@ -528,7 +552,7 @@ class TestNotifyLineWithRetry:
         mock_error.assert_called_once()
 
     @patch('src.main.time.sleep')
-    @patch('src.main.requests.post')
+    @patch('src.main._http_session.post')
     @patch('src.main.get_line_to_id')
     @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
     @patch('src.main.notify_error_to_slack')
@@ -549,7 +573,7 @@ class TestNotifyLineWithRetry:
 
     @patch('src.main.time.sleep')
     @patch('src.main.shorten_url', side_effect=lambda u: u)
-    @patch('src.main.requests.post')
+    @patch('src.main._http_session.post')
     @patch('src.main.get_line_to_id')
     @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
     @patch('src.main.is_test_mode', return_value=False)
@@ -566,7 +590,7 @@ class TestNotifyLineWithRetry:
 
     @patch('src.main.time.sleep')
     @patch('src.main.shorten_url', side_effect=lambda u: u)
-    @patch('src.main.requests.post')
+    @patch('src.main._http_session.post')
     @patch('src.main.get_line_to_id')
     @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
     @patch('src.main.is_test_mode', return_value=False)
@@ -738,7 +762,11 @@ def test_process_mail_by_uid_real_indeed_application_is_processed():
 
 
 def test_process_mail_by_uid_indeed_unknown_subject_still_alerts():
-    """送信者が本物のIndeed(indeed.com)で件名が未知の場合のみ、フォーマット変更の安全網アラートを出す。"""
+    """送信者が本物のIndeed(indeed.com)で件名が未知の場合:
+    - エラーチャネルにフォーマット変更アラートを出す
+    - 通常チャネル（Slack/LINE）にも「⚠️未分類」として通知する（取りこぼし防止・バグ1修正）
+    - return None（処理済みにしない＝次サイクルでも再処理可能）
+    """
     from unittest.mock import patch
     mock_mail = _build_mail_mock(
         subject="重要なお知らせ（新フォーマット）",  # 応募でも既知の非応募でもない
@@ -751,10 +779,110 @@ def test_process_mail_by_uid_indeed_unknown_subject_still_alerts():
          patch("src.main.notify_line_with_retry", return_value=True) as mock_line:
         result = process_mail_by_uid(mock_mail, b"12", set())
 
-    mock_alert.assert_called_once()   # 安全網は本物のIndeedドメインに対してのみ働く
-    mock_slack.assert_not_called()
-    mock_line.assert_not_called()
-    assert result is not None
+    mock_alert.assert_called_once()   # 安全網アラート（エラーチャネル）は本物のIndeedドメインに対してのみ
+    mock_slack.assert_called_once()   # 通常チャネルにも通知（取りこぼし防止）
+    mock_line.assert_called_once()    # 通常チャネルにも通知（取りこぼし防止）
+    assert result is None             # 処理済みにしない（次サイクルで再処理可能）
+
+
+# ---- バグ1: 未分類IndeedメールのSlack/LINE通知 ----------------------------------------
+
+def test_process_mail_by_uid_unclassified_indeed_notifies_normal_channels():
+    """未分類のIndeedメール（応募でも既知の非応募でもない件名）は
+    Slack/LINEの通常チャネルに通知され、取りこぼされないこと（バグ1の回帰テスト）。
+
+    修正前: notify_error_to_slack だけ呼んで return unique_id（永久抑制）。
+    修正後: Slack/LINE にも通知し、return None（次サイクルで再処理可能）。
+    """
+    from unittest.mock import patch
+    mock_mail = _build_mail_mock(
+        subject="重要なお知らせ（新フォーマット）",  # 応募でも既知の非応募でもない
+        from_header="Indeed <noreply@indeed.com>",
+        uid_num=20,
+        gm_msgid="2020202020202020202",
+    )
+    with patch("src.main.notify_error_to_slack") as mock_alert, \
+         patch("src.main.notify_slack_with_retry", return_value=True) as mock_slack, \
+         patch("src.main.notify_line_with_retry", return_value=True) as mock_line:
+        result = process_mail_by_uid(mock_mail, b"20", set())
+
+    # エラーアラートも出る（フォーマット変更の可能性を管理者に知らせる）
+    mock_alert.assert_called_once()
+    # 通常チャネルにも通知される（取りこぼし防止）
+    mock_slack.assert_called_once()
+    mock_line.assert_called_once()
+    # return None → processed_ids に入らず次サイクルでも再処理可能
+    assert result is None, "未分類メールは processed_ids に入れず None を返すべき"
+
+
+def test_unclassified_indeed_normal_channel_notified_only_once():
+    """未分類Indeedメールの通常チャネル（Slack/LINE）通知は「1メール=1回だけ」であること。
+
+    同一 unique_id のメールが2サイクル処理されても、Slack/LINE への通知は初回のみ。
+    エラーチャネル（notify_error_to_slack）は10分dedup制御なので2回呼ばれる想定。
+    """
+    import src.main as main_module
+    from unittest.mock import patch, call
+
+    # テスト間でグローバル state が汚染しないよう明示クリア
+    main_module._unclassified_normal_notified.discard("gm:3030303030303030303")
+
+    mock_mail = _build_mail_mock(
+        subject="全く新しいフォーマットのIndeedメール",
+        from_header="Indeed <noreply@indeed.com>",
+        uid_num=30,
+        gm_msgid="3030303030303030303",
+    )
+
+    # --- 1サイクル目 ---
+    with patch("src.main.notify_error_to_slack") as mock_alert, \
+         patch("src.main.notify_slack_with_retry", return_value=True) as mock_slack, \
+         patch("src.main.notify_line_with_retry", return_value=True) as mock_line:
+        result1 = process_mail_by_uid(mock_mail, b"30", set())
+
+    assert result1 is None, "1サイクル目: 処理済みにしない"
+    mock_alert.assert_called_once()   # エラーチャネルは通知される
+    mock_slack.assert_called_once()   # 1サイクル目: 通常チャネルも通知される
+    mock_line.assert_called_once()    # 1サイクル目: 通常チャネルも通知される
+
+    # --- 2サイクル目（同一メール・同一 unique_id）---
+    with patch("src.main.notify_error_to_slack") as mock_alert2, \
+         patch("src.main.notify_slack_with_retry", return_value=True) as mock_slack2, \
+         patch("src.main.notify_line_with_retry", return_value=True) as mock_line2:
+        result2 = process_mail_by_uid(mock_mail, b"30", set())
+
+    assert result2 is None, "2サイクル目: 引き続き処理済みにしない"
+    mock_alert2.assert_called_once()       # エラーチャネルは10分dedup制御（モック上は呼ばれる）
+    mock_slack2.assert_not_called()        # 2サイクル目: 通常チャネルは呼ばれない
+    mock_line2.assert_not_called()         # 2サイクル目: 通常チャネルは呼ばれない
+
+    # 後片付け
+    main_module._unclassified_normal_notified.discard("gm:3030303030303030303")
+
+
+# ---- バグ2: processed_ids のメモリ保持 -----------------------------------------------
+
+def test_check_mail_with_status_reuses_passed_processed_ids():
+    """check_mail_with_status に processed_ids を渡した場合、load_processed_ids を
+    呼ばずに渡されたセットをそのまま利用すること（バグ2の回帰テスト）。
+
+    修正前: 毎サイクルで load_processed_ids() を呼んでいた。
+    修正後: 引数で渡された processed_ids をそのまま _check_mail_attempt に転送する。
+    """
+    from unittest.mock import patch, MagicMock
+    from src.main import check_mail_with_status
+
+    existing_ids = {"gm:111", "uid:5"}
+
+    with patch("src.main.has_imap_credentials", return_value=True), \
+         patch("src.main.load_processed_ids") as mock_load, \
+         patch("src.main._check_mail_attempt") as mock_attempt:
+        check_mail_with_status(existing_ids)
+
+    # load_processed_ids は一切呼ばれない
+    mock_load.assert_not_called()
+    # 渡したセットがそのまま _check_mail_attempt に渡される
+    mock_attempt.assert_called_once_with(existing_ids)
 
 
 class TestIMAPConnectionPool:
@@ -904,7 +1032,7 @@ class TestNotifyLineWithRetryFallback:
         with patch("src.main.LINE_CHANNEL_ACCESS_TOKEN", "token"), \
              patch("src.main.LINE_TO_ID_PROD", "U123"), \
              patch("src.main.MODE", "prod"), \
-             patch("requests.post") as mock_post:
+             patch('src.main._http_session.post') as mock_post:
             mock_post.return_value = MagicMock(status_code=200)
             result = notify_line_with_retry("indeed", "田中", "https://indeed.com/x")
             assert result is True
@@ -919,7 +1047,7 @@ class TestNotifyLineWithRetryFallback:
         with patch("src.main.LINE_CHANNEL_ACCESS_TOKEN", "token"), \
              patch("src.main.LINE_TO_ID_PROD", "U123"), \
              patch("src.main.MODE", "prod"), \
-             patch("requests.post", side_effect=responses):
+             patch('src.main._http_session.post', side_effect=responses):
             result = notify_line_with_retry("indeed", "田中", "https://indeed.com/x")
             assert result is True
 
@@ -930,7 +1058,7 @@ class TestNotifyLineWithRetryFallback:
         with patch("src.main.LINE_CHANNEL_ACCESS_TOKEN", "token"), \
              patch("src.main.LINE_TO_ID_PROD", "U123"), \
              patch("src.main.MODE", "prod"), \
-             patch("requests.post") as mock_post:
+             patch('src.main._http_session.post') as mock_post:
             mock_post.return_value = MagicMock(status_code=200)
             notify_line_with_retry("indeed", "田中", "https://indeed.com/x")
             call_body = mock_post.call_args[1]["json"]
@@ -950,7 +1078,7 @@ class TestNotifyLineWithRetryFallback:
         with patch("src.main.LINE_CHANNEL_ACCESS_TOKEN", "token"), \
              patch("src.main.LINE_TO_ID_PROD", "U123"), \
              patch("src.main.MODE", "prod"), \
-             patch("requests.post", side_effect=responses) as mock_post:
+             patch('src.main._http_session.post', side_effect=responses) as mock_post:
             result = notify_line_with_retry("indeed", "田中", "https://indeed.com/x")
             assert result is True
             # 2回目の呼び出し（フォールバック）のボディを検証
@@ -965,8 +1093,9 @@ class TestCheckMailWithStatusAuthError:
     """KZ-23: AUTHENTICATIONFAILED エラーを即時検知して actionable な Slack 通知を送ること。"""
 
     @patch("src.main.notify_error_to_slack")
+    @patch("src.main.has_imap_credentials", return_value=True)
     @patch("src.main.load_processed_ids", return_value=(set(), True))
-    def test_auth_error_sends_distinct_alert_and_does_not_retry(self, mock_load, mock_notify):
+    def test_auth_error_sends_distinct_alert_and_does_not_retry(self, mock_load, mock_creds, mock_notify):
         import imaplib as _imaplib
         auth_exc = _imaplib.IMAP4.error("[AUTHENTICATIONFAILED] Invalid credentials (Failure)")
         with patch("src.main._check_mail_attempt", side_effect=auth_exc):
@@ -980,10 +1109,10 @@ class TestCheckMailWithStatusAuthError:
         assert "認証" in msg
 
     @patch("src.main.notify_error_to_slack")
+    @patch("src.main.has_imap_credentials", return_value=True)
     @patch("src.main.load_processed_ids", return_value=(set(), True))
-    def test_non_auth_imap_error_still_retries(self, mock_load, mock_notify):
+    def test_non_auth_imap_error_still_retries(self, mock_load, mock_creds, mock_notify):
         import imaplib as _imaplib
-        import socket as _socket
         conn_exc = _imaplib.IMAP4.error("Connection refused")
         with patch("src.main._check_mail_attempt", side_effect=conn_exc), \
              patch("src.main.time.sleep"):
@@ -993,3 +1122,582 @@ class TestCheckMailWithStatusAuthError:
         mock_notify.assert_called_once()
         call_kwargs = mock_notify.call_args
         assert call_kwargs[1]["dedup_key"] == "imap_connection_error"
+
+class TestIsAuthFailure:
+    """`[AUTHENTICATIONFAILED]`/Invalid credentials を一時障害と区別できること。"""
+
+    def test_authenticationfailed_error(self):
+        err = imaplib.IMAP4.error(b"[AUTHENTICATIONFAILED] Invalid credentials (Failure)")
+        assert is_auth_failure(err) is True
+
+    def test_invalid_credentials_plain(self):
+        assert is_auth_failure("Invalid credentials") is True
+
+    def test_transient_errors_are_not_auth_failure(self):
+        for err in [
+            "The read operation timed out",
+            imaplib.IMAP4.abort("server hung up"),
+            OSError("connection reset"),
+            "[OVERQUOTA] limit exceeded",
+        ]:
+            assert is_auth_failure(err) is False, err
+
+
+class TestHasImapCredentials:
+    def test_present(self):
+        with patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", "pw"), \
+             patch("src.main.use_oauth", return_value=False):
+            assert has_imap_credentials() is True
+
+    def test_missing_password(self):
+        with patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", None), \
+             patch("src.main.use_oauth", return_value=False):
+            assert has_imap_credentials() is False
+
+    def test_missing_user(self):
+        with patch("src.main.GMAIL_IMAP_USER", None), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", "pw"), \
+             patch("src.main.use_oauth", return_value=False):
+            assert has_imap_credentials() is False
+
+    def test_oauth_only_is_sufficient(self):
+        # OAuth2 方式が揃っていれば、アプリパスワード無しでも資格情報あり扱い。
+        with patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", None), \
+             patch("src.main.use_oauth", return_value=True):
+            assert has_imap_credentials() is True
+
+    def test_oauth_without_user_is_insufficient(self):
+        # OAuth が揃っていても Gmail アドレス(GMAIL_IMAP_USER)が無ければ不可。
+        with patch("src.main.GMAIL_IMAP_USER", None), \
+             patch("src.main.use_oauth", return_value=True):
+            assert has_imap_credentials() is False
+
+
+class TestGmailOAuth:
+    """src/gmail_oauth.py の refresh token → access token フロー。"""
+
+    def test_has_oauth_credentials_all_present(self):
+        import src.gmail_oauth as go
+        with patch.object(go, "GMAIL_OAUTH_CLIENT_ID", "cid"), \
+             patch.object(go, "GMAIL_OAUTH_CLIENT_SECRET", "sec"), \
+             patch.object(go, "GMAIL_OAUTH_REFRESH_TOKEN", "rt"):
+            assert go.has_oauth_credentials() is True
+
+    def test_has_oauth_credentials_without_secret_is_sufficient(self):
+        # PKCE 方式: client_secret が無くても CLIENT_ID + REFRESH_TOKEN で OAuth 有効。
+        import src.gmail_oauth as go
+        with patch.object(go, "GMAIL_OAUTH_CLIENT_ID", "cid"), \
+             patch.object(go, "GMAIL_OAUTH_CLIENT_SECRET", None), \
+             patch.object(go, "GMAIL_OAUTH_REFRESH_TOKEN", "rt"):
+            assert go.has_oauth_credentials() is True
+
+    def test_has_oauth_credentials_missing(self):
+        import src.gmail_oauth as go
+        with patch.object(go, "GMAIL_OAUTH_CLIENT_ID", "cid"), \
+             patch.object(go, "GMAIL_OAUTH_CLIENT_SECRET", "sec"), \
+             patch.object(go, "GMAIL_OAUTH_REFRESH_TOKEN", None):
+            assert go.has_oauth_credentials() is False
+
+    def test_has_oauth_credentials_missing_client_id(self):
+        import src.gmail_oauth as go
+        with patch.object(go, "GMAIL_OAUTH_CLIENT_ID", None), \
+             patch.object(go, "GMAIL_OAUTH_CLIENT_SECRET", None), \
+             patch.object(go, "GMAIL_OAUTH_REFRESH_TOKEN", "rt"):
+            assert go.has_oauth_credentials() is False
+
+    def test_build_xoauth2_string_format(self):
+        import src.gmail_oauth as go
+        s = go.build_xoauth2_string("user@example.com", "TOKEN123")
+        assert s == "user=user@example.com\x01auth=Bearer TOKEN123\x01\x01"
+
+    def test_refresh_access_token_caches(self):
+        import src.gmail_oauth as go
+        # キャッシュをクリア
+        go._cached_access_token = None
+        go._cached_expires_at = 0.0
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"access_token": "AT", "expires_in": 3600}
+        with patch.object(go, "GMAIL_OAUTH_CLIENT_ID", "cid"), \
+             patch.object(go, "GMAIL_OAUTH_CLIENT_SECRET", "sec"), \
+             patch.object(go, "GMAIL_OAUTH_REFRESH_TOKEN", "rt"), \
+             patch("src.gmail_oauth.requests.post", return_value=mock_resp) as mock_post:
+            tok1 = go.get_access_token()
+            tok2 = go.get_access_token()  # 2回目はキャッシュから（postは増えない）
+        assert tok1 == "AT"
+        assert tok2 == "AT"
+        mock_post.assert_called_once()
+
+    def test_refresh_without_secret_omits_client_secret(self):
+        # PKCE 方式: client_secret が未設定なら refresh リクエストに含めない。
+        import src.gmail_oauth as go
+        go._cached_access_token = None
+        go._cached_expires_at = 0.0
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"access_token": "AT", "expires_in": 3600}
+        with patch.object(go, "GMAIL_OAUTH_CLIENT_ID", "cid"), \
+             patch.object(go, "GMAIL_OAUTH_CLIENT_SECRET", None), \
+             patch.object(go, "GMAIL_OAUTH_REFRESH_TOKEN", "rt"), \
+             patch("src.gmail_oauth.requests.post", return_value=mock_resp) as mock_post:
+            tok = go.get_access_token()
+        assert tok == "AT"
+        sent = mock_post.call_args.kwargs["data"]
+        assert "client_secret" not in sent
+        assert sent["client_id"] == "cid"
+        assert sent["refresh_token"] == "rt"
+        assert sent["grant_type"] == "refresh_token"
+
+    def test_refresh_with_secret_includes_client_secret(self):
+        # client_secret が設定されていれば併用する（後方互換）。
+        import src.gmail_oauth as go
+        go._cached_access_token = None
+        go._cached_expires_at = 0.0
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"access_token": "AT", "expires_in": 3600}
+        with patch.object(go, "GMAIL_OAUTH_CLIENT_ID", "cid"), \
+             patch.object(go, "GMAIL_OAUTH_CLIENT_SECRET", "sec"), \
+             patch.object(go, "GMAIL_OAUTH_REFRESH_TOKEN", "rt"), \
+             patch("src.gmail_oauth.requests.post", return_value=mock_resp) as mock_post:
+            tok = go.get_access_token()
+        assert tok == "AT"
+        sent = mock_post.call_args.kwargs["data"]
+        assert sent["client_secret"] == "sec"
+
+    def test_refresh_invalid_grant_raises_runtime_error(self):
+        import src.gmail_oauth as go
+        go._cached_access_token = None
+        go._cached_expires_at = 0.0
+        mock_resp = MagicMock(status_code=400, text='{"error": "invalid_grant"}')
+        mock_resp.json.return_value = {"error": "invalid_grant"}
+        with patch.object(go, "GMAIL_OAUTH_CLIENT_ID", "cid"), \
+             patch.object(go, "GMAIL_OAUTH_CLIENT_SECRET", "sec"), \
+             patch.object(go, "GMAIL_OAUTH_REFRESH_TOKEN", "rt"), \
+             patch("src.gmail_oauth.requests.post", return_value=mock_resp):
+            with pytest.raises(RuntimeError) as exc:
+                go.get_access_token(force_refresh=True)
+        # invalid_grant は is_auth_failure で認証失効として扱われること
+        assert is_auth_failure(exc.value) is True
+
+    def test_imap_authenticate_uses_xoauth2(self):
+        import src.gmail_oauth as go
+        go._cached_access_token = "AT"
+        go._cached_expires_at = float("inf")
+        mock_mail = MagicMock()
+        go.imap_authenticate(mock_mail, "user@example.com")
+        mock_mail.authenticate.assert_called()
+        # 第1引数が XOAUTH2 であること
+        assert mock_mail.authenticate.call_args.args[0] == "XOAUTH2"
+
+
+class TestIMAPConnectionPoolOAuth:
+    """OAuth が有効なときに pool が XOAUTH2 で認証すること。"""
+
+    def test_connect_uses_oauth_when_enabled(self):
+        from src.main import IMAPConnectionPool
+        pool = IMAPConnectionPool()
+        fresh = MagicMock()
+        with patch("src.main.imaplib.IMAP4_SSL", return_value=fresh), \
+             patch("src.main.use_oauth", return_value=True), \
+             patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
+             patch("src.main.gmail_oauth.imap_authenticate") as mock_auth:
+            got = pool.get()
+        assert got is fresh
+        mock_auth.assert_called_once_with(fresh, "u@example.com")
+        fresh.login.assert_not_called()  # アプリパスワード login は使わない
+        fresh.select.assert_called_once_with("INBOX", readonly=True)
+
+
+class TestIMAPConnectionPoolOAuthFallback:
+    """OAuth refresh token が失効したとき app-password にフォールバックすること。"""
+
+    def setup_method(self):
+        # 各テスト前にクラス変数フラグをリセット
+        from src.main import IMAPConnectionPool
+        IMAPConnectionPool._oauth_known_invalid = False
+
+    def teardown_method(self):
+        from src.main import IMAPConnectionPool
+        IMAPConnectionPool._oauth_known_invalid = False
+
+    def test_oauth_invalid_grant_falls_back_to_app_password(self):
+        """OAuth が invalid_grant で失敗した場合、同一接続試行内で app-password に切り替わること。"""
+        from src.main import IMAPConnectionPool
+        import imaplib as _imaplib
+
+        pool = IMAPConnectionPool()
+        # IMAP4_SSL は2回呼ばれる: 1回目=OAuth試行用、2回目=フォールバック用
+        fresh1 = MagicMock()
+        fresh2 = MagicMock()
+        imap_instances = [fresh1, fresh2]
+
+        auth_err = _imaplib.IMAP4.error(b"[AUTHENTICATIONFAILED] Invalid credentials (Failure)")
+
+        def fake_imap_authenticate(mail, user):
+            raise auth_err
+
+        with patch("src.main.imaplib.IMAP4_SSL", side_effect=imap_instances), \
+             patch("src.main.use_oauth", return_value=True), \
+             patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", "app-pw"), \
+             patch("src.main.gmail_oauth.imap_authenticate", side_effect=fake_imap_authenticate):
+            got = pool.get()
+
+        # フォールバック後の接続が返されること
+        assert got is fresh2
+        # app-password でログインされること
+        fresh2.login.assert_called_once_with("u@example.com", "app-pw")
+        fresh2.select.assert_called_once_with("INBOX", readonly=True)
+        # フラグが立っていること（以降 OAuth を試みない）
+        assert IMAPConnectionPool._oauth_known_invalid is True
+
+    def test_oauth_known_invalid_skips_oauth_directly(self):
+        """_oauth_known_invalid フラグが立っている場合は OAuth を試みず直接 app-password を使うこと。"""
+        from src.main import IMAPConnectionPool
+
+        IMAPConnectionPool._oauth_known_invalid = True
+        pool = IMAPConnectionPool()
+        fresh = MagicMock()
+
+        with patch("src.main.imaplib.IMAP4_SSL", return_value=fresh), \
+             patch("src.main.use_oauth", return_value=True), \
+             patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", "app-pw"), \
+             patch("src.main.gmail_oauth.imap_authenticate") as mock_auth:
+            got = pool.get()
+
+        assert got is fresh
+        mock_auth.assert_not_called()  # OAuth は試みない
+        fresh.login.assert_called_once_with("u@example.com", "app-pw")
+
+    def test_oauth_transient_error_does_not_fallback(self):
+        """一時的なネットワーク断は fallback せず通常の IMAP エラーとして上位に伝播すること。"""
+        from src.main import IMAPConnectionPool
+        import imaplib as _imaplib
+
+        pool = IMAPConnectionPool()
+        fresh = MagicMock()
+
+        # AUTHENTICATIONFAILED ではなく abort（一時障害）
+        transient_err = _imaplib.IMAP4.abort("connection reset by server")
+
+        with patch("src.main.imaplib.IMAP4_SSL", return_value=fresh), \
+             patch("src.main.use_oauth", return_value=True), \
+             patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", "app-pw"), \
+             patch("src.main.gmail_oauth.imap_authenticate", side_effect=transient_err), \
+             patch("src.main.time.sleep"):
+            with pytest.raises(_imaplib.IMAP4.abort):
+                pool.get()
+
+        # フラグは立てない（一時障害なので OAuth を諦めない）
+        assert IMAPConnectionPool._oauth_known_invalid is False
+
+    def test_oauth_failure_both_auth_fail_raises(self):
+        """OAuth も app-password も失敗した場合は例外を送出すること。
+
+        _connect_with_backoff は max_attempts=3 回試みる。
+        各試行で: OAuth 失敗 → フォールバック用新規接続 → login 失敗 → except で last_exc に記録。
+        3回全て失敗すると last_exc を raise する。
+        """
+        from src.main import IMAPConnectionPool
+        import imaplib as _imaplib
+
+        pool = IMAPConnectionPool()
+
+        auth_err = _imaplib.IMAP4.error(b"[AUTHENTICATIONFAILED] Invalid credentials (Failure)")
+        pw_err = _imaplib.IMAP4.error(b"[AUTHENTICATIONFAILED] App password invalid (Failure)")
+
+        def fake_imap_authenticate(mail, user):
+            raise auth_err
+
+        # IMAP4_SSL は各試行で2回 (OAuth用+フォールバック用) 呼ばれる → 3試行で最大6回
+        def make_fresh():
+            m = MagicMock()
+            m.login.side_effect = pw_err
+            m.logout.return_value = None
+            return m
+
+        imap_instances = [make_fresh() for _ in range(6)]
+
+        with patch("src.main.imaplib.IMAP4_SSL", side_effect=imap_instances), \
+             patch("src.main.use_oauth", return_value=True), \
+             patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", "bad-pw"), \
+             patch("src.main.gmail_oauth.imap_authenticate", side_effect=fake_imap_authenticate), \
+             patch("src.main.time.sleep"):
+            with pytest.raises(_imaplib.IMAP4.error):
+                pool.get()
+
+
+class TestCheckMailAuthHandling:
+    """check_mail_with_status の認証/資格情報まわりの通知挙動。"""
+
+    @patch("src.main.notify_error_to_slack")
+    @patch("src.main.log")
+    def test_missing_credentials_sends_distinct_alert(self, mock_log, mock_error):
+        with patch("src.main.GMAIL_IMAP_USER", None), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", None):
+            result = check_mail_with_status()
+        assert result is True  # 設定待ち。quota扱いで過度にbackoffしない
+        mock_error.assert_called_once()
+        assert mock_error.call_args.kwargs.get("dedup_key") == "imap_missing_credentials"
+
+    @patch("src.main.time.sleep")
+    @patch("src.main.notify_error_to_slack")
+    @patch("src.main.log")
+    def test_auth_failure_sends_credential_alert(self, mock_log, mock_error, mock_sleep):
+        auth_err = imaplib.IMAP4.error(b"[AUTHENTICATIONFAILED] Invalid credentials (Failure)")
+        with patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", "pw"), \
+             patch("src.main.load_processed_ids", return_value=(set(), True)), \
+             patch("src.main._check_mail_attempt", side_effect=auth_err):
+            result = check_mail_with_status()
+        assert result is True
+        mock_error.assert_called_once()
+        kwargs = mock_error.call_args.kwargs
+        # KZ-23: AUTHENTICATIONFAILED は即時検知で imap_auth_error キーを使う
+        assert kwargs.get("dedup_key") == "imap_auth_error"
+        # 認証エラーを示す文言が含まれること
+        assert "認証" in mock_error.call_args.args[0]
+
+    @patch("src.main.time.sleep")
+    @patch("src.main.notify_error_to_slack")
+    @patch("src.main.log")
+    def test_transient_failure_uses_generic_key(self, mock_log, mock_error, mock_sleep):
+        timeout_err = TimeoutError("The read operation timed out")
+        with patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", "pw"), \
+             patch("src.main.load_processed_ids", return_value=(set(), True)), \
+             patch("src.main._check_mail_attempt", side_effect=timeout_err):
+            result = check_mail_with_status()
+        assert result is True
+        mock_error.assert_called_once()
+        assert mock_error.call_args.kwargs.get("dedup_key") == "imap_connection_error"
+
+
+class TestUseOauthEnablement:
+    """src/main.py の OAuth 有効化条件（PKCE: secret 任意）と後方互換。"""
+
+    def test_use_oauth_true_without_secret(self):
+        # CLIENT_ID + REFRESH_TOKEN が揃えば secret 無しでも OAuth 有効。
+        import src.gmail_oauth as go
+        from src.main import use_oauth
+        with patch.object(go, "GMAIL_OAUTH_CLIENT_ID", "cid"), \
+             patch.object(go, "GMAIL_OAUTH_CLIENT_SECRET", None), \
+             patch.object(go, "GMAIL_OAUTH_REFRESH_TOKEN", "rt"):
+            assert use_oauth() is True
+
+    def test_use_oauth_false_when_oauth_unset_falls_back_to_app_password(self):
+        # OAuth 変数が無ければ OAuth 無効 → アプリパスワード IMAP にフォールバック（後方互換）。
+        import src.gmail_oauth as go
+        from src.main import use_oauth, has_imap_credentials
+        with patch.object(go, "GMAIL_OAUTH_CLIENT_ID", None), \
+             patch.object(go, "GMAIL_OAUTH_CLIENT_SECRET", None), \
+             patch.object(go, "GMAIL_OAUTH_REFRESH_TOKEN", None):
+            assert use_oauth() is False
+        # アプリパスワードが設定されていれば従来どおり資格情報ありと判定される。
+        with patch("src.main.GMAIL_IMAP_USER", "u@example.com"), \
+             patch("src.main.GMAIL_IMAP_PASSWORD", "pw"), \
+             patch("src.main.use_oauth", return_value=False):
+            assert has_imap_credentials() is True
+
+
+class TestGetRefreshTokenScriptPKCE:
+    """scripts/get-gmail-refresh-token.py の PKCE 生成・client_id 既定・secret 任意。"""
+
+    def _load_script_module(self):
+        import importlib.util
+        script_path = os.path.join(
+            os.path.dirname(__file__), "..", "scripts", "get-gmail-refresh-token.py"
+        )
+        spec = importlib.util.spec_from_file_location("get_gmail_refresh_token", script_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_pkce_pair_valid_s256(self):
+        import base64
+        import hashlib
+        mod = self._load_script_module()
+        verifier, challenge = mod.generate_pkce_pair()
+        # RFC 7636: verifier は 43〜128 文字
+        assert 43 <= len(verifier) <= 128
+        # challenge = BASE64URL(SHA256(verifier)) パディング無し
+        expected = base64.urlsafe_b64encode(
+            hashlib.sha256(verifier.encode("ascii")).digest()
+        ).decode("ascii").rstrip("=")
+        assert challenge == expected
+        assert "=" not in challenge
+
+    def test_pkce_pair_is_random(self):
+        mod = self._load_script_module()
+        v1, _ = mod.generate_pkce_pair()
+        v2, _ = mod.generate_pkce_pair()
+        assert v1 != v2
+
+    def test_default_client_id_constant(self):
+        mod = self._load_script_module()
+        # 本番稼働中の「Claude Code MCP Desktop」クライアントの実値（2026-06-28 本番確認済み）。
+        # recruit-gmail-oauth3 クライアント (235822259813-7jdk1qosim8dj1lvej712br6e2i5iuam...) は
+        # 代替（任意）。現本番では使用していない。
+        assert mod.DEFAULT_CLIENT_ID == (
+            "235822259813-c9851j36ke8n0ne2jnclai4irktjr76d.apps.googleusercontent.com"
+        )
+
+    def test_missing_secret_returns_error(self):
+        # client_secret が未設定のとき rc == 1 でエラー終了すること。
+        # このクライアント（デスクトップアプリ型）は PKCE のみでは動作しない
+        # （Google が 400 invalid_request: client_secret is missing を返す）。
+        mod = self._load_script_module()
+
+        with patch.object(mod, "webbrowser"), \
+             patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GMAIL_OAUTH_CLIENT_SECRET", None)
+            os.environ.pop("GMAIL_OAUTH_CLIENT_JSON", None)
+            rc = mod.main(argv=[])
+        assert rc == 1, "client_secret 未設定のとき rc == 1 でエラー終了すべき"
+
+    def test_token_exchange_includes_secret_when_set(self):
+        mod = self._load_script_module()
+        captured = {}
+
+        def fake_post(url, data=None, timeout=None):
+            captured["data"] = data
+            resp = MagicMock(status_code=200)
+            resp.json.return_value = {"refresh_token": "RT"}
+            return resp
+
+        mod._auth_code_holder["code"] = "AUTHCODE"
+        mod._auth_code_holder["error"] = None
+        with patch.object(mod, "webbrowser"), \
+             patch.object(mod.http.server, "HTTPServer") as mock_server_cls, \
+             patch.object(mod.threading, "Thread") as mock_thread_cls, \
+             patch.object(mod.requests, "post", side_effect=fake_post), \
+             patch.dict(os.environ, {"GMAIL_OAUTH_CLIENT_SECRET": "sec"}, clear=False):
+            mock_server_cls.return_value = MagicMock()
+            mock_thread_cls.return_value = MagicMock()
+            rc = mod.main(argv=["custom-client-id"])
+        assert rc == 0
+        sent = captured["data"]
+        assert sent["client_secret"] == "sec"
+        assert sent["client_id"] == "custom-client-id"
+
+
+# ---- H-4: _check_mail_attempt の dedup 機能テスト ------------------------------------
+
+class TestCheckMailAttemptDedup:
+    """_check_mail_attempt の UID/GM-MSGID dedup 機能テスト。
+
+    _check_mail_attempt(processed_ids) は内部で imap_connection() を使って IMAP に
+    接続するため、imap_connection コンテキストマネージャーをモックして IMAP オブジェクトを
+    注入する形でテストする。
+    """
+
+    def _make_imap_mock(self, uid_list, gm_msgid_map=None):
+        """uid_list を返す IMAP モックを作成する。
+
+        Args:
+            uid_list: UID の整数リスト（空リストの場合は空の受信トレイ）
+            gm_msgid_map: {uid: gm_msgid} のマッピング（省略時は uid*1000 を使用）
+        """
+        mail = MagicMock()
+        gm_msgid_map = gm_msgid_map or {}
+
+        # UID SEARCH レスポンス
+        if uid_list:
+            uid_bytes = b" ".join(str(u).encode() for u in uid_list)
+        else:
+            uid_bytes = b""
+
+        def fake_uid(cmd, *args):
+            if cmd == "search":
+                return ("OK", [uid_bytes])
+            elif cmd == "fetch":
+                # get_gm_msgid_lightweight 用の軽量フェッチ
+                uid_str = args[0].decode() if isinstance(args[0], bytes) else args[0]
+                uid_int = int(uid_str)
+                gm_id = gm_msgid_map.get(uid_int, uid_int * 1000)
+                header = f"{uid_int} (X-GM-MSGID {gm_id})".encode()
+                return ("OK", [(header, b"")])
+            return ("NO", [b""])
+
+        mail.uid.side_effect = fake_uid
+        return mail
+
+    def test_empty_mailbox_returns_without_processing(self):
+        """空の受信トレイでは process_mail_by_uid が呼ばれないこと。"""
+        from src.main import _check_mail_attempt
+        from contextlib import contextmanager
+
+        mail = self._make_imap_mock([])
+
+        @contextmanager
+        def mock_imap_connection():
+            yield mail
+
+        with patch("src.main.imap_connection", mock_imap_connection), \
+             patch("src.main.process_mail_by_uid") as mock_process:
+            _check_mail_attempt(set())
+
+        mock_process.assert_not_called()
+
+    def test_uid_cache_skips_already_processed(self):
+        """uid:X が processed_ids にある場合は軽量フェッチもスキップされること。"""
+        from src.main import _check_mail_attempt
+        from contextlib import contextmanager
+
+        mail = self._make_imap_mock([100, 101])
+        processed = {"uid:100", "uid:101"}
+
+        @contextmanager
+        def mock_imap_connection():
+            yield mail
+
+        with patch("src.main.imap_connection", mock_imap_connection), \
+             patch("src.main.process_mail_by_uid") as mock_process:
+            _check_mail_attempt(processed)
+
+        # uid: キャッシュがあるのでフル処理は不要
+        mock_process.assert_not_called()
+
+    def test_gm_msgid_dedup_skips_already_processed(self):
+        """gm:X が processed_ids にある UID は process_mail_by_uid が呼ばれないこと。"""
+        from src.main import _check_mail_attempt
+        from contextlib import contextmanager
+
+        # UID=200 → GM-MSGID=999002
+        mail = self._make_imap_mock([200], gm_msgid_map={200: 999002})
+        # gm:999002 は処理済み（uid:200 はキャッシュなし）
+        processed = {"gm:999002"}
+
+        @contextmanager
+        def mock_imap_connection():
+            yield mail
+
+        with patch("src.main.imap_connection", mock_imap_connection), \
+             patch("src.main.process_mail_by_uid") as mock_process, \
+             patch("src.main.save_processed_ids", return_value=True):
+            _check_mail_attempt(processed)
+
+        # gm: dedup が効いてフル処理は呼ばれない
+        mock_process.assert_not_called()
+
+    def test_new_uid_triggers_full_processing(self):
+        """未処理の UID は process_mail_by_uid が呼ばれること。"""
+        from src.main import _check_mail_attempt
+        from contextlib import contextmanager
+
+        mail = self._make_imap_mock([300], gm_msgid_map={300: 888001})
+
+        @contextmanager
+        def mock_imap_connection():
+            yield mail
+
+        with patch("src.main.imap_connection", mock_imap_connection), \
+             patch("src.main.process_mail_by_uid", return_value="gm:888001") as mock_process, \
+             patch("src.main.save_processed_ids", return_value=True):
+            _check_mail_attempt(set())
+
+        mock_process.assert_called_once()

@@ -5,6 +5,7 @@ from email.header import decode_header
 from email.utils import parseaddr
 import os
 import socket
+import sys
 import time
 import json
 import re
@@ -15,10 +16,29 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 
+# gmail_oauth は「python src/main.py」（Procfile・src/ がトップに乗る）でも
+# 「from src.main import ...」（テスト・リポジトリルートが乗る）でも import できるよう両対応。
+try:
+    from src import gmail_oauth  # tests / パッケージとして import された場合
+except ImportError:  # pragma: no cover - 実行形態による分岐
+    import gmail_oauth  # `python src/main.py` で src/ が sys.path 先頭にある場合
+
 # --- Env Vars (Railway Variables) ---
 GMAIL_IMAP_HOST = os.getenv("GMAIL_IMAP_HOST", "imap.gmail.com")
 GMAIL_IMAP_USER = os.getenv("GMAIL_IMAP_USER")
 GMAIL_IMAP_PASSWORD = os.getenv("GMAIL_IMAP_PASSWORD")
+
+# --- OAuth2 (refresh token) 認証 ---
+# アプリパスワード(IMAP)は数週間で失効再発するため、原則失効しない OAuth2 refresh token
+# 方式へ移行する（[[feedback_google_auth_standard]]）。OAuth の資格情報が揃っていれば
+# IMAP XOAUTH2 で認証し、未設定ならアプリパスワード IMAP にフォールバックする（移行期の安全網）。
+# 実体は src/gmail_oauth.py。利用する Gmail アドレスは GMAIL_IMAP_USER を共用する。
+# OAuth 有効化条件は CLIENT_ID + REFRESH_TOKEN（client_secret も実質必須・本番実機確認済み）。
+# 必要スコープ = https://mail.google.com/（gmail.readonly は IMAP XOAUTH2 で AUTHENTICATIONFAILED）。
+# 監視メールボックス（GMAIL_IMAP_USER）= atsuhiro@takagi.bz（recruit@takagi.bz は存在しない）。
+def use_oauth() -> bool:
+    """OAuth2(refresh token) 方式が利用可能か（資格情報が全て設定済みか）。"""
+    return gmail_oauth.has_oauth_credentials()
 
 # MODE-based configuration
 MODE = os.getenv("MODE", "prod")  # "test" or "prod" (default: prod)
@@ -52,7 +72,50 @@ IMAP_RETRY_BACKOFFS = [5, 10, 20]  # 接続失敗時のexponential backoff（秒
 
 # --- Error notification deduplication ---
 ERROR_NOTIFICATION_DEDUP_SECONDS = int(os.getenv("ERROR_NOTIFICATION_DEDUP_SECONDS", "600"))  # 同一エラーの再通知抑制（10分）
+# 認証失敗の通知抑制（既定6時間）。アプリパスワード失効は人手による再発行が必要で
+# すぐには直らないため、10分おきに通知を垂れ流さず長めの間隔に集約する。
+AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS = int(os.getenv("AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS", "21600"))
 _last_error_notification_ts: dict = {}  # dedup_key -> last unix timestamp
+# --- Unclassified mail normal-channel dedup ---
+# 未分類Indeedメール（determine_source が None を返したもの）について、
+# 通常チャネル（Slack/LINE 応募通知）への送信を「1メール=1回限り」に制限する。
+# エラーチャネル（notify_error_to_slack）は10分dedupで管理者へのリマインダーを兼ねるため
+# 従来どおり10分間隔で送り続けるが、通常チャネルへの再送はスパムになるため抑制する。
+_unclassified_normal_notified: Set[str] = set()  # unique_id -> 通常チャネル送信済み
+
+# --- Shared HTTP session (M-9: connection reuse across requests) ---
+_http_session = requests.Session()
+
+
+def is_auth_failure(error: object) -> bool:
+    """IMAP のエラーが「認証失敗（資格情報が無効/失効）」かどうかを判定する。
+
+    Gmail はアプリパスワードが失効/削除されると
+    `[AUTHENTICATIONFAILED] Invalid credentials (Failure)` を返す。
+    これはネットワーク瞬断などの一時障害とは異なり、人手によるアプリパスワード
+    再発行が必要なため、通常の接続エラーとは別扱いで分かりやすく通知する。
+    """
+    text = str(error).upper()
+    return (
+        "AUTHENTICATIONFAILED" in text
+        or "INVALID CREDENTIALS" in text
+        # OAuth2: refresh token が失効/取消されると invalid_grant が返る（要再同意）。
+        or "INVALID_GRANT" in text
+    )
+
+
+def has_imap_credentials() -> bool:
+    """IMAP 接続に必要な資格情報が設定されているか。
+
+    OAuth2(refresh token) 方式が揃っていれば GMAIL_IMAP_USER のみで足りる
+    （パスワードは access token で代替）。OAuth が未設定の場合は従来どおり
+    ユーザー名＋アプリパスワードの両方が必要。
+    """
+    if not GMAIL_IMAP_USER:
+        return False
+    if use_oauth():
+        return True
+    return bool(GMAIL_IMAP_PASSWORD)
 
 # --- Known Indeed non-application email patterns (silently ignored) ---
 # These are legitimate Indeed emails that are NOT job applications.
@@ -204,20 +267,31 @@ def save_processed_ids(processed_ids: Set[str]) -> bool:
         return False
 
 
-def notify_error_to_slack(message: str, dedup_key: Optional[str] = None) -> None:
+def notify_error_to_slack(message: str, dedup_key: Optional[str] = None,
+                          dedup_seconds: Optional[int] = None) -> None:
     """重大なエラーを Slack Webhook に通知する。
 
     Args:
         message: 通知メッセージ
         dedup_key: 重複抑止用キー。指定時、同一キーで前回通知から
-            ERROR_NOTIFICATION_DEDUP_SECONDS（既定600秒=10分）以内ならスキップする。
-            省略時は message 本文を dedup key として使う。
+            dedup_seconds（既定 ERROR_NOTIFICATION_DEDUP_SECONDS=600秒=10分）以内なら
+            スキップする。省略時は message 本文を dedup key として使う。
+        dedup_seconds: 重複抑止の窓（秒）。省略時は ERROR_NOTIFICATION_DEDUP_SECONDS。
+            認証失効など長く続く障害は長めの窓を指定して通知フラッドを防ぐ。
     """
+    # サイズ上限（古いエントリを自動削除）
+    if len(_last_error_notification_ts) > 500:
+        cutoff = time.time() - (dedup_seconds if dedup_seconds is not None else ERROR_NOTIFICATION_DEDUP_SECONDS)
+        expired = [k for k, v in _last_error_notification_ts.items() if v < cutoff]
+        for k in expired:
+            del _last_error_notification_ts[k]
+
     key = dedup_key if dedup_key is not None else message
+    window = dedup_seconds if dedup_seconds is not None else ERROR_NOTIFICATION_DEDUP_SECONDS
     now_ts = time.time()
     last_ts = _last_error_notification_ts.get(key, 0.0)
-    if now_ts - last_ts < ERROR_NOTIFICATION_DEDUP_SECONDS:
-        log(f"Skipping duplicate error notification within {ERROR_NOTIFICATION_DEDUP_SECONDS}s window: key={key[:80]}")
+    if now_ts - last_ts < window:
+        log(f"Skipping duplicate error notification within {window}s window: key={key[:80]}")
         return
     _last_error_notification_ts[key] = now_ts
 
@@ -227,7 +301,7 @@ def notify_error_to_slack(message: str, dedup_key: Optional[str] = None) -> None
         return
     text = f"🚨 Indeed応募通知エラー発生\n{message}"
     try:
-        resp = requests.post(
+        resp = _http_session.post(
             webhook_url,
             json={"text": text},
             timeout=5,
@@ -241,7 +315,7 @@ def notify_error_to_slack(message: str, dedup_key: Optional[str] = None) -> None
     # DM にも同じメッセージを送信
     if SLACK_DM_WEBHOOK_URL:
         try:
-            dm_resp = requests.post(
+            dm_resp = _http_session.post(
                 SLACK_DM_WEBHOOK_URL,
                 json={"text": text},
                 timeout=5,
@@ -412,7 +486,7 @@ def _shorten_via_tinyurl(encoded_url: str) -> Optional[str]:
     """Try to shorten a URL via TinyURL. Returns shortened URL or None."""
     try:
         api = "https://tinyurl.com/api-create.php?url=" + encoded_url
-        resp = requests.get(api, timeout=8)
+        resp = _http_session.get(api, timeout=8)
         if resp.status_code == 200 and resp.text.strip().startswith("http"):
             return resp.text.strip()
         log(f"WARN: TinyURL shorten returned status={resp.status_code}")
@@ -425,7 +499,7 @@ def _shorten_via_isgd(encoded_url: str) -> Optional[str]:
     """Try to shorten a URL via is.gd. Returns shortened URL or None."""
     try:
         api = "https://is.gd/create.php?format=simple&url=" + encoded_url
-        resp = requests.get(api, timeout=5)
+        resp = _http_session.get(api, timeout=5)
         if resp.status_code == 200 and resp.text.strip().startswith("http"):
             return resp.text.strip()
         log(f"WARN: is.gd shorten returned status={resp.status_code} body={resp.text[:80]}")
@@ -474,7 +548,7 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
     message = add_test_prefix(mention_prefix + "\n".join(lines))
     for attempt in range(max_retries):
         try:
-            resp = requests.post(webhook_url, json={"text": message}, timeout=10)
+            resp = _http_session.post(webhook_url, json={"text": message}, timeout=10)
             if resp.status_code < 400:
                 return True
             log(f"ERROR: Slack notify failed (status={resp.status_code}, body={resp.text}, attempt={attempt + 1}/{max_retries})")
@@ -534,7 +608,7 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
         # textV2 (@all mention) を試み、失敗したら plain text にフォールバック
         for body_builder, label in [(_build_body_v2, "textV2+mention"), (_build_body_plain, "text(fallback)")]:
             try:
-                resp = requests.post("https://api.line.me/v2/bot/message/push", json=body_builder(), headers=headers, timeout=10)
+                resp = _http_session.post("https://api.line.me/v2/bot/message/push", json=body_builder(), headers=headers, timeout=10)
                 log(f"LINE API response: status={resp.status_code} type={label}")
                 if resp.status_code < 400:
                     return True
@@ -609,6 +683,10 @@ class IMAPConnectionPool:
             pass
         self._connection = None
 
+    # プロセス内フラグ: OAuth が invalid_grant で失効していることが判明したら True に立てる。
+    # これ以降は OAuth を試さずに app-password に直行し、毎ポーリングで無駄な 400 を食わない。
+    _oauth_known_invalid: bool = False
+
     def _connect_with_backoff(self) -> imaplib.IMAP4_SSL:
         delays = IMAP_CONNECT_BACKOFF_SECONDS
         max_attempts = len(delays)
@@ -618,11 +696,42 @@ class IMAPConnectionPool:
             log(f"IMAP connect attempt {attempt}/{max_attempts} host={GMAIL_IMAP_HOST} ts={ts}")
             try:
                 mail = imaplib.IMAP4_SSL(GMAIL_IMAP_HOST)
-                mail.login(GMAIL_IMAP_USER, GMAIL_IMAP_PASSWORD)
+                if use_oauth() and not IMAPConnectionPool._oauth_known_invalid:
+                    # OAuth2(refresh token) → IMAP XOAUTH2 を試みる。
+                    # 認証失敗（invalid_grant / AUTHENTICATIONFAILED）が返ったら
+                    # app-password にフォールバックし、以降は OAuth を再試行しない。
+                    try:
+                        gmail_oauth.imap_authenticate(mail, GMAIL_IMAP_USER)
+                        auth_method = "XOAUTH2"
+                    except Exception as oauth_err:
+                        if is_auth_failure(oauth_err):
+                            # OAuth refresh token が失効/無効 → app-password に切り替える。
+                            IMAPConnectionPool._oauth_known_invalid = True
+                            log(
+                                f"WARN: OAuth auth failed ({oauth_err!r}); "
+                                "falling back to app-password for this process lifetime"
+                            )
+                            # 壊れた接続を捨てて新規接続を張り直す。
+                            try:
+                                mail.logout()
+                            except Exception:
+                                pass
+                            mail = imaplib.IMAP4_SSL(GMAIL_IMAP_HOST)
+                            mail.login(GMAIL_IMAP_USER, GMAIL_IMAP_PASSWORD)
+                            auth_method = "app-password(oauth-fallback)"
+                        else:
+                            # ネットワーク断等の一時障害はそのまま上位に再送出してリトライさせる。
+                            raise
+                else:
+                    # OAuth 未設定、または既に失効確定済み → 従来のアプリパスワード IMAP。
+                    mail.login(GMAIL_IMAP_USER, GMAIL_IMAP_PASSWORD)
+                    auth_method = "app-password"
                 mail.select("INBOX", readonly=True)
-                log(f"IMAP connect success host={GMAIL_IMAP_HOST} attempt={attempt}/{max_attempts}")
+                log(f"IMAP connect success host={GMAIL_IMAP_HOST} auth={auth_method} attempt={attempt}/{max_attempts}")
                 return mail
-            except (imaplib.IMAP4.error, OSError) as e:
+            # RuntimeError/RequestException は OAuth トークン取得失敗（refresh token 失効や
+            # ネットワーク断）。接続失敗と同様に backoff＋上位の認証失敗判定に乗せる。
+            except (imaplib.IMAP4.error, OSError, RuntimeError, requests.RequestException) as e:
                 last_exc = e
                 fail_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 log(
@@ -693,12 +802,38 @@ INDEED_APPLICATION_PATTERNS = [
     "新しい応募者",       # 「新しい応募者が1名います」等の言い回し変化に追従
     "応募がありました",
     "応募者からのメッセージ",
+    "応募を受け付けました",   # 件名フォーマット変化への追従
+    "新規応募",
+    "応募が届きました",
 ]
+
+# Indeed が件名フォーマットを変えても応募通知を取りこぼさないための正規表現フォールバック。
+# 固定フレーズ（INDEED_APPLICATION_PATTERNS）に一致しなくても、「応募」と
+# 「あった/来た/受付/届いた/者」等の動き・対象を表す語が同じ件名に共起していれば応募とみなす。
+# 誤検知防止のため、この共起判定は INDEED_NON_APPLICATION_PATTERNS（レコメンド・課金・
+# 認証コード等）に一致しない件名にのみ適用する。
+_INDEED_APPLICATION_FALLBACK_RE = re.compile(
+    r"応募(?:者|を|が|の)?.{0,12}"
+    r"(?:ありました|きました|来ました|届きました|受け付け|受付|お知らせ|通知|1名|名います)"
+)
+
+
+def _looks_like_indeed_application(subject: str) -> bool:
+    """件名が Indeed の応募通知らしいかを、固定フレーズ＋正規表現フォールバックで判定する。
+
+    既知の非応募パターン（認証コード・課金・レコメンド等）に該当する件名は、
+    フォーマット変化に強くしても応募と誤判定しないよう先に除外する。
+    """
+    if any(pattern in subject for pattern in INDEED_APPLICATION_PATTERNS):
+        return True
+    if is_indeed_non_application_email(subject):
+        return False
+    return bool(_INDEED_APPLICATION_FALLBACK_RE.search(subject))
 
 
 def determine_source(subject: str) -> Tuple[Optional[str], Optional[str]]:
     """Determine email source and default URL based on subject."""
-    if any(pattern in subject for pattern in INDEED_APPLICATION_PATTERNS):
+    if _looks_like_indeed_application(subject):
         return "indeed", None
     elif "ジモティー" in subject:
         return "jimoty", "https://jmty.jp/web_mail/posts"
@@ -796,7 +931,13 @@ def process_mail_by_uid(
                 log(f"Skip Indeed non-application mail: {subject[:80]}")
                 return unique_id  # 処理済みマーク、アラートなし
             else:
-                # 未知のパターン → Indeedが件名フォーマットを変更した可能性があるためアラート送信
+                # 未知のパターン → Indeedが件名フォーマットを変更した可能性がある。
+                # エラーチャネルにアラートを出しつつ、通常の応募通知チャネル（Slack/LINE）にも
+                # 「⚠️未分類」として通知して人間が必ず気づけるようにする。
+                # return None にして processed_ids に入れないことで、次サイクルでも再処理される
+                # （エラーチャネルは dedup_key で10分間隔リマインダーとして残す）。
+                # ただし通常チャネルへの送信は _unclassified_normal_notified で「1メール=1回」
+                # に制限する（未対処のまま ~60秒ポーリングが続くと最大1440回/日のスパムになるため）。
                 date_header = decode_header_value(msg.get("Date", ""))
                 alert_msg = (
                     "⚠️ 件名不一致のIndeedメールを検知\n"
@@ -806,8 +947,22 @@ def process_mail_by_uid(
                     "Indeedが件名フォーマットを変更した可能性があります。determine_source関数の更新を検討してください。"
                 )
                 log(f"ALERT: Indeed email detected with unrecognized subject: {subject}")
-                notify_error_to_slack(alert_msg)
-                return unique_id  # アラート1回送信後は処理済みマーク（繰り返し通知を防止）
+                dedup_key = f"indeed_unclassified:{unique_id}"
+                notify_error_to_slack(alert_msg, dedup_key=dedup_key)
+                # 通常チャネルには初回のみ送信（2サイクル目以降は抑制）
+                if unique_id not in _unclassified_normal_notified:
+                    html = extract_html(msg)
+                    url = extract_indeed_url(html) or ""
+                    unclassified_name = "⚠️未分類のIndeedメール（要確認）"
+                    notify_slack_with_retry("indeed", unclassified_name, url)
+                    notify_line_with_retry("indeed", unclassified_name, url)
+                    _unclassified_normal_notified.add(unique_id)
+                    processed_ids.add(f"unclf:{unique_id}")
+                    save_processed_ids(processed_ids)
+                    log(f"Normal channel notified (first time) for unclassified: {unique_id}")
+                else:
+                    log(f"Normal channel skip (already notified) for unclassified: {unique_id}")
+                return None  # 処理済みにしない＝次サイクルでも拾い直す（エラーチャネルでリマインド継続）
         else:
             log(f"Skip non-target mail: {subject[:50]}...")
             return unique_id  # Indeed以外の対象外メールは静かにスキップ＋処理済みマーク
@@ -827,13 +982,13 @@ def process_mail_by_uid(
         applicant_name = extract_name(from_header)
         job_title = None
 
-    log(f"Notify {source}: {applicant_name}, job={job_title}, url={url}, id={unique_id}")
+    log(f"Notify {source}: job={job_title}, id={unique_id}")
 
     slack_ok = notify_slack_with_retry(source, applicant_name, url, job_title=job_title)
     line_ok = notify_line_with_retry(source, applicant_name, url, job_title=job_title)
 
     if not slack_ok and not line_ok:
-        log(f"ERROR: All notifications failed for {applicant_name} ({unique_id}), will retry next cycle")
+        log(f"ERROR: All notifications failed for id={unique_id}, will retry next cycle")
         return None
 
     # 片方成功・片方失敗: 処理済みマークしつつDMで通知（重複送信防止が最優先）
@@ -843,19 +998,18 @@ def process_mail_by_uid(
             failed_channels.append("Slack")
         if not line_ok:
             failed_channels.append("LINE")
-        log(f"WARNING: Partial success for {applicant_name} ({unique_id}): {', '.join(failed_channels)} failed. Marking as processed to prevent duplicates.")
+        log(f"WARNING: Partial success for id={unique_id}: {', '.join(failed_channels)} failed. Marking as processed to prevent duplicates.")
         dm_detail = (
-            f"\u26a0\ufe0f 通知一部失敗\uff08処理済みマーク済み・手動確認してください\uff09\n"
+            f"⚠️ 通知一部失敗（処理済みマーク済み・手動確認してください）\n"
             f"失敗チャンネル: {', '.join(failed_channels)}\n"
             f"メール件名: {subject}\n"
             f"送信者: {from_header}\n"
-            f"応募者名: {applicant_name}\n"
             f"ソース: {source}\n"
             f"unique_id: {unique_id}"
         )
         if SLACK_DM_WEBHOOK_URL:
             try:
-                requests.post(SLACK_DM_WEBHOOK_URL, json={"text": dm_detail}, timeout=5)
+                _http_session.post(SLACK_DM_WEBHOOK_URL, json={"text": dm_detail}, timeout=5)
             except Exception as e:
                 log(f"ERROR: Failed to send detail DM: {e}")
 
@@ -956,19 +1110,46 @@ def _check_mail_attempt(processed_ids: Set[str]) -> None:
                         return
 
 
-def check_mail_with_status() -> bool:
+def check_mail_with_status(processed_ids: Optional[Set[str]] = None) -> bool:
     """Check mailbox for new applications. Returns True if successful, False if quota/error.
 
     IMAP 接続/読み取りタイムアウトに対しては IMAP_RETRY_BACKOFFS（5,10,20秒）で
     リトライし、全て失敗した時のみ notify_error_to_slack() で通知する。
+
+    Args:
+        processed_ids: 起動時にロード済みの処理済みID集合。Noneのとき（後方互換・テスト用）は
+            従来どおり内部でロードする。main()からはこの引数で渡してサイクル間でメモリ保持する。
     """
     try:
-        processed_ids, load_success = load_processed_ids()
+        # 資格情報が未設定なら、リトライで叩かず即座に分かりやすく通知する
+        if not has_imap_credentials():
+            missing = []
+            if not GMAIL_IMAP_USER:
+                missing.append("GMAIL_IMAP_USER")
+            # OAuth も アプリパスワードも無い → どちらの認証手段も成立しない。
+            if not GMAIL_IMAP_PASSWORD:
+                missing.append("GMAIL_IMAP_PASSWORD（または GMAIL_OAUTH_CLIENT_ID/SECRET/REFRESH_TOKEN）")
+            log(f"ERROR: Missing IMAP credentials: {', '.join(missing)}")
+            notify_error_to_slack(
+                "Gmail の資格情報が未設定です。\n"
+                f"未設定の環境変数: {', '.join(missing)}\n"
+                "推奨: OAuth2 方式（GMAIL_OAUTH_CLIENT_ID / GMAIL_OAUTH_REFRESH_TOKEN / "
+                "GMAIL_OAUTH_CLIENT_SECRET）を Railway の Variables に設定してください。"
+                "スコープは https://mail.google.com/ が必須（gmail.readonly は IMAP で失敗）。"
+                "監視アドレス（GMAIL_IMAP_USER）は atsuhiro@takagi.bz を使用。"
+                "（アプリパスワード GMAIL_IMAP_PASSWORD は失効しやすいため非推奨）",
+                dedup_key="imap_missing_credentials",
+                dedup_seconds=AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS,
+            )
+            return True  # 設定待ち。quotaエラーではないので過度なbackoffはしない
 
-        # If file exists but is corrupted, skip processing to prevent mass re-notifications
-        if not load_success:
-            log("ERROR: Skipping mail check due to corrupted processed IDs file")
-            return True  # Not a quota error, don't backoff
+        if processed_ids is None:
+            # 後方互換 / テスト用: 引数なしで呼ばれた場合はその場でロード
+            processed_ids, load_success = load_processed_ids()
+            # If file exists but is corrupted, skip processing to prevent mass re-notifications
+            if not load_success:
+                log("ERROR: Skipping mail check due to corrupted processed IDs file")
+                return True  # Not a quota error, don't backoff
 
         total_attempts = len(IMAP_RETRY_BACKOFFS) + 1  # initial + len(backoffs) retries
         last_conn_error: Optional[BaseException] = None
@@ -979,7 +1160,7 @@ def check_mail_with_status() -> bool:
             except imaplib.IMAP4.abort:
                 # quota / abort は別ハンドラへ
                 raise
-            except (imaplib.IMAP4.error, socket.timeout, socket.gaierror, TimeoutError, ConnectionError, OSError) as e:
+            except (imaplib.IMAP4.error, socket.timeout, socket.gaierror, TimeoutError, ConnectionError, OSError, RuntimeError, requests.RequestException) as e:
                 last_conn_error = e
                 if "AUTHENTICATIONFAILED" in str(e):
                     log(f"ERROR: IMAP authentication failed (credentials invalid or expired): {e}")
@@ -998,10 +1179,38 @@ def check_mail_with_status() -> bool:
                     continue
                 # All retries exhausted
                 log(f"ERROR: IMAP connection failed after {total_attempts} attempts: {last_conn_error}")
-                notify_error_to_slack(
-                    f"Gmail IMAP connection error (after {total_attempts} attempts): {last_conn_error}",
-                    dedup_key="imap_connection_error",
-                )
+                if is_auth_failure(last_conn_error):
+                    # 資格情報の失効/無効。OAuth 方式と アプリパスワード方式で対処が異なるため、
+                    # 現在の認証方式に応じた案内を出す。接続瞬断とは別の分かりやすいメッセージ＋
+                    # 長めの抑止窓で通知する。
+                    if use_oauth():
+                        auth_alert = (
+                            "Gmail OAuth の認証に失敗しました（refresh token が無効/失効＝要再同意）。\n"
+                            f"エラー: {last_conn_error}\n"
+                            "対処: scripts/get-gmail-refresh-token.py で再度同意し、Railway 環境変数 "
+                            "`GMAIL_OAUTH_REFRESH_TOKEN` を更新してください。"
+                            "（refresh token は通常失効しませんが、取消・パスワード変更・"
+                            "6か月未使用で無効になることがあります）"
+                        )
+                    else:
+                        auth_alert = (
+                            "Gmail IMAP の認証に失敗しました（資格情報が無効/失効）。\n"
+                            f"エラー: {last_conn_error}\n"
+                            "対処: OAuth2 方式（GMAIL_OAUTH_*）への移行を推奨します。"
+                            "暫定対応として Google アカウントでアプリパスワードを再発行し、"
+                            "Railway 環境変数 `GMAIL_IMAP_PASSWORD` を更新してください。"
+                            "（アプリパスワードが Google 側で削除/失効した可能性があります）"
+                        )
+                    notify_error_to_slack(
+                        auth_alert,
+                        dedup_key="imap_auth_failure",
+                        dedup_seconds=AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS,
+                    )
+                else:
+                    notify_error_to_slack(
+                        f"Gmail IMAP connection error (after {total_attempts} attempts): {last_conn_error}",
+                        dedup_key="imap_connection_error",
+                    )
                 return True  # Not necessarily a quota error
         return True
 
@@ -1069,22 +1278,36 @@ def main() -> None:
     """Main polling loop with exponential backoff for quota errors."""
     log(f"Starting Gmail polling with POLL_INTERVAL_SECONDS={POLL_INTERVAL_SECONDS}")
     log(f"MODE={MODE}, SEARCH_DAYS={SEARCH_DAYS}, MAX_BACKOFF_SECONDS={MAX_BACKOFF_SECONDS}, MAX_EMAILS_PER_CYCLE={MAX_EMAILS_PER_CYCLE}")
+    log(f"Gmail auth method: {'OAuth2 (XOAUTH2 refresh token)' if use_oauth() else 'app-password (IMAP LOGIN)'}")
 
     # Verify storage is working
     if not verify_storage():
         log("CRITICAL: Storage verification failed. Exiting to prevent duplicate notifications.")
         notify_error_to_slack("CRITICAL: Storage verification failed at startup. Service stopped.")
-        return
+        sys.exit(1)
+
+    # processed_ids を起動時に一度だけロードしてサイクル間でメモリ保持する。
+    # これにより: (a) 毎ポーリングのディスク全再読込＋migrate_old_id_format 全件再実行を排除、
+    # (b) uid: セッションキャッシュがサイクルをまたいで生き続けるため無駄な IMAP 往復が減る。
+    # 破損ファイル時は verify_storage() が先に検出して sys.exit(1) するため、ここでは成功前提。
+    startup_ids, load_success = load_processed_ids()
+    if not load_success:
+        log("CRITICAL: Failed to load processed IDs at startup. Exiting.")
+        notify_error_to_slack("CRITICAL: Failed to load processed IDs at startup. Service stopped.")
+        sys.exit(1)
+    log(f"Loaded {len(startup_ids)} processed IDs into memory at startup")
 
     consecutive_errors = 0
     quota_notified = False
     while True:
         try:
-            success = check_mail_with_status()
+            _cycle_start = time.monotonic()
+            success = check_mail_with_status(startup_ids)
+            _elapsed = time.monotonic() - _cycle_start
             if success:
                 consecutive_errors = 0
                 quota_notified = False
-                time.sleep(POLL_INTERVAL_SECONDS)
+                time.sleep(max(0, POLL_INTERVAL_SECONDS - _elapsed))
             else:
                 # Error occurred, apply exponential backoff
                 consecutive_errors += 1
@@ -1094,7 +1317,7 @@ def main() -> None:
                 if not quota_notified:
                     notify_error_to_slack(f"Gmail quota exceeded. Applying backoff ({backoff}s). Will retry automatically.")
                     quota_notified = True
-                time.sleep(backoff)
+                time.sleep(max(0, backoff - _elapsed))
         except Exception as e:
             log(f"ERROR in main loop: {e}")
             consecutive_errors += 1
@@ -1104,4 +1327,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
