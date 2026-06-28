@@ -1162,6 +1162,15 @@ def check_mail_with_status(processed_ids: Optional[Set[str]] = None) -> bool:
                 raise
             except (imaplib.IMAP4.error, socket.timeout, socket.gaierror, TimeoutError, ConnectionError, OSError, RuntimeError, requests.RequestException) as e:
                 last_conn_error = e
+                if "AUTHENTICATIONFAILED" in str(e):
+                    log(f"ERROR: IMAP authentication failed (credentials invalid or expired): {e}")
+                    notify_error_to_slack(
+                        "🔑 Gmail IMAP 認証エラー: 認証情報が無効または期限切れです。\n"
+                        "Gmailのアプリパスワード（またはOAuth認証情報）を確認・再設定してください。\n"
+                        f"エラー詳細: {e}",
+                        dedup_key="imap_auth_error",
+                    )
+                    return True  # Auth failures won't self-heal with retries
                 log(f"WARN: IMAP connection/read error on attempt {attempt_idx + 1}/{total_attempts}: {e}")
                 if attempt_idx < len(IMAP_RETRY_BACKOFFS):
                     backoff = IMAP_RETRY_BACKOFFS[attempt_idx]

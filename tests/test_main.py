@@ -38,6 +38,7 @@ from src.main import (
     process_mail_by_uid,
     extract_job_title_from_subject,
     extract_job_title_from_html,
+    check_mail_with_status,
 )
 import imaplib
 
@@ -1088,6 +1089,40 @@ class TestNotifyLineWithRetryFallback:
             )
 
 
+class TestCheckMailWithStatusAuthError:
+    """KZ-23: AUTHENTICATIONFAILED エラーを即時検知して actionable な Slack 通知を送ること。"""
+
+    @patch("src.main.notify_error_to_slack")
+    @patch("src.main.has_imap_credentials", return_value=True)
+    @patch("src.main.load_processed_ids", return_value=(set(), True))
+    def test_auth_error_sends_distinct_alert_and_does_not_retry(self, mock_load, mock_creds, mock_notify):
+        import imaplib as _imaplib
+        auth_exc = _imaplib.IMAP4.error("[AUTHENTICATIONFAILED] Invalid credentials (Failure)")
+        with patch("src.main._check_mail_attempt", side_effect=auth_exc):
+            result = check_mail_with_status()
+
+        assert result is True
+        mock_notify.assert_called_once()
+        call_kwargs = mock_notify.call_args
+        assert call_kwargs[1]["dedup_key"] == "imap_auth_error"
+        msg = call_kwargs[0][0]
+        assert "認証" in msg
+
+    @patch("src.main.notify_error_to_slack")
+    @patch("src.main.has_imap_credentials", return_value=True)
+    @patch("src.main.load_processed_ids", return_value=(set(), True))
+    def test_non_auth_imap_error_still_retries(self, mock_load, mock_creds, mock_notify):
+        import imaplib as _imaplib
+        conn_exc = _imaplib.IMAP4.error("Connection refused")
+        with patch("src.main._check_mail_attempt", side_effect=conn_exc), \
+             patch("src.main.time.sleep"):
+            result = check_mail_with_status()
+
+        assert result is True
+        mock_notify.assert_called_once()
+        call_kwargs = mock_notify.call_args
+        assert call_kwargs[1]["dedup_key"] == "imap_connection_error"
+
 class TestIsAuthFailure:
     """`[AUTHENTICATIONFAILED]`/Invalid credentials を一時障害と区別できること。"""
 
@@ -1422,9 +1457,10 @@ class TestCheckMailAuthHandling:
         assert result is True
         mock_error.assert_called_once()
         kwargs = mock_error.call_args.kwargs
-        assert kwargs.get("dedup_key") == "imap_auth_failure"
-        # アプリパスワード再発行を促す文言が含まれること
-        assert "GMAIL_IMAP_PASSWORD" in mock_error.call_args.args[0]
+        # KZ-23: AUTHENTICATIONFAILED は即時検知で imap_auth_error キーを使う
+        assert kwargs.get("dedup_key") == "imap_auth_error"
+        # 認証エラーを示す文言が含まれること
+        assert "認証" in mock_error.call_args.args[0]
 
     @patch("src.main.time.sleep")
     @patch("src.main.notify_error_to_slack")
@@ -1665,4 +1701,3 @@ class TestCheckMailAttemptDedup:
             _check_mail_attempt(set())
 
         mock_process.assert_called_once()
-
