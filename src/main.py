@@ -1126,6 +1126,7 @@ def check_mail_with_status(processed_ids: Optional[Set[str]] = None) -> bool:
         processed_ids: 起動時にロード済みの処理済みID集合。Noneのとき（後方互換・テスト用）は
             従来どおり内部でロードする。main()からはこの引数で渡してサイクル間でメモリ保持する。
     """
+    global _last_backoff_reason
     try:
         # 資格情報が未設定なら、リトライで叩かず即座に分かりやすく通知する
         if not has_imap_credentials():
@@ -1194,7 +1195,6 @@ def check_mail_with_status(processed_ids: Optional[Set[str]] = None) -> bool:
         return True
 
     except imaplib.IMAP4.abort as e:
-        global _last_backoff_reason
         error_msg = str(e)
         if "OVERQUOTA" in error_msg:
             log(f"QUOTA ERROR: {error_msg}")
@@ -1282,6 +1282,7 @@ def main() -> None:
 
     consecutive_errors = 0
     quota_notified = False
+    last_notified_reason = None
     while True:
         try:
             _cycle_start = time.monotonic()
@@ -1292,28 +1293,40 @@ def main() -> None:
                 # （エラー通知だけが流れて「詰まったまま」に見えるのを防ぐ）
                 if consecutive_errors > 0:
                     log(f"Recovered after {consecutive_errors} consecutive error(s)")
+                    # dedup_seconds を明示しない＝既定 ERROR_NOTIFICATION_DEDUP_SECONDS(600s) を適用。
+                    # quota/非quotaが短時間で往復する「フラッピング」時に復旧通知が連投されるのを防ぐ
+                    # （エラー側は quota_notified ガード＋600s dedup で既に抑制されているのに合わせる）。
                     notify_error_to_slack(
                         f"✅ Gmail polling recovered after {consecutive_errors} error(s). Resuming normal polling.",
                         dedup_key="gmail_polling_recovered",
-                        dedup_seconds=0,
                     )
                 consecutive_errors = 0
                 quota_notified = False
+                last_notified_reason = None
                 time.sleep(max(0, POLL_INTERVAL_SECONDS - _elapsed))
             else:
                 # Error occurred, apply exponential backoff
                 consecutive_errors += 1
                 backoff = min(POLL_INTERVAL_SECONDS * (2 ** consecutive_errors), MAX_BACKOFF_SECONDS)
                 log(f"Backoff: waiting {backoff} seconds (consecutive_errors={consecutive_errors}, reason={_last_backoff_reason})")
-                # Notify once when the error run starts（以降は同種エラーが続いても連投しない）
-                if not quota_notified:
+                # 同一障害ランでも、理由が変わった場合（quota⇔非quota abort等）は再通知する。
+                # 理由が同じ間は連投しない。
+                if not quota_notified or last_notified_reason != _last_backoff_reason:
                     notify_error_to_slack(f"{_last_backoff_reason}. Applying backoff ({backoff}s). Will retry automatically.")
                     quota_notified = True
+                    last_notified_reason = _last_backoff_reason
                 time.sleep(max(0, backoff - _elapsed))
         except Exception as e:
             log(f"ERROR in main loop: {e}")
             consecutive_errors += 1
             backoff = min(POLL_INTERVAL_SECONDS * (2 ** consecutive_errors), MAX_BACKOFF_SECONDS)
+            # main loop 内の想定外例外もbackoff通知の対象にする（従来はサイレントにbackoffするだけで
+            # Slackに一切出ず、その後の復旧通知だけが届く非対称があった）。
+            reason = f"Gmail polling main loop error: {e}"
+            if not quota_notified or last_notified_reason != reason:
+                notify_error_to_slack(f"{reason}. Applying backoff ({backoff}s). Will retry automatically.")
+                quota_notified = True
+                last_notified_reason = reason
             time.sleep(backoff)
 
 
