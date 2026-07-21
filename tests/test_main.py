@@ -1703,3 +1703,157 @@ class TestCheckMailAttemptDedup:
             _check_mail_attempt(set())
 
         mock_process.assert_called_once()
+
+
+# ---- バグチェック回帰: _last_backoff_reason と main() の復旧/backoff通知 -------------
+
+class TestBackoffReasonTracking:
+    """check_mail_with_status() が返す False の理由を _last_backoff_reason に
+    正確に記録すること（バグ: 全 IMAP abort を一律「Gmail quota exceeded」と
+    誤表示していた問題の回帰テスト）。
+    """
+
+    def test_overquota_abort_sets_quota_reason(self):
+        """本当の OVERQUOTA abort では reason に 'quota exceeded' が入ること。"""
+        import src.main as main_module
+        from src.main import check_mail_with_status
+
+        with patch("src.main.has_imap_credentials", return_value=True), \
+             patch("src.main._check_mail_attempt",
+                   side_effect=imaplib.IMAP4.abort("[OVERQUOTA] Quota exceeded")), \
+             patch("src.main.notify_error_to_slack"):
+            result = check_mail_with_status(set())
+
+        assert result is False
+        assert "quota exceeded" in main_module._last_backoff_reason.lower()
+        assert "OVERQUOTA" in main_module._last_backoff_reason
+
+    def test_non_quota_abort_sets_non_quota_reason(self):
+        """quota 以外の IMAP abort では reason が「quota超過ではない可能性」に
+        なり、'Gmail quota exceeded' という誤った断定文言を含まないこと。
+        """
+        import src.main as main_module
+        from src.main import check_mail_with_status
+
+        with patch("src.main.has_imap_credentials", return_value=True), \
+             patch("src.main._check_mail_attempt",
+                   side_effect=imaplib.IMAP4.abort("BYE server hung up")), \
+             patch("src.main.notify_error_to_slack"):
+            result = check_mail_with_status(set())
+
+        assert result is False
+        assert "quota exceeded" not in main_module._last_backoff_reason.lower() or \
+            "ではない可能性" in main_module._last_backoff_reason
+        assert "server hung up" in main_module._last_backoff_reason
+
+    def test_overquota_generic_exception_sets_quota_reason(self):
+        """imaplib.IMAP4.abort 以外の Exception でも OVERQUOTA 文字列を含めば
+        quota reason が設定されること。
+
+        注意: RuntimeError/OSError等は check_mail_with_status 内側のリトライ
+        ループ（IMAP_RETRY_BACKOFFS）で捕捉されて retry→最終 True になるため、
+        ここでは内側のタプルに含まれないプレーンな Exception を使い、
+        一番外側の `except Exception as e:` に直接到達させる。
+        """
+        import src.main as main_module
+        from src.main import check_mail_with_status
+
+        with patch("src.main.has_imap_credentials", return_value=True), \
+             patch("src.main._check_mail_attempt",
+                   side_effect=Exception("OVERQUOTA: mailbox full")), \
+             patch("src.main.notify_error_to_slack"):
+            result = check_mail_with_status(set())
+
+        assert result is False
+        assert "quota exceeded" in main_module._last_backoff_reason.lower()
+
+
+class TestMainLoopBackoffAndRecovery:
+    """main() のポーリングループにおける backoff 通知・復旧通知の挙動。
+
+    バグチェックで判明した2点の回帰テスト:
+    - 復旧通知を dedup_seconds=0（常に送信）にしていたため、quota/非quota が
+      短時間で往復する「フラッピング」時に復旧通知がスパムしうる問題。
+    - main() の except Exception（想定外例外）経路がサイレントに backoff する
+      だけで一切 Slack 通知せず、その後の復旧通知だけが届く非対称があった問題。
+    """
+
+    def _run_main_cycles(self, success_sequence, monkeypatch):
+        """main() を success_sequence の長さだけ回して StopIteration で抜ける。"""
+        import src.main as main_module
+
+        calls = {"notify": []}
+
+        def fake_notify(message, dedup_key=None, dedup_seconds=None):
+            calls["notify"].append({"message": message, "dedup_key": dedup_key, "dedup_seconds": dedup_seconds})
+
+        seq = iter(success_sequence)
+
+        def fake_check_mail_with_status(processed_ids):
+            try:
+                return next(seq)
+            except StopIteration:
+                raise SystemExit("test-stop")
+
+        monkeypatch.setattr(main_module, "notify_error_to_slack", fake_notify)
+        monkeypatch.setattr(main_module, "check_mail_with_status", fake_check_mail_with_status)
+        monkeypatch.setattr(main_module, "verify_storage", lambda: True)
+        monkeypatch.setattr(main_module, "load_processed_ids", lambda: (set(), True))
+        monkeypatch.setattr(main_module.time, "sleep", lambda *_a, **_kw: None)
+        monkeypatch.setattr(main_module.time, "monotonic", lambda: 0.0)
+
+        with pytest.raises(SystemExit):
+            main_module.main()
+
+        return calls["notify"]
+
+    def test_recovery_notification_uses_default_dedup_not_zero(self, monkeypatch):
+        """復旧通知が dedup_seconds=0（常に送信＝無防備）になっていないこと。
+
+        フラッピング時のスパムを防ぐため、既定の ERROR_NOTIFICATION_DEDUP_SECONDS
+        （dedup_seconds を省略）を使うべき。
+        """
+        import src.main as main_module
+        main_module._last_backoff_reason = "Gmail quota exceeded (test)"
+
+        notified = self._run_main_cycles([False, True], monkeypatch)
+
+        recovered = [n for n in notified if n["dedup_key"] == "gmail_polling_recovered"]
+        assert len(recovered) == 1
+        # dedup_seconds を明示的に 0 にしていない（省略 or None＝既定値を使う）こと
+        assert recovered[0]["dedup_seconds"] != 0
+
+    def test_silent_main_loop_exception_now_notifies(self, monkeypatch):
+        """main() の except Exception（想定外例外）経路でも、従来はサイレントに
+        backoff するだけだったが、修正後は notify_error_to_slack が呼ばれること。
+        """
+        import src.main as main_module
+
+        calls = {"notify": []}
+
+        def fake_notify(message, dedup_key=None, dedup_seconds=None):
+            calls["notify"].append(message)
+
+        def raising_check(processed_ids):
+            raise ValueError("boom")
+
+        call_count = {"n": 0}
+
+        def raising_then_stop(processed_ids):
+            call_count["n"] += 1
+            if call_count["n"] >= 2:
+                raise SystemExit("test-stop")
+            raise ValueError("boom")
+
+        monkeypatch.setattr(main_module, "notify_error_to_slack", fake_notify)
+        monkeypatch.setattr(main_module, "check_mail_with_status", raising_then_stop)
+        monkeypatch.setattr(main_module, "verify_storage", lambda: True)
+        monkeypatch.setattr(main_module, "load_processed_ids", lambda: (set(), True))
+        monkeypatch.setattr(main_module.time, "sleep", lambda *_a, **_kw: None)
+
+        with pytest.raises(SystemExit):
+            main_module.main()
+
+        assert any("boom" in m for m in calls["notify"]), (
+            f"想定外例外がSlackに一切通知されなかった（サイレントbackoffの回帰）: {calls['notify']}"
+        )
