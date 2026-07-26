@@ -110,6 +110,40 @@ def is_auth_failure(error: object) -> bool:
     )
 
 
+def is_quota_error(error: object) -> bool:
+    """Gmail の容量/レート超過（OVERQUOTA）かどうか。"""
+    return "OVERQUOTA" in str(error).upper()
+
+
+# Gmail がアイドル接続を切ったとき等、「張り直せば直る」種類の IMAP4.abort。
+# これらは人手対応が不要で、再接続すれば次のポーリングで復旧する。
+IMAP_TRANSIENT_ABORT_PATTERNS = (
+    "SESSION EXPIRED",        # Gmail がアイドルセッションを終了（observed 2026-07-26）
+    "PLEASE LOGIN AGAIN",
+    "SOCKET ERROR",           # imaplib が接続断で送出（EOF 等）
+    "EOF",
+    "CONNECTION RESET",
+    "TEMPORARY SYSTEM ERROR",  # Gmail 側の一時障害
+    "UNAVAILABLE",
+    "TRY AGAIN",
+)
+
+
+def is_transient_abort(error: object) -> bool:
+    """IMAP4.abort が「再接続で自然に直る一時障害」かどうかを判定する。
+
+    Gmail は接続を張りっぱなしにしていると `command: UID => Session expired,
+    please login again.` を返してセッションを切る。これは障害ではなく通常運用の
+    一部で、接続を張り直せば直る。quota 超過や認証失敗と同列に扱って
+    120秒バックオフ＋社長へのSlackアラートを出すのは誤報になるため、
+    ここで切り分けて通常のリトライ経路に載せる。
+    """
+    if is_quota_error(error) or is_auth_failure(error):
+        return False
+    text = str(error).upper()
+    return any(pattern in text for pattern in IMAP_TRANSIENT_ABORT_PATTERNS)
+
+
 def has_imap_credentials() -> bool:
     """IMAP 接続に必要な資格情報が設定されているか。
 
@@ -1164,8 +1198,23 @@ def check_mail_with_status(processed_ids: Optional[Set[str]] = None) -> bool:
             try:
                 _check_mail_attempt(processed_ids)
                 return True
-            except imaplib.IMAP4.abort:
-                # quota / abort は別ハンドラへ
+            except imaplib.IMAP4.abort as e:
+                # quota 超過・認証失敗・未知の abort は既存の別ハンドラへ委ねる。
+                if not is_transient_abort(e):
+                    raise
+                # セッション切れ等の一時障害。imap_connection() が既にプール接続を
+                # 破棄しているので、次の試行は新規ログインになり自然に復旧する。
+                # バックオフ＋Slackアラートには載せず、通常のリトライで吸収する。
+                last_conn_error = e
+                log(f"WARN: IMAP session dropped on attempt {attempt_idx + 1}/{total_attempts}; reconnecting: {e}")
+                if attempt_idx < len(IMAP_RETRY_BACKOFFS):
+                    backoff = IMAP_RETRY_BACKOFFS[attempt_idx]
+                    log(f"Retrying IMAP in {backoff}s (next attempt {attempt_idx + 2}/{total_attempts})...")
+                    time.sleep(backoff)
+                    continue
+                # 全リトライで再接続できない＝一時障害では説明がつかない。本物の障害として
+                # 下位の abort ハンドラに投げ、バックオフ＋通知させる。
+                log(f"ERROR: IMAP session kept dropping across {total_attempts} attempts: {e}")
                 raise
             except (imaplib.IMAP4.error, socket.timeout, socket.gaierror, TimeoutError, ConnectionError, OSError, RuntimeError, requests.RequestException) as e:
                 last_conn_error = e
@@ -1196,7 +1245,7 @@ def check_mail_with_status(processed_ids: Optional[Set[str]] = None) -> bool:
 
     except imaplib.IMAP4.abort as e:
         error_msg = str(e)
-        if "OVERQUOTA" in error_msg:
+        if is_quota_error(error_msg):
             log(f"QUOTA ERROR: {error_msg}")
             _last_backoff_reason = f"Gmail quota exceeded ({error_msg})"
             return False  # Quota error, trigger backoff
@@ -1206,7 +1255,7 @@ def check_mail_with_status(processed_ids: Optional[Set[str]] = None) -> bool:
     except Exception as e:
         log(f"ERROR: {e}")
         # Check if it's a quota-related error
-        if "OVERQUOTA" in str(e):
+        if is_quota_error(e):
             _last_backoff_reason = f"Gmail quota exceeded ({e})"
             return False  # Quota error, trigger backoff
         notify_error_to_slack(f"Gmail polling error: {e}", dedup_key="gmail_polling_error")

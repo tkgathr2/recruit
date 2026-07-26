@@ -1857,3 +1857,89 @@ class TestMainLoopBackoffAndRecovery:
         assert any("boom" in m for m in calls["notify"]), (
             f"想定外例外がSlackに一切通知されなかった（サイレントbackoffの回帰）: {calls['notify']}"
         )
+
+
+# ---- 回帰: Gmail セッション切れ abort を「障害」扱いして誤アラートしない -------------
+
+class TestTransientSessionAbort:
+    """Gmail がアイドル接続を切って `Session expired, please login again.` を
+    返しただけで、120秒バックオフ＋社長へのSlackアラートを飛ばしていた誤報の回帰テスト
+    （observed 2026-07-26 17:28 キャスト応募通知Bot）。
+
+    プール接続は imap_connection() 側で破棄済みなので、張り直せば直る。
+    """
+
+    def test_is_transient_abort_classification(self):
+        from src.main import is_transient_abort
+
+        assert is_transient_abort(
+            imaplib.IMAP4.abort("command: UID => Session expired, please login again.")
+        ) is True
+        assert is_transient_abort(imaplib.IMAP4.abort("socket error: EOF")) is True
+        # quota 超過と認証失敗は「張り直せば直る」ものではない
+        assert is_transient_abort(imaplib.IMAP4.abort("[OVERQUOTA] Quota exceeded")) is False
+        assert is_transient_abort(
+            imaplib.IMAP4.abort("[AUTHENTICATIONFAILED] Invalid credentials")
+        ) is False
+
+    @patch("src.main.time.sleep")
+    def test_session_expired_recovers_on_retry_without_alerting(self, _sleep):
+        """1回セッション切れ→再接続で成功するなら、成功(True)扱いで
+        バックオフもSlackアラートも発生しないこと。"""
+        from src.main import check_mail_with_status
+
+        attempts = {"n": 0}
+
+        def _flaky(_processed_ids):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise imaplib.IMAP4.abort(
+                    "command: UID => Session expired, please login again."
+                )
+            return None
+
+        with patch("src.main.has_imap_credentials", return_value=True), \
+             patch("src.main._check_mail_attempt", side_effect=_flaky), \
+             patch("src.main.notify_error_to_slack") as mock_notify:
+            result = check_mail_with_status(set())
+
+        assert result is True, "セッション切れは再接続で復旧するのでバックオフさせない"
+        assert attempts["n"] == 2, "再接続のリトライが行われていない"
+        assert mock_notify.call_count == 0, (
+            f"自然復旧する事象でSlackアラートが飛んだ: {mock_notify.call_args_list}"
+        )
+
+    @patch("src.main.time.sleep")
+    def test_session_expired_persisting_still_backs_off(self, _sleep):
+        """全リトライで再接続できない場合は本物の障害としてバックオフ(False)すること。"""
+        import src.main as main_module
+        from src.main import check_mail_with_status
+
+        with patch("src.main.has_imap_credentials", return_value=True), \
+             patch("src.main._check_mail_attempt",
+                   side_effect=imaplib.IMAP4.abort(
+                       "command: UID => Session expired, please login again.")), \
+             patch("src.main.notify_error_to_slack"):
+            result = check_mail_with_status(set())
+
+        assert result is False
+        assert "Session expired" in main_module._last_backoff_reason
+
+    @patch("src.main.time.sleep")
+    def test_overquota_abort_is_not_retried(self, _sleep):
+        """OVERQUOTA は即バックオフ（リトライで叩き続けない）こと。"""
+        from src.main import check_mail_with_status
+
+        attempts = {"n": 0}
+
+        def _quota(_processed_ids):
+            attempts["n"] += 1
+            raise imaplib.IMAP4.abort("[OVERQUOTA] Quota exceeded")
+
+        with patch("src.main.has_imap_credentials", return_value=True), \
+             patch("src.main._check_mail_attempt", side_effect=_quota), \
+             patch("src.main.notify_error_to_slack"):
+            result = check_mail_with_status(set())
+
+        assert result is False
+        assert attempts["n"] == 1, "quota超過でリトライして叩き続けている"
