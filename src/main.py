@@ -75,19 +75,23 @@ ERROR_NOTIFICATION_DEDUP_SECONDS = int(os.getenv("ERROR_NOTIFICATION_DEDUP_SECON
 # 認証失敗の通知抑制（既定6時間）。アプリパスワード失効は人手による再発行が必要で
 # すぐには直らないため、10分おきに通知を垂れ流さず長めの間隔に集約する。
 AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS = int(os.getenv("AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS", "21600"))
-_last_error_notification_ts: dict = {}  # dedup_key -> last unix timestamp
-# --- Unclassified mail normal-channel dedup ---
-# 未分類Indeedメール（determine_source が None を返したもの）について、
-# 通常チャネル（Slack/LINE 応募通知）への送信を「1メール=1回限り」に制限する。
-# エラーチャネル（notify_error_to_slack）は10分dedupで管理者へのリマインダーを兼ねるため
-# 従来どおり10分間隔で送り続けるが、通常チャネルへの再送はスパムになるため抑制する。
-_unclassified_normal_notified: Set[str] = set()  # unique_id -> 通常チャネル送信済み
+_last_error_notification_ts: dict = {}  # dedup_key -> (last unix timestamp, window_seconds)
 
 # --- Backoff reason tracking ---
 # check_mail_with_status() は「quota超過」以外の IMAP abort でも False を返すため、
 # main() が理由を問わず一律「Gmail quota exceeded」と報告すると誤診断を招く。
 # ここに実際の失敗理由を記録し、main() の通知メッセージに反映する。
 _last_backoff_reason: str = "Gmail quota exceeded"
+
+# --- Degraded-success tracking (bug-check-lab H-3, 2026-08-23) ---
+# check_mail_with_status() は「資格情報未設定」「processed_ids破損」「認証失敗」
+# 「接続全滅」でも backoff を避けるため True を返す。しかし True の本当の意味は
+# 「メールを実際に読めた」ではなく「backoffするな」であり、main() がこれを
+# 「復旧した」と誤解釈すると、実際にはメールを1通も読めていないのに
+# 「✅ Gmail polling recovered」という偽の復旧通知が飛ぶ（＝実害が続いているのに
+# 緑に見える）。ここに「直近の True が本物の成功か、backoff回避のための
+# degraded True か」を記録し、main() の復旧通知の条件に反映する。
+_last_check_degraded: bool = False
 
 # --- Shared HTTP session (M-9: connection reuse across requests) ---
 _http_session = requests.Session()
@@ -115,20 +119,6 @@ def is_quota_error(error: object) -> bool:
     return "OVERQUOTA" in str(error).upper()
 
 
-# Gmail がアイドル接続を切ったとき等、「張り直せば直る」種類の IMAP4.abort。
-# これらは人手対応が不要で、再接続すれば次のポーリングで復旧する。
-IMAP_TRANSIENT_ABORT_PATTERNS = (
-    "SESSION EXPIRED",        # Gmail がアイドルセッションを終了（observed 2026-07-26）
-    "PLEASE LOGIN AGAIN",
-    "SOCKET ERROR",           # imaplib が接続断で送出（EOF 等）
-    "EOF",
-    "CONNECTION RESET",
-    "TEMPORARY SYSTEM ERROR",  # Gmail 側の一時障害
-    "UNAVAILABLE",
-    "TRY AGAIN",
-)
-
-
 def is_transient_abort(error: object) -> bool:
     """IMAP4.abort が「再接続で自然に直る一時障害」かどうかを判定する。
 
@@ -137,11 +127,19 @@ def is_transient_abort(error: object) -> bool:
     一部で、接続を張り直せば直る。quota 超過や認証失敗と同列に扱って
     120秒バックオフ＋社長へのSlackアラートを出すのは誤報になるため、
     ここで切り分けて通常のリトライ経路に載せる。
+
+    quota超過・認証失敗以外は全て一時障害として扱う（denylist方式・
+    2026-08-23 bug-check-lab で allowlist から変更）。理由：Gmail が返す
+    IMAP4.abort のBYE本文は自由文かつ多様で（"System Error (Failure)"、
+    "[LIMIT] Too many simultaneous connections."、imaplib自身が出す
+    "unexpected tagged response" 等）、allowlist方式では実測で複数系統の
+    取りこぼしが確認された。誤判定のコストは非対称：transient を permanent と
+    誤ると120秒×バックオフ段数の停止＋誤アラートが最大15分続くが、
+    permanent を transient と誤っても既存の接続リトライ（5/10/20秒、
+    最大35秒）で打ち切られてbackoffに落ちるだけで実害はわずか。
+    このため安全側（denylist）に倒す。
     """
-    if is_quota_error(error) or is_auth_failure(error):
-        return False
-    text = str(error).upper()
-    return any(pattern in text for pattern in IMAP_TRANSIENT_ABORT_PATTERNS)
+    return not (is_quota_error(error) or is_auth_failure(error))
 
 
 def has_imap_credentials() -> bool:
@@ -200,11 +198,19 @@ INDEED_NON_APPLICATION_PATTERNS = [
 
 # --- Logging ---
 def log(msg: str) -> None:
-    """Log message to file and stdout."""
+    """Log message to file and stdout.
+
+    ファイル書き込み失敗（LOG_DIR不通・権限無し等）は stdout のみへ degrade する。
+    ここで例外を投げると notify_error_to_slack() 自身も log() を呼ぶため、
+    エラー通知経路ごと無言でクラッシュする（2026-08-23 bug-check-lab M-6）。
+    """
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     line = f"{ts} {msg}"
-    with open(os.path.join(LOG_DIR, "recruit.log"), "a", encoding="utf-8") as f:
-        f.write(line + "\n")
+    try:
+        with open(os.path.join(LOG_DIR, "recruit.log"), "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
     print(line, flush=True)
 
 
@@ -294,8 +300,11 @@ def save_processed_ids(processed_ids: Set[str]) -> bool:
             persistent_ids.sort()
             persistent_ids = persistent_ids[-MAX_PROCESSED_IDS:]
         # Atomic write: write to temp file then replace to prevent partial writes on crash
+        # tmpファイル名にPIDを含める（2026-08-23 bug-check-lab M-3）: Railway再デプロイ時に
+        # 新旧コンテナが共有Volume上で一時的に併走すると、固定名の tmp を両プロセスが
+        # 同時に開いて書きかけJSONを replace() し合い、原子性の保証が破れて破損しうる。
         target_path = Path(PROCESSED_IDS_FILE)
-        tmp_path = target_path.with_suffix(".tmp")
+        tmp_path = target_path.with_suffix(f".{os.getpid()}.tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(persistent_ids, f)
         tmp_path.replace(target_path)
@@ -319,21 +328,27 @@ def notify_error_to_slack(message: str, dedup_key: Optional[str] = None,
         dedup_seconds: 重複抑止の窓（秒）。省略時は ERROR_NOTIFICATION_DEDUP_SECONDS。
             認証失効など長く続く障害は長めの窓を指定して通知フラッドを防ぐ。
     """
-    # サイズ上限（古いエントリを自動削除）
-    if len(_last_error_notification_ts) > 500:
-        cutoff = time.time() - (dedup_seconds if dedup_seconds is not None else ERROR_NOTIFICATION_DEDUP_SECONDS)
-        expired = [k for k, v in _last_error_notification_ts.items() if v < cutoff]
-        for k in expired:
-            del _last_error_notification_ts[k]
-
     key = dedup_key if dedup_key is not None else message
     window = dedup_seconds if dedup_seconds is not None else ERROR_NOTIFICATION_DEDUP_SECONDS
     now_ts = time.time()
-    last_ts = _last_error_notification_ts.get(key, 0.0)
+
+    # サイズ上限（古いエントリを自動削除）。各エントリ「自身の」window で失効判定する
+    # （2026-08-23 bug-check-lab M-8）：以前は「今回呼び出しの window」を全エントリへ一括適用しており、
+    # 600秒窓の通常エラーが1件掃除を誘発しただけで、6時間窓で登録した認証エラー等の
+    # dedup が誤って早期失効し、AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS の意味が消えていた。
+    if len(_last_error_notification_ts) > 500:
+        expired = [
+            k for k, (ts, w) in _last_error_notification_ts.items()
+            if now_ts - ts >= w
+        ]
+        for k in expired:
+            del _last_error_notification_ts[k]
+
+    last_ts, _prev_window = _last_error_notification_ts.get(key, (0.0, window))
     if now_ts - last_ts < window:
         log(f"Skipping duplicate error notification within {window}s window: key={key[:80]}")
         return
-    _last_error_notification_ts[key] = now_ts
+    _last_error_notification_ts[key] = (now_ts, window)
 
     webhook_url = SLACK_ERROR_WEBHOOK_URL or SLACK_WEBHOOK_URL_PROD
     if not webhook_url:
@@ -464,17 +479,22 @@ def extract_applicant_name_from_html(html: str) -> Optional[str]:
     text = soup.get_text(separator="\n")
 
     # パターン1: 「○○さんからの応募」「○○さんが応募しました」
+    # 区切りは半角/全角スペース限定（[ 　]）にする。`\s` は改行にもマッチするため、
+    # soup.get_text(separator="\n") で改行区切りにした本文では、名前行の直前に
+    # 別要素（見出し等）が来ると前行の末尾トークンを巻き込んで誤抽出する
+    # （例: "求人詳細\n山田太郎さんが応募しました" → 誤って "求人詳細\n山田太郎" を抽出。
+    # 2026-08-23 bug-check-lab H-1・実測再現済み）。
     for pattern in [
-        r"([^\s　\n]+(?:\s[^\s　\n]+)?)\s*さん(?:から(?:の)?応募|が応募)",
+        r"([^\s　\n]+(?:[ 　][^\s　\n]+)?)[ 　]*さん(?:から(?:の)?応募|が応募)",
         r"新しい応募者(?:のお知らせ)?[:：]\s*([^\n\r]+)",
         r"応募者(?:名)?[:：]\s*([^\n\r]+)",
-        r"([^\s　\n]{1,20})\s*(?:様|さん)(?:\s|$|が|から|の)",
+        r"([^\s　\n]{1,20})[ 　]*(?:様|さん)(?:[ 　]|$|が|から|の)",
     ]:
         match = re.search(pattern, text)
         if match:
             name = match.group(1).strip()
-            # 明らかに名前ではないものを除外（URLや長すぎる文字列）
-            if name and len(name) <= 30 and "http" not in name and "@" not in name:
+            # 明らかに名前ではないものを除外（URL・長すぎる文字列・改行混入）
+            if name and len(name) <= 30 and "http" not in name and "@" not in name and "\n" not in name:
                 return name
 
     return None
@@ -522,55 +542,24 @@ def extract_job_title_from_html(html: str) -> Optional[str]:
     return None
 
 
-def _shorten_via_tinyurl(encoded_url: str) -> Optional[str]:
-    """Try to shorten a URL via TinyURL. Returns shortened URL or None."""
-    try:
-        api = "https://tinyurl.com/api-create.php?url=" + encoded_url
-        resp = _http_session.get(api, timeout=8)
-        if resp.status_code == 200 and resp.text.strip().startswith("http"):
-            return resp.text.strip()
-        log(f"WARN: TinyURL shorten returned status={resp.status_code}")
-    except Exception as e:
-        log(f"WARN: TinyURL shorten failed: {e}")
-    return None
+def sanitize_slack_text(text: str) -> str:
+    """Slack mrkdwn の特殊文字をエスケープする（2026-08-23 bug-check-lab M-4）。
 
-
-def _shorten_via_isgd(encoded_url: str) -> Optional[str]:
-    """Try to shorten a URL via is.gd. Returns shortened URL or None."""
-    try:
-        api = "https://is.gd/create.php?format=simple&url=" + encoded_url
-        resp = _http_session.get(api, timeout=5)
-        if resp.status_code == 200 and resp.text.strip().startswith("http"):
-            return resp.text.strip()
-        log(f"WARN: is.gd shorten returned status={resp.status_code} body={resp.text[:80]}")
-    except Exception as e:
-        log(f"WARN: is.gd shorten failed: {e}")
-    return None
-
-
-def shorten_url(url: str) -> str:
-    """Shorten URL using TinyURL and is.gd with domain-aware ordering.
-
-    is.gd blocks Indeed domains entirely, so for Indeed URLs we use
-    TinyURL as primary. For other URLs, is.gd is preferred (faster).
-    Returns the original URL if all shorteners fail.
+    応募者名・件名は外部入力（応募者自身がIndeed上で自由に設定できる）で、
+    無サニタイズのまま Slack `text` に渡すと `<!channel>` の追加ピングや
+    `<https://evil.example|表示文字>` 形式のリンク偽装が機能してしまう。
+    Slack公式推奨の順序（& を最初に）でエスケープする。
     """
-    if not url:
-        return url
-    encoded = requests.utils.quote(url, safe="")
-    is_indeed = "indeed" in url.lower()
-    if is_indeed:
-        # is.gd blocks all *.indeed.com domains → TinyURL first
-        result = _shorten_via_tinyurl(encoded) or _shorten_via_isgd(encoded)
-    else:
-        result = _shorten_via_isgd(encoded) or _shorten_via_tinyurl(encoded)
-    if result:
-        return result
-    log("WARN: Both URL shorteners failed, using original URL")
-    return url
+    if not text:
+        return text
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # --- Notification Functions ---
+# 2026-08-23 bug-check-lab H-4: 以前は shorten_url() で TinyURL/is.gd に応募URLを
+# 平文で渡していたが、応募者導線URL（トークン付き）が外部の第三者2社のログに残り、
+# 生成された短縮コードは短く公開・総当たり可能なため、応募者PIIへの露出経路になりうる。
+# Slack/LINE 双方ともチャネル自体がアクセス制御されているため、短縮せず原URLを直接貼る。
 def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optional[str] = None, max_retries: int = 3) -> bool:
     """Send notification to Slack with retry logic. Returns True if successful."""
     webhook_url = get_slack_webhook_url()
@@ -580,11 +569,13 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
     title = "【Indeed応募】" if source == "indeed" else "【ジモティー】"
     mention_prefix = "<!channel>\n"
 
-    lines = [f"{title} 【{name}】 さんから応募がありました。"]
-    if job_title:
-        lines.append(f"求人: {job_title}")
+    safe_name = sanitize_slack_text(name)
+    safe_job_title = sanitize_slack_text(job_title) if job_title else job_title
+    lines = [f"{title} 【{safe_name}】 さんから応募がありました。"]
+    if safe_job_title:
+        lines.append(f"求人: {safe_job_title}")
     if url:
-        lines.extend(["", "応募内容はこちら:", shorten_url(url)])
+        lines.extend(["", "応募内容はこちら:", url])
     message = add_test_prefix(mention_prefix + "\n".join(lines))
     for attempt in range(max_retries):
         try:
@@ -617,7 +608,7 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
         # to avoid Google OAuth blocking in LINE's in-app browser
         separator = "&" if "?" in url else "?"
         external_url = f"{url}{separator}openExternalBrowser=1"
-        lines.extend(["", "詳細はこちら:", shorten_url(external_url)])
+        lines.extend(["", "詳細はこちら:", external_url])
     base_message = add_test_prefix("\n".join(lines))
     headers = {
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
@@ -974,10 +965,14 @@ def process_mail_by_uid(
                 # 未知のパターン → Indeedが件名フォーマットを変更した可能性がある。
                 # エラーチャネルにアラートを出しつつ、通常の応募通知チャネル（Slack/LINE）にも
                 # 「⚠️未分類」として通知して人間が必ず気づけるようにする。
-                # return None にして processed_ids に入れないことで、次サイクルでも再処理される
-                # （エラーチャネルは dedup_key で10分間隔リマインダーとして残す）。
-                # ただし通常チャネルへの送信は _unclassified_normal_notified で「1メール=1回」
-                # に制限する（未対処のまま ~60秒ポーリングが続くと最大1440回/日のスパムになるため）。
+                #
+                # 2026-08-23 bug-check-lab Critical(H-2+M-1+M-2)修正: 以前は return None にして
+                # processed_ids に入れず「次サイクルでも再処理」させていたが、_check_mail_attempt()
+                # の batch は UID昇順（＝古い順）で MAX_EMAILS_PER_CYCLE 件しか処理しないため、
+                # 未分類メールが既定10件溜まると batch 全体が未分類で埋まり、以降に届いた
+                # 本物の応募メールが一切処理されなくなる（SEARCH_DAYS=1 のため24時間で検索窓から
+                # 脱落し、応募通知が無言で恒久的に消失する）。未分類も「1通=1回」検知できれば
+                # 目的は果たせるため、他の分岐と同様 unique_id を返して即座に処理済みにする。
                 date_header = decode_header_value(msg.get("Date", ""))
                 alert_msg = (
                     "⚠️ 件名不一致のIndeedメールを検知\n"
@@ -987,22 +982,14 @@ def process_mail_by_uid(
                     "Indeedが件名フォーマットを変更した可能性があります。determine_source関数の更新を検討してください。"
                 )
                 log(f"ALERT: Indeed email detected with unrecognized subject: {subject}")
-                dedup_key = f"indeed_unclassified:{unique_id}"
-                notify_error_to_slack(alert_msg, dedup_key=dedup_key)
-                # 通常チャネルには初回のみ送信（2サイクル目以降は抑制）
-                if unique_id not in _unclassified_normal_notified:
-                    html = extract_html(msg)
-                    url = extract_indeed_url(html) or ""
-                    unclassified_name = "⚠️未分類のIndeedメール（要確認）"
-                    notify_slack_with_retry("indeed", unclassified_name, url)
-                    notify_line_with_retry("indeed", unclassified_name, url)
-                    _unclassified_normal_notified.add(unique_id)
-                    processed_ids.add(f"unclf:{unique_id}")
-                    save_processed_ids(processed_ids)
-                    log(f"Normal channel notified (first time) for unclassified: {unique_id}")
-                else:
-                    log(f"Normal channel skip (already notified) for unclassified: {unique_id}")
-                return None  # 処理済みにしない＝次サイクルでも拾い直す（エラーチャネルでリマインド継続）
+                notify_error_to_slack(alert_msg, dedup_key=f"indeed_unclassified:{unique_id}")
+                html = extract_html(msg)
+                url = extract_indeed_url(html) or ""
+                unclassified_name = "⚠️未分類のIndeedメール（要確認）"
+                notify_slack_with_retry("indeed", unclassified_name, url)
+                notify_line_with_retry("indeed", unclassified_name, url)
+                log(f"Normal channel notified for unclassified: {unique_id}")
+                return unique_id  # 処理済みマーク＝本物の応募処理のバッチ枠を占有し続けない
         else:
             log(f"Skip non-target mail: {subject[:50]}...")
             return unique_id  # Indeed以外の対象外メールは静かにスキップ＋処理済みマーク
@@ -1160,7 +1147,7 @@ def check_mail_with_status(processed_ids: Optional[Set[str]] = None) -> bool:
         processed_ids: 起動時にロード済みの処理済みID集合。Noneのとき（後方互換・テスト用）は
             従来どおり内部でロードする。main()からはこの引数で渡してサイクル間でメモリ保持する。
     """
-    global _last_backoff_reason
+    global _last_backoff_reason, _last_check_degraded
     try:
         # 資格情報が未設定なら、リトライで叩かず即座に分かりやすく通知する
         if not has_imap_credentials():
@@ -1182,6 +1169,7 @@ def check_mail_with_status(processed_ids: Optional[Set[str]] = None) -> bool:
                 dedup_key="imap_missing_credentials",
                 dedup_seconds=AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS,
             )
+            _last_check_degraded = True  # 設定待ち＝メールは読めていない（H-3: 偽の復旧通知防止）
             return True  # 設定待ち。quotaエラーではないので過度なbackoffはしない
 
         if processed_ids is None:
@@ -1190,6 +1178,7 @@ def check_mail_with_status(processed_ids: Optional[Set[str]] = None) -> bool:
             # If file exists but is corrupted, skip processing to prevent mass re-notifications
             if not load_success:
                 log("ERROR: Skipping mail check due to corrupted processed IDs file")
+                _last_check_degraded = True  # ファイル破損＝メールは読めていない
                 return True  # Not a quota error, don't backoff
 
         total_attempts = len(IMAP_RETRY_BACKOFFS) + 1  # initial + len(backoffs) retries
@@ -1197,9 +1186,26 @@ def check_mail_with_status(processed_ids: Optional[Set[str]] = None) -> bool:
         for attempt_idx in range(total_attempts):
             try:
                 _check_mail_attempt(processed_ids)
+                _last_check_degraded = False  # 実際にメールを読めた＝本物の成功
                 return True
             except imaplib.IMAP4.abort as e:
-                # quota 超過・認証失敗・未知の abort は既存の別ハンドラへ委ねる。
+                # abort 経由の認証失敗（Gmailが認証失敗時にBYEを返す経路）は、通常の
+                # IMAP4.error 側にある専用通知（🔑・6時間dedup・actionable）に到達しないと
+                # 対処法が伝わらない汎用メッセージが出続けるため、ここで先に振り分ける
+                # （2026-08-23 bug-check-lab M-5）。IMAP4.abort は IMAP4.error のサブクラスで
+                # except節の評価順的にここが先に捕まる。
+                if is_auth_failure(e):
+                    log(f"ERROR: IMAP authentication failed (abort): {e}")
+                    notify_error_to_slack(
+                        "🔑 Gmail IMAP 認証エラー: 認証情報が無効または期限切れです。\n"
+                        "Gmailのアプリパスワード（またはOAuth認証情報）を確認・再設定してください。\n"
+                        f"エラー詳細: {e}",
+                        dedup_key="imap_auth_error",
+                        dedup_seconds=AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS,
+                    )
+                    _last_check_degraded = True
+                    return True  # Auth failures won't self-heal with retries
+                # quota 超過・未知の abort は既存の別ハンドラへ委ねる。
                 if not is_transient_abort(e):
                     raise
                 # セッション切れ等の一時障害。imap_connection() が既にプール接続を
@@ -1227,6 +1233,7 @@ def check_mail_with_status(processed_ids: Optional[Set[str]] = None) -> bool:
                         dedup_key="imap_auth_error",
                         dedup_seconds=AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS,
                     )
+                    _last_check_degraded = True
                     return True  # Auth failures won't self-heal with retries
                 log(f"WARN: IMAP connection/read error on attempt {attempt_idx + 1}/{total_attempts}: {e}")
                 if attempt_idx < len(IMAP_RETRY_BACKOFFS):
@@ -1240,7 +1247,9 @@ def check_mail_with_status(processed_ids: Optional[Set[str]] = None) -> bool:
                     f"Gmail IMAP connection error (after {total_attempts} attempts): {last_conn_error}",
                     dedup_key="imap_connection_error",
                 )
+                _last_check_degraded = True
                 return True  # Not necessarily a quota error
+        _last_check_degraded = True  # ここに到達するのは想定外（安全側でdegraded扱い）
         return True
 
     except imaplib.IMAP4.abort as e:
@@ -1264,7 +1273,7 @@ def check_mail_with_status(processed_ids: Optional[Set[str]] = None) -> bool:
 
 def verify_storage() -> bool:
     """Verify that storage is working correctly at startup."""
-    log(f"=== Storage Verification ===")
+    log("=== Storage Verification ===")
     log(f"PROCESSED_IDS_FILE={PROCESSED_IDS_FILE}")
     parent_dir = Path(PROCESSED_IDS_FILE).parent
     log(f"Parent directory: {parent_dir}")
@@ -1301,7 +1310,7 @@ def verify_storage() -> bool:
         return False
 
     log(f"Currently tracking {len(processed_ids)} processed emails")
-    log(f"=== Storage Verification Complete ===")
+    log("=== Storage Verification Complete ===")
     return True
 
 
@@ -1339,8 +1348,13 @@ def main() -> None:
             _elapsed = time.monotonic() - _cycle_start
             if success:
                 # backoff から回復した場合のみ、復旧をSlackに知らせる
-                # （エラー通知だけが流れて「詰まったまま」に見えるのを防ぐ）
-                if consecutive_errors > 0:
+                # （エラー通知だけが流れて「詰まったまま」に見えるのを防ぐ）。
+                # ただし success=True は「メールを読めた」とは限らず「backoffするな」の
+                # 意味でも返るため（資格情報未設定・ファイル破損・認証失敗等）、
+                # _last_check_degraded で本物の成功かどうかを見る（2026-08-23 bug-check-lab H-3）。
+                # degraded のまま「✅ recovered」を出すと、実際にはメールを1通も読めて
+                # いないのに緑に見える誤報になる。
+                if consecutive_errors > 0 and not _last_check_degraded:
                     log(f"Recovered after {consecutive_errors} consecutive error(s)")
                     # dedup_seconds を明示しない＝既定 ERROR_NOTIFICATION_DEDUP_SECONDS(600s) を適用。
                     # quota/非quotaが短時間で往復する「フラッピング」時に復旧通知が連投されるのを防ぐ
@@ -1364,7 +1378,12 @@ def main() -> None:
                     notify_error_to_slack(f"{_last_backoff_reason}. Applying backoff ({backoff}s). Will retry automatically.")
                     quota_notified = True
                     last_notified_reason = _last_backoff_reason
-                time.sleep(max(0, backoff - _elapsed))
+                # backoff は「障害後に空ける期間」であり、ポーリング周期のドリフト補正
+                # （- _elapsed）とは意味が異なる。以前は _elapsed を引いていたため、
+                # リトライ梯子の所要時間（最大155秒）が初回backoff(120秒)を上回り、
+                # 最も効かせたい初回でバックオフが実質ゼロになっていた
+                # （2026-08-23 bug-check-lab M-7・実測確認）。
+                time.sleep(backoff)
         except Exception as e:
             log(f"ERROR in main loop: {e}")
             consecutive_errors += 1

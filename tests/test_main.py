@@ -38,6 +38,7 @@ from src.main import (
     process_mail_by_uid,
     extract_job_title_from_subject,
     extract_job_title_from_html,
+    extract_applicant_name_from_html,
     check_mail_with_status,
 )
 import imaplib
@@ -572,13 +573,15 @@ class TestNotifyLineWithRetry:
         assert mock_post.call_count == 2
 
     @patch('src.main.time.sleep')
-    @patch('src.main.shorten_url', side_effect=lambda u: u)
     @patch('src.main._http_session.post')
     @patch('src.main.get_line_to_id')
     @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
     @patch('src.main.is_test_mode', return_value=False)
-    def test_url_opens_in_external_browser(self, mock_test_mode, mock_get_id, mock_post, mock_shorten, mock_sleep):
-        """LINE通知のURLに openExternalBrowser=1 を付与すること（LINE内ブラウザのOAuthブロック回避）。"""
+    def test_url_opens_in_external_browser(self, mock_test_mode, mock_get_id, mock_post, mock_sleep):
+        """LINE通知のURLに openExternalBrowser=1 を付与すること（LINE内ブラウザのOAuthブロック回避）。
+
+        2026-08-23 bug-check-lab H-4以降、URL短縮は行わず原URLをそのまま使う。
+        """
         mock_get_id.return_value = "group_id"
         mock_post.return_value = MagicMock(status_code=200)
 
@@ -589,12 +592,11 @@ class TestNotifyLineWithRetry:
         assert "https://indeed.com/apply/123?openExternalBrowser=1" in text
 
     @patch('src.main.time.sleep')
-    @patch('src.main.shorten_url', side_effect=lambda u: u)
     @patch('src.main._http_session.post')
     @patch('src.main.get_line_to_id')
     @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
     @patch('src.main.is_test_mode', return_value=False)
-    def test_url_external_browser_with_existing_query(self, mock_test_mode, mock_get_id, mock_post, mock_shorten, mock_sleep):
+    def test_url_external_browser_with_existing_query(self, mock_test_mode, mock_get_id, mock_post, mock_sleep):
         """URLに既存クエリがある場合は & で openExternalBrowser=1 を連結すること。"""
         mock_get_id.return_value = "group_id"
         mock_post.return_value = MagicMock(status_code=200)
@@ -764,8 +766,14 @@ def test_process_mail_by_uid_real_indeed_application_is_processed():
 def test_process_mail_by_uid_indeed_unknown_subject_still_alerts():
     """送信者が本物のIndeed(indeed.com)で件名が未知の場合:
     - エラーチャネルにフォーマット変更アラートを出す
-    - 通常チャネル（Slack/LINE）にも「⚠️未分類」として通知する（取りこぼし防止・バグ1修正）
-    - return None（処理済みにしない＝次サイクルでも再処理可能）
+    - 通常チャネル（Slack/LINE）にも「⚠️未分類」として通知する（取りこぼし防止）
+    - unique_id を返して処理済みにする（2026-08-23 bug-check-lab Critical修正）
+
+    以前は return None で処理済みにせず「次サイクルでも再処理」させていたが、
+    _check_mail_attempt() のバッチは古い順に MAX_EMAILS_PER_CYCLE 件しか処理しないため、
+    未分類メールが既定10件溜まるとバッチ全体が未分類で埋まり、本物の応募メールが
+    一切処理されなくなる致命的な欠陥だった。未分類も1回検知できれば目的は果たせるため
+    即座に処理済みにする。
     """
     from unittest.mock import patch
     mock_mail = _build_mail_mock(
@@ -782,7 +790,7 @@ def test_process_mail_by_uid_indeed_unknown_subject_still_alerts():
     mock_alert.assert_called_once()   # 安全網アラート（エラーチャネル）は本物のIndeedドメインに対してのみ
     mock_slack.assert_called_once()   # 通常チャネルにも通知（取りこぼし防止）
     mock_line.assert_called_once()    # 通常チャネルにも通知（取りこぼし防止）
-    assert result is None             # 処理済みにしない（次サイクルで再処理可能）
+    assert result == "gm:1212121212121212121"  # 処理済みマーク（バッチ枠を占有し続けない）
 
 
 # ---- バグ1: 未分類IndeedメールのSlack/LINE通知 ----------------------------------------
@@ -791,8 +799,7 @@ def test_process_mail_by_uid_unclassified_indeed_notifies_normal_channels():
     """未分類のIndeedメール（応募でも既知の非応募でもない件名）は
     Slack/LINEの通常チャネルに通知され、取りこぼされないこと（バグ1の回帰テスト）。
 
-    修正前: notify_error_to_slack だけ呼んで return unique_id（永久抑制）。
-    修正後: Slack/LINE にも通知し、return None（次サイクルで再処理可能）。
+    かつ unique_id を返して処理済みにする（Critical根本原因修正・2026-08-23）。
     """
     from unittest.mock import patch
     mock_mail = _build_mail_mock(
@@ -811,22 +818,22 @@ def test_process_mail_by_uid_unclassified_indeed_notifies_normal_channels():
     # 通常チャネルにも通知される（取りこぼし防止）
     mock_slack.assert_called_once()
     mock_line.assert_called_once()
-    # return None → processed_ids に入らず次サイクルでも再処理可能
-    assert result is None, "未分類メールは processed_ids に入れず None を返すべき"
+    # unique_id を返す → processed_ids に入り、次サイクルではバッチ枠を占有しない
+    assert result == "gm:2020202020202020202", "未分類メールも処理済みマークすべき"
 
 
-def test_unclassified_indeed_normal_channel_notified_only_once():
-    """未分類Indeedメールの通常チャネル（Slack/LINE）通知は「1メール=1回だけ」であること。
+def test_unclassified_indeed_marked_processed_and_not_renotified():
+    """未分類Indeedメールは1回検知したら即座に処理済みマークされ、
+    同一メールが processed_ids に入った状態で再度渡されても
+    エラーチャネル・通常チャネルとも再送されないこと。
 
-    同一 unique_id のメールが2サイクル処理されても、Slack/LINE への通知は初回のみ。
-    エラーチャネル（notify_error_to_slack）は10分dedup制御なので2回呼ばれる想定。
+    2026-08-23 bug-check-lab Critical(H-2+M-1+M-2)修正の回帰テスト：
+    以前は未分類メールを永久に未処理のままにする設計で、_unclassified_normal_notified
+    という in-memory ガードだけで通常チャネルへの再送を抑制していたが、processed_ids
+    には反映されない（デッドコードの unclf: プレフィックスのみ書き込み、読み出し無し）ため、
+    毎サイクル _check_mail_attempt() のバッチ枠(MAX_EMAILS_PER_CYCLE)を占有し続け、
+    本物の応募メールが処理されなくなっていた。
     """
-    import src.main as main_module
-    from unittest.mock import patch, call
-
-    # テスト間でグローバル state が汚染しないよう明示クリア
-    main_module._unclassified_normal_notified.discard("gm:3030303030303030303")
-
     mock_mail = _build_mail_mock(
         subject="全く新しいフォーマットのIndeedメール",
         from_header="Indeed <noreply@indeed.com>",
@@ -834,30 +841,31 @@ def test_unclassified_indeed_normal_channel_notified_only_once():
         gm_msgid="3030303030303030303",
     )
 
+    processed_ids = set()
+
     # --- 1サイクル目 ---
     with patch("src.main.notify_error_to_slack") as mock_alert, \
          patch("src.main.notify_slack_with_retry", return_value=True) as mock_slack, \
          patch("src.main.notify_line_with_retry", return_value=True) as mock_line:
-        result1 = process_mail_by_uid(mock_mail, b"30", set())
+        result1 = process_mail_by_uid(mock_mail, b"30", processed_ids)
 
-    assert result1 is None, "1サイクル目: 処理済みにしない"
+    assert result1 == "gm:3030303030303030303", "1サイクル目: 処理済みマークすべき"
     mock_alert.assert_called_once()   # エラーチャネルは通知される
     mock_slack.assert_called_once()   # 1サイクル目: 通常チャネルも通知される
     mock_line.assert_called_once()    # 1サイクル目: 通常チャネルも通知される
 
-    # --- 2サイクル目（同一メール・同一 unique_id）---
+    processed_ids.add(result1)  # 呼び出し元(_check_mail_attempt)が行う処理を模する
+
+    # --- 2サイクル目（processed_ids に入った状態で同一メールが再度渡された場合）---
     with patch("src.main.notify_error_to_slack") as mock_alert2, \
          patch("src.main.notify_slack_with_retry", return_value=True) as mock_slack2, \
          patch("src.main.notify_line_with_retry", return_value=True) as mock_line2:
-        result2 = process_mail_by_uid(mock_mail, b"30", set())
+        result2 = process_mail_by_uid(mock_mail, b"30", processed_ids)
 
-    assert result2 is None, "2サイクル目: 引き続き処理済みにしない"
-    mock_alert2.assert_called_once()       # エラーチャネルは10分dedup制御（モック上は呼ばれる）
-    mock_slack2.assert_not_called()        # 2サイクル目: 通常チャネルは呼ばれない
-    mock_line2.assert_not_called()         # 2サイクル目: 通常チャネルは呼ばれない
-
-    # 後片付け
-    main_module._unclassified_normal_notified.discard("gm:3030303030303030303")
+    assert result2 is None, "2サイクル目: 既に処理済みなのでスキップすべき"
+    mock_alert2.assert_not_called()   # 2サイクル目: エラーチャネルも呼ばれない（早期return）
+    mock_slack2.assert_not_called()   # 2サイクル目: 通常チャネルは呼ばれない
+    mock_line2.assert_not_called()    # 2サイクル目: 通常チャネルは呼ばれない
 
 
 # ---- バグ2: processed_ids のメモリ保持 -----------------------------------------------
@@ -1025,6 +1033,36 @@ class TestExtractJobTitleFromHtml:
     def test_no_job_title_in_html_returns_none(self):
         html = "<html><body><p>○○さんからの応募がありました</p></body></html>"
         assert extract_job_title_from_html(html) is None
+
+
+class TestExtractApplicantNameFromHtml:
+    """extract_applicant_name_from_html() の回帰テスト（2026-08-23 bug-check-lab H-1）。
+
+    修正前: パターン1の区切りが `\\s`（改行にもマッチ）だったため、
+    soup.get_text(separator="\\n") した本文で名前行の直前に別要素（見出し等）が
+    来ると前行の末尾トークンを巻き込んで誤抽出していた（実測再現済み・
+    テストカバレッジがゼロだった）。
+    """
+
+    def test_name_not_contaminated_by_preceding_line(self):
+        html = "<p>求人詳細</p><p>山田太郎さんが応募しました</p>"
+        assert extract_applicant_name_from_html(html) == "山田太郎"
+
+    def test_name_not_contaminated_by_preceding_table_cell(self):
+        html = "<td>警備員</td><td>佐藤花子さんからの応募</td>"
+        assert extract_applicant_name_from_html(html) == "佐藤花子"
+
+    def test_name_with_half_width_space_still_matches(self):
+        html = "<p>山田 太郎さんが応募しました</p>"
+        assert extract_applicant_name_from_html(html) == "山田 太郎"
+
+    def test_empty_html_returns_none(self):
+        assert extract_applicant_name_from_html("") is None
+        assert extract_applicant_name_from_html(None) is None
+
+    def test_no_name_pattern_returns_none(self):
+        html = "<p>本日はお問い合わせありがとうございます</p>"
+        assert extract_applicant_name_from_html(html) is None
 
 
 class TestNotifyLineWithRetryFallback:
@@ -1704,6 +1742,45 @@ class TestCheckMailAttemptDedup:
 
         mock_process.assert_called_once()
 
+    def test_unclassified_backlog_does_not_starve_new_real_application(self):
+        """2026-08-23 bug-check-lab Critical(H-2+M-1+M-2)の回帰テスト。
+
+        以前は未分類Indeedメールを return None で処理済みにせず永久に未処理のまま
+        残していたため、MAX_EMAILS_PER_CYCLE(既定10)件溜まるとバッチが古い順の未分類で
+        埋まり、後から届いた本物の応募メール（このテストでは UID=13）が
+        SEARCH_DAYS(既定1日)の検索窓内で一度も処理されなかった。
+        process_mail_by_uid が unique_id を返す（=処理済みマークされる）契約さえ
+        守っていれば、数サイクルの範囲で新着も処理されることを検証する。
+        """
+        from src.main import _check_mail_attempt
+        from contextlib import contextmanager
+
+        # UID 1-12: 未分類（滞留分・MAX_EMAILS_PER_CYCLE=10を超える数）、UID 13: 本物の新着応募
+        all_uids = list(range(1, 14))
+        mail = self._make_imap_mock(all_uids)
+        processed_ids = set()
+
+        @contextmanager
+        def mock_imap_connection():
+            yield mail
+
+        def fake_process_mail_by_uid(mail_obj, uid, processed):
+            uid_int = int(uid.decode() if isinstance(uid, bytes) else uid)
+            # 修正後の契約: 未分類メールも他のメールと同様 unique_id を返して処理済みにする
+            return f"gm:{uid_int * 1000}"
+
+        with patch("src.main.imap_connection", mock_imap_connection), \
+             patch("src.main.process_mail_by_uid", side_effect=fake_process_mail_by_uid), \
+             patch("src.main.save_processed_ids", return_value=True):
+            # MAX_EMAILS_PER_CYCLE=10 のため、UID13まで届かせるには最低2サイクル要る
+            _check_mail_attempt(processed_ids)
+            _check_mail_attempt(processed_ids)
+
+        assert "gm:13000" in processed_ids, (
+            "未分類メールが処理済みマークされないと、後続の本物の応募(UID13)がバッチ枠に"
+            "入らず、SEARCH_DAYS の検索窓を過ぎて無言で消失する"
+        )
+
 
 # ---- バグチェック回帰: _last_backoff_reason と main() の復旧/backoff通知 -------------
 
@@ -1791,9 +1868,14 @@ class TestMainLoopBackoffAndRecovery:
 
         def fake_check_mail_with_status(processed_ids):
             try:
-                return next(seq)
+                result = next(seq)
             except StopIteration:
                 raise SystemExit("test-stop")
+            # 本物の check_mail_with_status() は成功時に _last_check_degraded=False を
+            # 設定する（2026-08-23 bug-check-lab H-3）。モックはこの副作用も模倣する。
+            if result:
+                main_module._last_check_degraded = False
+            return result
 
         monkeypatch.setattr(main_module, "notify_error_to_slack", fake_notify)
         monkeypatch.setattr(main_module, "check_mail_with_status", fake_check_mail_with_status)
@@ -1880,6 +1962,34 @@ class TestTransientSessionAbort:
         assert is_transient_abort(imaplib.IMAP4.abort("[OVERQUOTA] Quota exceeded")) is False
         assert is_transient_abort(
             imaplib.IMAP4.abort("[AUTHENTICATIONFAILED] Invalid credentials")
+        ) is False
+
+    def test_denylist_covers_previously_missed_transient_patterns(self):
+        """2026-08-23 bug-check-lab H-5の回帰テスト。
+
+        従来のallowlist方式（固定パターン列挙）では、Gmail/imaplibが実際に返す
+        以下のBYE文言・プロトコル同期ズレメッセージを取りこぼし、再接続で自然回復
+        する一時障害を本物の障害として120秒バックオフ＋Slackアラートに落としていた。
+        denylist方式（quota・認証失敗以外は全てtransient）への変更で全て拾えること。
+        """
+        from src.main import is_transient_abort
+
+        previously_missed = [
+            "System Error (Failure)",
+            "[LIMIT] Too many simultaneous connections.",
+            "unexpected tagged response: b'* BYE'",
+            "unexpected response: b'xyz'",
+            "[SERVERBUG] Internal error",
+            "[INUSE] Mailbox in use",
+        ]
+        for msg in previously_missed:
+            assert is_transient_abort(imaplib.IMAP4.abort(msg)) is True, (
+                f"denylist方式でも transient と判定されるべき: {msg}"
+            )
+        # quota・認証失敗は denylist化後も引き続き non-transient であること
+        assert is_transient_abort(imaplib.IMAP4.abort("[OVERQUOTA] over quota")) is False
+        assert is_transient_abort(
+            imaplib.IMAP4.abort("[AUTHENTICATIONFAILED] bad creds")
         ) is False
 
     @patch("src.main.time.sleep")
