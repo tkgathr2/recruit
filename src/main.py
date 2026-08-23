@@ -339,7 +339,7 @@ def notify_error_to_slack(message: str, dedup_key: Optional[str] = None,
     if not webhook_url:
         log("ERROR: No Slack webhook URL configured; cannot notify error to Slack")
         return
-    text = f"🚨 Indeed応募通知エラー発生\n{message}"
+    text = f"<!channel> 🚨 Indeed応募通知エラー発生\n{message}"
     try:
         resp = _http_session.post(
             webhook_url,
