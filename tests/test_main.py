@@ -1861,8 +1861,13 @@ class TestMainLoopBackoffAndRecovery:
 
         calls = {"notify": []}
 
-        def fake_notify(message, dedup_key=None, dedup_seconds=None):
-            calls["notify"].append({"message": message, "dedup_key": dedup_key, "dedup_seconds": dedup_seconds})
+        def fake_notify(message, dedup_key=None, dedup_seconds=None, **kwargs):
+            calls["notify"].append({
+                "message": message,
+                "dedup_key": dedup_key,
+                "dedup_seconds": dedup_seconds,
+                "mention": kwargs.get("mention", True),
+            })
 
         seq = iter(success_sequence)
 
@@ -1905,6 +1910,18 @@ class TestMainLoopBackoffAndRecovery:
         # dedup_seconds を明示的に 0 にしていない（省略 or None＝既定値を使う）こと
         assert recovered[0]["dedup_seconds"] != 0
 
+    def test_recovery_notification_is_sent_without_channel_mention(self, monkeypatch):
+        """復旧通知（✅）は障害ではないので mention=False で呼ばれること
+        （2026-08-24 bug-check-lab H: 🚨+@channel で送られ内容と矛盾していた）。"""
+        import src.main as main_module
+        main_module._last_backoff_reason = "Gmail quota exceeded (test)"
+
+        notified = self._run_main_cycles([False, True], monkeypatch)
+
+        recovered = [n for n in notified if n["dedup_key"] == "gmail_polling_recovered"]
+        assert len(recovered) == 1
+        assert recovered[0]["mention"] is False, "復旧通知に @channel が付いている"
+
     def test_silent_main_loop_exception_now_notifies(self, monkeypatch):
         """main() の except Exception（想定外例外）経路でも、従来はサイレントに
         backoff するだけだったが、修正後は notify_error_to_slack が呼ばれること。
@@ -1913,7 +1930,7 @@ class TestMainLoopBackoffAndRecovery:
 
         calls = {"notify": []}
 
-        def fake_notify(message, dedup_key=None, dedup_seconds=None):
+        def fake_notify(message, dedup_key=None, dedup_seconds=None, **kwargs):
             calls["notify"].append(message)
 
         def raising_check(processed_ids):
@@ -2053,3 +2070,169 @@ class TestTransientSessionAbort:
 
         assert result is False
         assert attempts["n"] == 1, "quota超過でリトライして叩き続けている"
+
+
+class TestNotifyErrorToSlackMention:
+    """notify_error_to_slack() の mention 引数と dedup 記録タイミングの検証
+    （2026-08-24 bug-check-lab H/M）。"""
+
+    def _clear_dedup(self):
+        import src.main as main_module
+        main_module._last_error_notification_ts.clear()
+
+    def _post_mock(self, status_code=200):
+        resp = MagicMock()
+        resp.status_code = status_code
+        resp.text = ""
+        return MagicMock(return_value=resp)
+
+    def test_mention_default_includes_channel(self):
+        """既定（mention 省略）では <!channel> と 🚨 エラー見出しが付くこと。"""
+        from src.main import notify_error_to_slack
+
+        self._clear_dedup()
+        post = self._post_mock()
+        with patch("src.main._http_session.post", post), \
+             patch("src.main.SLACK_ERROR_WEBHOOK_URL", "https://hooks.example/err"), \
+             patch("src.main.SLACK_DM_WEBHOOK_URL", ""):
+            notify_error_to_slack("boom", dedup_key="k_default")
+
+        text = post.call_args.kwargs["json"]["text"]
+        assert text.startswith("<!channel> ")
+        assert "🚨 Indeed応募通知エラー発生" in text
+        assert "boom" in text
+
+    def test_mention_true_explicit_includes_channel(self):
+        """mention=True を明示した場合も <!channel> が付くこと。"""
+        from src.main import notify_error_to_slack
+
+        self._clear_dedup()
+        post = self._post_mock()
+        with patch("src.main._http_session.post", post), \
+             patch("src.main.SLACK_ERROR_WEBHOOK_URL", "https://hooks.example/err"), \
+             patch("src.main.SLACK_DM_WEBHOOK_URL", ""):
+            notify_error_to_slack("boom", dedup_key="k_true", mention=True)
+
+        assert post.call_args.kwargs["json"]["text"].startswith("<!channel> ")
+
+    def test_mention_false_omits_channel_and_error_header(self):
+        """mention=False では <!channel> も 🚨 エラー見出しも付かないこと。"""
+        from src.main import notify_error_to_slack
+
+        self._clear_dedup()
+        post = self._post_mock()
+        with patch("src.main._http_session.post", post), \
+             patch("src.main.SLACK_ERROR_WEBHOOK_URL", "https://hooks.example/err"), \
+             patch("src.main.SLACK_DM_WEBHOOK_URL", ""):
+            notify_error_to_slack("✅ recovered", dedup_key="k_false", mention=False)
+
+        text = post.call_args.kwargs["json"]["text"]
+        assert "<!channel>" not in text, f"復旧通知に @channel が付いている: {text}"
+        assert "🚨" not in text, f"復旧通知に赤いエラー見出しが付いている: {text}"
+        assert "✅ recovered" in text
+
+    def test_mention_false_with_custom_header(self):
+        """header 引数で中立的な見出しに差し替えられること。"""
+        from src.main import notify_error_to_slack
+
+        self._clear_dedup()
+        post = self._post_mock()
+        with patch("src.main._http_session.post", post), \
+             patch("src.main.SLACK_ERROR_WEBHOOK_URL", "https://hooks.example/err"), \
+             patch("src.main.SLACK_DM_WEBHOOK_URL", ""):
+            notify_error_to_slack("設定待ち", dedup_key="k_hdr",
+                                  mention=False, header="ℹ️ Indeed応募通知 設定確認")
+
+        text = post.call_args.kwargs["json"]["text"]
+        assert text.startswith("ℹ️ Indeed応募通知 設定確認\n")
+        assert "<!channel>" not in text
+
+    def test_dedup_recorded_only_after_successful_post(self):
+        """POST 成功時は dedup 記録され、2回目の同一キーは抑止されること。"""
+        import src.main as main_module
+        from src.main import notify_error_to_slack
+
+        self._clear_dedup()
+        post = self._post_mock()
+        with patch("src.main._http_session.post", post), \
+             patch("src.main.SLACK_ERROR_WEBHOOK_URL", "https://hooks.example/err"), \
+             patch("src.main.SLACK_DM_WEBHOOK_URL", ""):
+            notify_error_to_slack("dup", dedup_key="k_ok")
+            notify_error_to_slack("dup", dedup_key="k_ok")
+
+        assert post.call_count == 1, "dedup 窓内なのに2回送信された"
+        assert "k_ok" in main_module._last_error_notification_ts
+
+    def test_dedup_not_recorded_when_post_fails(self):
+        """POST が 5xx で失敗したら dedup 記録せず、次回は再送信を試みること。"""
+        import src.main as main_module
+        from src.main import notify_error_to_slack
+
+        self._clear_dedup()
+        post = self._post_mock(status_code=500)
+        with patch("src.main._http_session.post", post), \
+             patch("src.main.SLACK_ERROR_WEBHOOK_URL", "https://hooks.example/err"), \
+             patch("src.main.SLACK_DM_WEBHOOK_URL", ""):
+            notify_error_to_slack("fail", dedup_key="k_ng")
+            assert "k_ng" not in main_module._last_error_notification_ts, (
+                "POST 失敗なのに送信済みとして dedup 記録された"
+            )
+            notify_error_to_slack("fail", dedup_key="k_ng")
+
+        assert post.call_count == 2, "POST 失敗後に再送信が抑止されている（沈黙バグ）"
+
+    def test_dedup_not_recorded_when_post_raises(self):
+        """POST が例外を投げた場合も dedup 記録せず再送信を試みること。"""
+        import src.main as main_module
+        from src.main import notify_error_to_slack
+
+        self._clear_dedup()
+        post = MagicMock(side_effect=Exception("network down"))
+        with patch("src.main._http_session.post", post), \
+             patch("src.main.SLACK_ERROR_WEBHOOK_URL", "https://hooks.example/err"), \
+             patch("src.main.SLACK_DM_WEBHOOK_URL", ""):
+            notify_error_to_slack("boom", dedup_key="k_exc")
+            assert "k_exc" not in main_module._last_error_notification_ts
+            notify_error_to_slack("boom", dedup_key="k_exc")
+
+        assert post.call_count == 2
+
+
+class TestRetryFailureNotificationSanitizesName:
+    """リトライ全失敗通知で応募者名がサニタイズされること（2026-08-24 bug-check-lab M）。"""
+
+    MALICIOUS_NAME = "<!channel> 山田<https://evil.example|太郎>"
+
+    @patch("src.main.time.sleep")
+    def test_slack_retry_failure_sanitizes_name(self, _sleep):
+        from src.main import notify_slack_with_retry
+
+        resp = MagicMock()
+        resp.status_code = 500
+        resp.text = "err"
+        with patch("src.main.get_slack_webhook_url", return_value="https://hooks.example/x"), \
+             patch("src.main._http_session.post", return_value=resp), \
+             patch("src.main.notify_error_to_slack") as mock_notify:
+            assert notify_slack_with_retry("indeed", self.MALICIOUS_NAME, "https://ex.example") is False
+
+        sent = mock_notify.call_args.args[0]
+        assert "<!channel>" not in sent, f"応募者名の @channel が素通りしている: {sent}"
+        assert "&lt;!channel&gt;" in sent
+        assert "&lt;https://evil.example|太郎&gt;" in sent
+
+    @patch("src.main.time.sleep")
+    def test_line_retry_failure_sanitizes_name(self, _sleep):
+        from src.main import notify_line_with_retry
+
+        resp = MagicMock()
+        resp.status_code = 500
+        resp.text = "err"
+        with patch("src.main.LINE_CHANNEL_ACCESS_TOKEN", "token"), \
+             patch("src.main.get_line_to_id", return_value="U123"), \
+             patch("src.main._http_session.post", return_value=resp), \
+             patch("src.main.notify_error_to_slack") as mock_notify:
+            assert notify_line_with_retry("indeed", self.MALICIOUS_NAME, "https://ex.example") is False
+
+        sent = mock_notify.call_args.args[0]
+        assert "<!channel>" not in sent, f"応募者名の @channel が素通りしている: {sent}"
+        assert "&lt;!channel&gt;" in sent

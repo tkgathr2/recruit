@@ -317,7 +317,9 @@ def save_processed_ids(processed_ids: Set[str]) -> bool:
 
 
 def notify_error_to_slack(message: str, dedup_key: Optional[str] = None,
-                          dedup_seconds: Optional[int] = None) -> None:
+                          dedup_seconds: Optional[int] = None,
+                          mention: bool = True,
+                          header: Optional[str] = None) -> None:
     """重大なエラーを Slack Webhook に通知する。
 
     Args:
@@ -327,6 +329,10 @@ def notify_error_to_slack(message: str, dedup_key: Optional[str] = None,
             スキップする。省略時は message 本文を dedup key として使う。
         dedup_seconds: 重複抑止の窓（秒）。省略時は ERROR_NOTIFICATION_DEDUP_SECONDS。
             認証失効など長く続く障害は長めの窓を指定して通知フラッドを防ぐ。
+        mention: True（既定）なら `<!channel>` を先頭に付け、赤いエラー見出しで送る。
+            復旧通知や設定待ちなど「本物の障害ではない」通知は False を渡す
+            （2026-08-24 bug-check-lab H: ✅復旧通知が🚨+@channel で飛び矛盾していた）。
+        header: 見出しの明示指定。省略時は mention に応じた既定見出しを使う。
     """
     key = dedup_key if dedup_key is not None else message
     window = dedup_seconds if dedup_seconds is not None else ERROR_NOTIFICATION_DEDUP_SECONDS
@@ -348,13 +354,14 @@ def notify_error_to_slack(message: str, dedup_key: Optional[str] = None,
     if now_ts - last_ts < window:
         log(f"Skipping duplicate error notification within {window}s window: key={key[:80]}")
         return
-    _last_error_notification_ts[key] = (now_ts, window)
 
     webhook_url = SLACK_ERROR_WEBHOOK_URL or SLACK_WEBHOOK_URL_PROD
     if not webhook_url:
         log("ERROR: No Slack webhook URL configured; cannot notify error to Slack")
         return
-    text = f"<!channel> 🚨 Indeed応募通知エラー発生\n{message}"
+    if header is None:
+        header = "🚨 Indeed応募通知エラー発生" if mention else "ℹ️ Indeed応募通知 お知らせ"
+    text = f"<!channel> {header}\n{message}" if mention else f"{header}\n{message}"
     try:
         resp = _http_session.post(
             webhook_url,
@@ -363,6 +370,10 @@ def notify_error_to_slack(message: str, dedup_key: Optional[str] = None,
         )
         if resp.status_code >= 400:
             log(f"ERROR: failed to send error notification to Slack (status={resp.status_code}, body={resp.text})")
+        else:
+            # dedup 記録は「送信できた」ことを確認してから行う（2026-08-24 bug-check-lab M）。
+            # POST 前に記録すると、失敗した通知が最大6時間 dedup 窓で沈黙してしまう。
+            _last_error_notification_ts[key] = (now_ts, window)
     except Exception as e:
         # 通知時のエラーでさらに例外を投げるとループするのでログのみ
         log(f"ERROR: exception while sending error notification to Slack: {e}")
@@ -589,7 +600,7 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
             log(f"ERROR: Slack notify exception: {e} (attempt={attempt + 1}/{max_retries})")
         if attempt < max_retries - 1:
             time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s
-    notify_error_to_slack(f"Slack notify failed after {max_retries} attempts for {name}")
+    notify_error_to_slack(f"Slack notify failed after {max_retries} attempts for {sanitize_slack_text(name)}")
     return False
 
 
@@ -657,7 +668,7 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
                 break
         if attempt < max_retries - 1:
             time.sleep(2 ** attempt)
-    notify_error_to_slack(f"LINE notify failed after {max_retries} attempts for {name}")
+    notify_error_to_slack(f"LINE notify failed after {max_retries} attempts for {sanitize_slack_text(name)}")
     return False
 
 
@@ -1168,6 +1179,8 @@ def check_mail_with_status(processed_ids: Optional[Set[str]] = None) -> bool:
                 "（アプリパスワード GMAIL_IMAP_PASSWORD は失効しやすいため非推奨）",
                 dedup_key="imap_missing_credentials",
                 dedup_seconds=AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS,
+                mention=False,
+                header="ℹ️ Indeed応募通知 設定確認",
             )
             _last_check_degraded = True  # 設定待ち＝メールは読めていない（H-3: 偽の復旧通知防止）
             return True  # 設定待ち。quotaエラーではないので過度なbackoffはしない
@@ -1362,6 +1375,8 @@ def main() -> None:
                     notify_error_to_slack(
                         f"✅ Gmail polling recovered after {consecutive_errors} error(s). Resuming normal polling.",
                         dedup_key="gmail_polling_recovered",
+                        mention=False,
+                        header="ℹ️ Indeed応募通知 復旧",
                     )
                 consecutive_errors = 0
                 quota_notified = False
