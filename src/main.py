@@ -571,6 +571,7 @@ def sanitize_slack_text(text: str) -> str:
 # 平文で渡していたが、応募者導線URL（トークン付き）が外部の第三者2社のログに残り、
 # 生成された短縮コードは短く公開・総当たり可能なため、応募者PIIへの露出経路になりうる。
 # Slack/LINE 双方ともチャネル自体がアクセス制御されているため、短縮せず原URLを直接貼る。
+# 2026-09-23: URLの中身は変えず表示だけ短くする（Slackはmrkdwnリンク化、LINEはFlexボタン化）。
 def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optional[str] = None, max_retries: int = 3) -> bool:
     """Send notification to Slack with retry logic. Returns True if successful."""
     webhook_url = get_slack_webhook_url()
@@ -586,7 +587,11 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
     if safe_job_title:
         lines.append(f"求人: {safe_job_title}")
     if url:
-        lines.extend(["", "応募内容はこちら:", url])
+        if "|" in url or "<" in url or ">" in url:
+            # mrkdwnリンク構文 <url|text> が壊れうる異常なURLは安全側で生URL表示にフォールバック
+            lines.extend(["", "応募内容はこちら:", url])
+        else:
+            lines.append(f"応募内容は<{url}|こちら>")
     message = add_test_prefix(mention_prefix + "\n".join(lines))
     for attempt in range(max_retries):
         try:
@@ -604,6 +609,40 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
     return False
 
 
+# LINE Messaging API仕様: uri actionのuriフィールドは最大1000文字。
+# Indeed URLは実測800〜900文字程度だが、まれに超過するケースに備え安全側のフォールバックを持つ。
+LINE_URI_ACTION_MAX_LENGTH = 1000
+
+
+def _build_line_flex_detail_message(external_url: str) -> dict:
+    """応募詳細への遷移ボタンのみを持つFlexメッセージ（URLはボタンの裏に隠れ本文には出さない）。"""
+    return {
+        "type": "flex",
+        "altText": "詳細はこちら",
+        "contents": {
+            "type": "bubble",
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "contents": [
+                    {"type": "text", "text": "応募詳細", "weight": "bold", "size": "md"},
+                ],
+            },
+            "footer": {
+                "type": "box",
+                "layout": "vertical",
+                "contents": [
+                    {
+                        "type": "button",
+                        "style": "primary",
+                        "action": {"type": "uri", "label": "詳細を見る", "uri": external_url},
+                    }
+                ],
+            },
+        },
+    }
+
+
 def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional[str] = None, max_retries: int = 3) -> bool:
     """Send notification to LINE with retry logic. Returns True if successful."""
     line_to_id = get_line_to_id()
@@ -614,17 +653,31 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
     lines = [f"【{name}】 さんから{title}"]
     if job_title:
         lines.append(f"求人: {job_title}")
+
+    external_url = None
+    use_flex_button = False
     if url:
         # Force LINE to open URL in external browser (Chrome/Safari)
         # to avoid Google OAuth blocking in LINE's in-app browser
         separator = "&" if "?" in url else "?"
         external_url = f"{url}{separator}openExternalBrowser=1"
-        lines.extend(["", "詳細はこちら:", external_url])
+        if len(external_url) <= LINE_URI_ACTION_MAX_LENGTH:
+            use_flex_button = True
+        else:
+            # uri action文字数上限超過時は安全側でテキストに直接貼る（従来挙動）
+            lines.extend(["", "詳細はこちら:", external_url])
+
     base_message = add_test_prefix("\n".join(lines))
     headers = {
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
+
+    def _build_messages(text_message: dict) -> list:
+        messages = [text_message]
+        if use_flex_button:
+            messages.append(_build_line_flex_detail_message(external_url))
+        return messages
 
     def _build_body_v2() -> dict:
         substitution = {
@@ -635,7 +688,9 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
         }
         return {
             "to": line_to_id,
-            "messages": [{"type": "textV2", "text": "{mention_all} " + base_message, "substitution": substitution}],
+            "messages": _build_messages(
+                {"type": "textV2", "text": "{mention_all} " + base_message, "substitution": substitution}
+            ),
         }
 
     def _build_body_plain() -> dict:
@@ -643,7 +698,7 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
         plain_text = base_message.replace("{mention_all} ", "").replace("{mention_all}", "")
         return {
             "to": line_to_id,
-            "messages": [{"type": "text", "text": plain_text}],
+            "messages": _build_messages({"type": "text", "text": plain_text}),
         }
 
     for attempt in range(max_retries):
