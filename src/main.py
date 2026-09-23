@@ -12,6 +12,7 @@ import re
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Set, Tuple
+from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
@@ -566,6 +567,38 @@ def sanitize_slack_text(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+# 2026-09-23 bug-check-lab S-1: 応募元の判定(determine_source)は件名のみで行っており、
+# 送信元アドレスは検証していない（雇用主ドメイン経由の正規応募を取りこぼさないため意図的）。
+# URLをリンク化・ボタン化すると遷移先が見えにくくなるため、表示直前のこの層で
+# 「投稿者が自由に書ける情報(件名・href)より、システムが検証済みの構造(ホスト名)を優先する」
+# 原則に従い許可リストで検証する（2026-08-13 mention-hisho教訓と同型）。
+ALLOWED_APPLICATION_URL_HOSTS = ("indeed.com", "jmty.jp")
+
+
+def is_trusted_application_url(url: str) -> bool:
+    """応募詳細URLが信頼できるドメイン(Indeed/ジモティー)かを検証する。
+
+    ホスト名は urlparse().hostname で正確に比較する（"evil-indeed.com.attacker.com"
+    のような文字列包含チェックでは容易にバイパスされるため部分一致は使わない）。
+    """
+    if not url or any(c.isspace() for c in url):
+        return False
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme != "https":
+        return False
+    host = (parsed.hostname or "").lower()
+    return any(host == domain or host.endswith("." + domain) for domain in ALLOWED_APPLICATION_URL_HOSTS)
+
+
+def _slack_link_safe_url(url: str) -> str:
+    """Slack mrkdwnリンク <url|text> の構文を壊す文字を無害化する（is_trusted_application_url
+    を通過した正規URL向けの保険。& は必ず先に処理する）。"""
+    return url.replace("&", "&amp;").replace("|", "%7C").replace("<", "%3C").replace(">", "%3E")
+
+
 # --- Notification Functions ---
 # 2026-08-23 bug-check-lab H-4: 以前は shorten_url() で TinyURL/is.gd に応募URLを
 # 平文で渡していたが、応募者導線URL（トークン付き）が外部の第三者2社のログに残り、
@@ -587,11 +620,11 @@ def notify_slack_with_retry(source: str, name: str, url: str, job_title: Optiona
     if safe_job_title:
         lines.append(f"求人: {safe_job_title}")
     if url:
-        if "|" in url or "<" in url or ">" in url:
-            # mrkdwnリンク構文 <url|text> が壊れうる異常なURLは安全側で生URL表示にフォールバック
-            lines.extend(["", "応募内容はこちら:", url])
+        if is_trusted_application_url(url):
+            lines.append(f"応募内容は<{_slack_link_safe_url(url)}|こちら>")
         else:
-            lines.append(f"応募内容は<{url}|こちら>")
+            # 許可ドメイン外のURLはリンク化せず、mrkdwn特殊文字もエスケープして生表示する
+            lines.extend(["", "⚠️要確認 応募内容はこちら:", sanitize_slack_text(url)])
     message = add_test_prefix(mention_prefix + "\n".join(lines))
     for attempt in range(max_retries):
         try:
@@ -661,57 +694,62 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
         # to avoid Google OAuth blocking in LINE's in-app browser
         separator = "&" if "?" in url else "?"
         external_url = f"{url}{separator}openExternalBrowser=1"
-        if len(external_url) <= LINE_URI_ACTION_MAX_LENGTH:
-            use_flex_button = True
-        else:
-            # uri action文字数上限超過時は安全側でテキストに直接貼る（従来挙動）
-            lines.extend(["", "詳細はこちら:", external_url])
+        use_flex_button = is_trusted_application_url(url) and len(external_url) <= LINE_URI_ACTION_MAX_LENGTH
+
+    # Flexを使わない最終形（非信頼ドメイン・uri action最大長超過・Flex自体が拒否された時の最後の砦）
+    # ではテキストへ直接URLを貼る
+    text_only_lines = list(lines)
+    if external_url:
+        text_only_lines.extend(["", "詳細はこちら:", external_url])
 
     base_message = add_test_prefix("\n".join(lines))
+    text_only_message = add_test_prefix("\n".join(text_only_lines))
     headers = {
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
 
-    def _build_messages(text_message: dict) -> list:
-        messages = [text_message]
-        if use_flex_button:
+    def _strip_mention_literal(text: str) -> str:
+        return text.replace("{mention_all} ", "").replace("{mention_all}", "")
+
+    def _build_body(text_type: str, text: str, include_flex: bool) -> dict:
+        if text_type == "textV2":
+            substitution = {"mention_all": {"type": "mention", "mentionee": {"type": "all"}}}
+            message: dict = {"type": "textV2", "text": text, "substitution": substitution}
+        else:
+            message = {"type": "text", "text": text}
+        messages = [message]
+        if include_flex:
             messages.append(_build_line_flex_detail_message(external_url))
-        return messages
+        return {"to": line_to_id, "messages": messages}
 
-    def _build_body_v2() -> dict:
-        substitution = {
-            "mention_all": {
-                "type": "mention",
-                "mentionee": {"type": "all"},
-            }
-        }
-        return {
-            "to": line_to_id,
-            "messages": _build_messages(
-                {"type": "textV2", "text": "{mention_all} " + base_message, "substitution": substitution}
-            ),
-        }
-
-    def _build_body_plain() -> dict:
-        # textV2 フォールバック時: {mention_all} リテラルを除去して plain text を送信
-        plain_text = base_message.replace("{mention_all} ", "").replace("{mention_all}", "")
-        return {
-            "to": line_to_id,
-            "messages": _build_messages({"type": "text", "text": plain_text}),
-        }
+    # 2026-09-23 bug-check-lab L-1: Flexメッセージ自体が400の原因（不正uri等）だと、
+    # textV2→plainへ切り替えても同じFlexが付いたままで再度400になり通知が完全に失われる。
+    # 最後の段では必ずFlexを外し、変更前から実績のある「テキストにURL直貼り」形に戻す。
+    if use_flex_button:
+        stages = [
+            ("textV2", "{mention_all} " + base_message, True),
+            ("text", _strip_mention_literal(base_message), True),
+            ("text", _strip_mention_literal(text_only_message), False),
+        ]
+    else:
+        stages = [
+            ("textV2", "{mention_all} " + text_only_message, False),
+            ("text", _strip_mention_literal(text_only_message), False),
+        ]
 
     for attempt in range(max_retries):
-        # textV2 (@all mention) を試み、失敗したら plain text にフォールバック
-        for body_builder, label in [(_build_body_v2, "textV2+mention"), (_build_body_plain, "text(fallback)")]:
+        for text_type, text, include_flex in stages:
+            label = f"{text_type}{'+flex' if include_flex else ''}"
             try:
-                resp = _http_session.post("https://api.line.me/v2/bot/message/push", json=body_builder(), headers=headers, timeout=10)
+                body = _build_body(text_type, text, include_flex)
+                resp = _http_session.post("https://api.line.me/v2/bot/message/push", json=body, headers=headers, timeout=10)
                 log(f"LINE API response: status={resp.status_code} type={label}")
                 if resp.status_code < 400:
                     return True
                 log(f"LINE notify {label} failed (status={resp.status_code}, body={resp.text[:200]})")
                 if resp.status_code == 400:
-                    # 400はtextV2未対応や不正メンション → 内側ループの次builder(plain)へ即フォールバック
+                    # 400は当該段の形式/内容が原因 → 次の段へ即フォールバック
                     continue
                 # 4xx以外（5xx等）はリトライ
                 break

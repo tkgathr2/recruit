@@ -534,8 +534,9 @@ class TestNotifySlackWithRetry:
     @patch('src.main._http_session.post')
     @patch('src.main.get_slack_webhook_url')
     @patch('src.main.is_test_mode', return_value=False)
-    def test_url_with_pipe_falls_back_to_plain_url(self, mock_test_mode, mock_get_url, mock_post, mock_sleep):
-        """URLに | や <> が混入している異常系は、mrkdwnリンク構文を壊さないよう生URL表示にフォールバックすること。"""
+    def test_url_with_pipe_is_percent_encoded_before_linking(self, mock_test_mode, mock_get_url, mock_post, mock_sleep):
+        """2026-09-23 bug-check-lab修正: 許可ドメイン(indeed.com)のURLに | が混入していても、
+        mrkdwnリンク構文を壊さないようパーセントエンコードした上でリンク化すること。"""
         mock_get_url.return_value = "https://hooks.slack.com/test"
         mock_post.return_value = MagicMock(status_code=200)
 
@@ -543,8 +544,42 @@ class TestNotifySlackWithRetry:
         notify_slack_with_retry("indeed", "山田太郎", weird_url)
 
         text = mock_post.call_args[1]['json']['text']
-        assert weird_url in text
-        assert f"<{weird_url}|" not in text
+        assert "<https://indeed.com/apply?x=1%7Cevil|こちら>" in text
+        assert "|evil|" not in text  # 生のパイプがリンク構文に混入していない
+
+    @patch('src.main.time.sleep')
+    @patch('src.main._http_session.post')
+    @patch('src.main.get_slack_webhook_url')
+    @patch('src.main.is_test_mode', return_value=False)
+    def test_untrusted_host_url_not_linked_and_escaped(self, mock_test_mode, mock_get_url, mock_post, mock_sleep):
+        """2026-09-23 bug-check-lab S-1修正: indeed.com/jmty.jp以外のホストのURLはリンク化せず、
+        mrkdwn特殊文字もエスケープして生表示すること（なりすましリンク対策）。"""
+        mock_get_url.return_value = "https://hooks.slack.com/test"
+        mock_post.return_value = MagicMock(status_code=200)
+
+        evil_url = "https://evil.example/x?a=1"
+        notify_slack_with_retry("indeed", "山田太郎", evil_url)
+
+        text = mock_post.call_args[1]['json']['text']
+        assert "|こちら>" not in text
+        assert "⚠️要確認" in text
+
+    @patch('src.main.time.sleep')
+    @patch('src.main._http_session.post')
+    @patch('src.main.get_slack_webhook_url')
+    @patch('src.main.is_test_mode', return_value=False)
+    def test_untrusted_host_html_entity_here_mention_is_escaped(self, mock_test_mode, mock_get_url, mock_post, mock_sleep):
+        """BeautifulSoupがHTMLエンティティ(&lt;!here&gt;)をデコードして<!here>を含むURLが
+        来ても、Slack本文に生の<!here>メンション構文が残らないこと。"""
+        mock_get_url.return_value = "https://hooks.slack.com/test"
+        mock_post.return_value = MagicMock(status_code=200)
+
+        url_with_here = "https://evil.example/<!here>"
+        notify_slack_with_retry("indeed", "山田太郎", url_with_here)
+
+        text = mock_post.call_args[1]['json']['text']
+        assert "<!here>" not in text
+        assert "&lt;!here&gt;" in text
 
 
 class TestNotifyLineWithRetry:
@@ -695,6 +730,53 @@ class TestNotifyLineWithRetry:
         body = mock_post.call_args[1]['json']
         assert body['messages'][0]['type'] == 'text'
         assert body['messages'][1]['type'] == 'flex'
+
+    @patch('src.main.time.sleep')
+    @patch('src.main._http_session.post')
+    @patch('src.main.get_line_to_id')
+    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
+    @patch('src.main.is_test_mode', return_value=False)
+    def test_flex_always_400_falls_back_to_text_only_without_flex(self, mock_test_mode, mock_get_id, mock_post, mock_sleep):
+        """2026-09-23 bug-check-lab L-1修正の再現テスト: Flexメッセージ自体が拒否理由で
+        textV2+flex・text+flexの両方が400になっても、3段目(text単独・Flexなし・URL直貼り)
+        まで自動フォールバックして最終的に成功すること（通知の完全消失を防ぐ）。"""
+        mock_get_id.return_value = "group_id"
+
+        def fake_post(url, json=None, headers=None, timeout=None):  # noqa: F811 (kwarg name mirrors requests.post's `json=`)
+            has_flex = any(m.get("type") == "flex" for m in json["messages"])
+            if has_flex:
+                return MagicMock(status_code=400, text="flex rejected")
+            return MagicMock(status_code=200)
+
+        mock_post.side_effect = fake_post
+
+        result = notify_line_with_retry("indeed", "山田太郎", "https://indeed.com/apply/123")
+
+        assert result is True
+        last_body = mock_post.call_args[1]['json']
+        assert len(last_body['messages']) == 1
+        assert last_body['messages'][0]['type'] == 'text'
+        assert "https://indeed.com/apply/123?openExternalBrowser=1" in last_body['messages'][0]['text']
+        # 400を2回(textV2+flex, text+flex)経てからの3段目成功であること
+        assert mock_post.call_count == 3
+
+    @patch('src.main.time.sleep')
+    @patch('src.main._http_session.post')
+    @patch('src.main.get_line_to_id')
+    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
+    @patch('src.main.is_test_mode', return_value=False)
+    def test_untrusted_host_url_no_flex_button(self, mock_test_mode, mock_get_id, mock_post, mock_sleep):
+        """2026-09-23 bug-check-lab S-1修正: indeed.com/jmty.jp以外のホストのURLはFlexボタン化せず、
+        テキストへ直接URLを貼ること（なりすましリンクをボタンの裏に隠さない）。"""
+        mock_get_id.return_value = "group_id"
+        mock_post.return_value = MagicMock(status_code=200)
+
+        notify_line_with_retry("indeed", "山田太郎", "https://evil.example/apply/123")
+
+        body = mock_post.call_args[1]['json']
+        assert len(body['messages']) == 1
+        assert body['messages'][0]['type'] == 'textV2'
+        assert "https://evil.example/apply/123?openExternalBrowser=1" in body['messages'][0]['text']
 
 
 def test_process_mail_by_uid_both_notifications_fail(tmp_path):
