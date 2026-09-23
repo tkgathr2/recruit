@@ -657,9 +657,8 @@ class TestNotifyLineWithRetry:
         """LINE通知のURLに openExternalBrowser=1 を付与すること（LINE内ブラウザのOAuthブロック回避）。
 
         2026-08-23 bug-check-lab H-4以降、外部の第三者短縮サービスは使わず原URLを直接使う。
-        2026-09-23以降、URLはテキスト本文ではなくFlexメッセージの詳細ボタン(uri action)に入り、
-        さらにLINE uri actionの1000文字上限対策として自社リダイレクト短縮URLを経由する。
-        ボタンのuriは短縮URLだが、resolve_short_url()で辿ると元のIndeed URLに一致すること。
+        2026-09-23(3回目のbug-check-lab F-3)以降、1000文字以内に収まる短いURLは自社短縮も
+        経由せず、Flexボタンのuriに元URLをそのまま使う（短縮は上限超過時のみに限定）。
         """
         mock_get_id.return_value = "group_id"
         mock_post.return_value = MagicMock(status_code=200)
@@ -669,10 +668,7 @@ class TestNotifyLineWithRetry:
         body = mock_post.call_args[1]['json']
         assert body['messages'][1]['type'] == 'flex'
         button_uri = body['messages'][1]['contents']['footer']['contents'][0]['action']['uri']
-        assert button_uri != "https://indeed.com/apply/123?openExternalBrowser=1"
-        assert button_uri.endswith("?openExternalBrowser=1")
-        short_id = button_uri.split("/r/")[1].split("?")[0]
-        assert resolve_short_url(short_id) == "https://indeed.com/apply/123"
+        assert button_uri == "https://indeed.com/apply/123?openExternalBrowser=1"
 
     @patch('src.main.time.sleep')
     @patch('src.main._http_session.post')
@@ -680,15 +676,32 @@ class TestNotifyLineWithRetry:
     @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
     @patch('src.main.is_test_mode', return_value=False)
     def test_url_external_browser_with_existing_query(self, mock_test_mode, mock_get_id, mock_post, mock_sleep):
-        """URLに既存クエリがある場合、短縮URL経由でも元URL(クエリ込み)へ正しく解決されること。"""
+        """URLに既存クエリがある場合は & で openExternalBrowser=1 を連結すること。"""
         mock_get_id.return_value = "group_id"
         mock_post.return_value = MagicMock(status_code=200)
 
         notify_line_with_retry("indeed", "山田太郎", "https://indeed.com/apply/123?ref=email")
 
         button_uri = mock_post.call_args[1]['json']['messages'][1]['contents']['footer']['contents'][0]['action']['uri']
-        short_id = button_uri.split("/r/")[1].split("?")[0]
-        assert resolve_short_url(short_id) == "https://indeed.com/apply/123?ref=email"
+        assert button_uri == "https://indeed.com/apply/123?ref=email&openExternalBrowser=1"
+
+    @patch('src.main.time.sleep')
+    @patch('src.main._http_session.post')
+    @patch('src.main.get_line_to_id')
+    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
+    @patch('src.main.is_test_mode', return_value=False)
+    def test_short_indeed_url_is_not_shortened(self, mock_test_mode, mock_get_id, mock_post, mock_sleep):
+        """2026-09-23 bug-check-lab(3回目) F-3: 1000文字以内のURLは無駄に短縮登録しない
+        （短縮は本当に必要な場合だけに限定し、永続化コスト・リダイレクトサーバー依存を避ける）。"""
+        mock_get_id.return_value = "group_id"
+        mock_post.return_value = MagicMock(status_code=200)
+
+        notify_line_with_retry("indeed", "山田太郎", "https://engage.indeed.com/f/a/short123")
+
+        body = mock_post.call_args[1]['json']
+        button_uri = body['messages'][1]['contents']['footer']['contents'][0]['action']['uri']
+        assert "/r/" not in button_uri
+        assert button_uri == "https://engage.indeed.com/f/a/short123?openExternalBrowser=1"
 
     @patch('src.main.time.sleep')
     @patch('src.main._http_session.post')
@@ -718,17 +731,21 @@ class TestNotifyLineWithRetry:
     @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
     @patch('src.main.is_test_mode', return_value=False)
     def test_short_url_itself_exceeding_limit_falls_back_to_plain_text(self, mock_test_mode, mock_get_id, mock_post, mock_sleep):
-        """安全網: 自社短縮URL自体が何らかの理由で1000文字を超える異常系でも、
-        Flexボタン化せず従来通りテキストに直接貼ること（LINE_URI_ACTION_MAX_LENGTHチェックは維持）。"""
+        """安全網: 自社短縮URL自体が何らかの理由で1000文字を超える異常系（SHORT_URL_BASEが
+        異常に長い等）でも、Flexボタン化せず従来通りテキストに直接貼ること
+        （LINE_URI_ACTION_MAX_LENGTHチェックは維持）。2026-09-23(3回目)のF-2修正により、
+        テキストに入るのは短縮URLではなく元のIndeed URLそのもの。"""
         mock_get_id.return_value = "group_id"
         mock_post.return_value = MagicMock(status_code=200)
 
-        notify_line_with_retry("indeed", "山田太郎", "https://indeed.com/apply/123")
+        long_url = "https://engage.indeed.com/f/a/" + ("A" * 1000)
+        notify_line_with_retry("indeed", "山田太郎", long_url)
 
         body = mock_post.call_args[1]['json']
         assert len(body['messages']) == 1
         assert body['messages'][0]['type'] == 'textV2'
-        assert "https://example.com/" in body['messages'][0]['text']
+        assert f"{long_url}?openExternalBrowser=1" in body['messages'][0]['text']
+        assert "https://example.com/" not in body['messages'][0]['text']
 
     @patch('src.main.time.sleep')
     @patch('src.main._http_session.post')
@@ -793,9 +810,9 @@ class TestNotifyLineWithRetry:
         last_body = mock_post.call_args[1]['json']
         assert len(last_body['messages']) == 1
         assert last_body['messages'][0]['type'] == 'text'
-        # 3段目のテキストにも短縮URLが使われる（生URLではない）ことを確認
-        assert "https://indeed.com/apply/123" not in last_body['messages'][0]['text']
-        assert "?openExternalBrowser=1" in last_body['messages'][0]['text']
+        # 2026-09-23(3回目)のF-2修正: 3段目(最後の砦)は短縮URLではなく元URLを直接使う
+        # （リダイレクトサーバーの状態に依存させないため）
+        assert "https://indeed.com/apply/123?openExternalBrowser=1" in last_body['messages'][0]['text']
         # 400を2回(textV2+flex, text+flex)経てからの3段目成功であること
         assert mock_post.call_count == 3
 
@@ -816,6 +833,60 @@ class TestNotifyLineWithRetry:
         assert len(body['messages']) == 1
         assert body['messages'][0]['type'] == 'textV2'
         assert "https://evil.example/apply/123?openExternalBrowser=1" in body['messages'][0]['text']
+
+    @patch('src.main.time.sleep')
+    @patch('src.main._http_session.post')
+    @patch('src.main.get_line_to_id')
+    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
+    @patch('src.main.is_test_mode', return_value=False)
+    def test_untrusted_host_url_shows_warning_label(self, mock_test_mode, mock_get_id, mock_post, mock_sleep):
+        """2026-09-23 bug-check-lab(3回目) F-6: LINE側もSlack側と同様、許可リスト外のURLには
+        ⚠️要確認の警告を付けること（これまでLINEだけ無警告でリンクが貼られる非対称があった）。"""
+        mock_get_id.return_value = "group_id"
+        mock_post.return_value = MagicMock(status_code=200)
+
+        notify_line_with_retry("indeed", "山田太郎", "https://evil.example/apply/123")
+
+        text = mock_post.call_args[1]['json']['messages'][0]['text']
+        assert "⚠️要確認" in text
+
+    @patch('src.main.time.sleep')
+    @patch('src.main._http_session.post')
+    @patch('src.main.get_line_to_id')
+    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
+    @patch('src.main.is_test_mode', return_value=False)
+    def test_trusted_host_url_has_no_warning_label(self, mock_test_mode, mock_get_id, mock_post, mock_sleep):
+        """許可リスト内のURLには⚠️表示を付けないこと（正規の応募に誤って警告を出さない）。"""
+        mock_get_id.return_value = "group_id"
+        mock_post.return_value = MagicMock(status_code=200)
+
+        notify_line_with_retry("indeed", "山田太郎", "https://indeed.com/apply/123")
+
+        flex = mock_post.call_args[1]['json']['messages'][1]
+        assert flex['type'] == 'flex'
+        # Flexボタンが使われるケースでは⚠️は無関係だが、text本文側にも混入していないことを確認
+        text = mock_post.call_args[1]['json']['messages'][0]['text']
+        assert "⚠️要確認" not in text
+
+    @patch('src.main.time.sleep')
+    @patch('src.main._http_session.post')
+    @patch('src.main.get_line_to_id')
+    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
+    @patch('src.main.is_test_mode', return_value=False)
+    def test_applicant_name_with_mention_placeholder_is_escaped(self, mock_test_mode, mock_get_id, mock_post, mock_sleep):
+        """2026-09-23 bug-check-lab(3回目、西野の動的テストで実測確認): 応募者名の文字列に
+        そのまま "{mention_all}" が含まれていると、LINE textV2のsubstitutionが本文中の
+        全ての該当箇所を置換してしまい、名前の位置にも意図しないメンションが生成されうる。
+        {}を全角に置換して無害化すること。"""
+        mock_get_id.return_value = "group_id"
+        mock_post.return_value = MagicMock(status_code=200)
+
+        notify_line_with_retry("indeed", "{mention_all}太郎", "https://indeed.com/apply/123")
+
+        text = mock_post.call_args[1]['json']['messages'][0]['text']
+        # 先頭の正規のプレースホルダ1箇所以外に、名前由来の生の{mention_all}が残っていないこと
+        assert text.count("{mention_all}") == 1
+        assert "｛mention_all｝太郎" in text
 
 
 def test_process_mail_by_uid_both_notifications_fail(tmp_path):
@@ -874,6 +945,41 @@ def test_process_mail_by_uid_slack_only_success(tmp_path):
 
     # Slackだけ成功 → unique_idを返す（処理済みにする）
     assert result is not None, "少なくとも1つ成功時はunique_idを返すべき"
+
+
+def test_process_mail_by_uid_dm_detail_escapes_subject_and_sender(tmp_path):
+    """2026-09-23 bug-check-lab(3回目) M-2: Slack/LINE片方失敗時の個別DM通知(dm_detail)に、
+    外部入力(メール件名・送信者)がSlack mrkdwn注入されないようエスケープされていること。"""
+    import email
+    from unittest.mock import MagicMock, patch
+
+    evil_subject = "Indeed: 新しい応募者のお知らせ - <!channel>偽装 <https://evil.example|クリック>"
+    msg = email.message.Message()
+    msg["Subject"] = evil_subject
+    msg["From"] = "偽装 <evil@example.com>"
+    msg.set_payload("test body")
+    raw_bytes = msg.as_bytes()
+
+    mock_mail = MagicMock()
+    mock_mail.uid.return_value = (
+        "OK",
+        [(b"9 (X-GM-MSGID 9999999999999999999 UID 9)", raw_bytes)],
+    )
+
+    processed_ids = set()
+
+    with patch("src.main.notify_slack_with_retry", return_value=True), \
+         patch("src.main.notify_line_with_retry", return_value=False), \
+         patch("src.main.SLACK_DM_WEBHOOK_URL", "https://hooks.slack.com/dm-test"), \
+         patch("src.main._http_session.post") as mock_post:
+        mock_post.return_value = MagicMock(status_code=200)
+        process_mail_by_uid(mock_mail, b"9", processed_ids)
+
+    assert mock_post.called, "SLACK_DM_WEBHOOK_URL設定時はDM送信が呼ばれるべき"
+    dm_text = mock_post.call_args[1]["json"]["text"]
+    assert "<!channel>" not in dm_text
+    assert "<https://evil.example|" not in dm_text
+    assert "&lt;!channel&gt;" in dm_text
 
 
 def test_process_mail_by_uid_indeed_login_code_no_false_alert(tmp_path):
@@ -1339,6 +1445,60 @@ class TestShortUrlRedirect:
         assert is_trusted_application_url(resolve_short_url(short_id)) is False
         # 許可外ドメインはnotify_line_with_retry内でcreate_short_urlに渡されないため、
         # 短縮マップに登録されないことを間接的に保証する（実際の呼び出しはTestNotifyLineWithRetry側で確認済み）。
+
+    def test_oversized_url_is_rejected(self):
+        """2026-09-23 bug-check-lab(3回目) M-1: 正規ホスト名を持つが巨大なURLは、外部から
+        永続ボリュームを無制限に埋められるDoS経路になるため、長さ上限で拒否すること。"""
+        import src.main as main_module
+
+        huge_url = "https://www.indeed.com/?pad=" + ("A" * 5_000_000)
+        assert len(huge_url) > main_module.MAX_APPLICATION_URL_LENGTH
+        assert is_trusted_application_url(huge_url) is False
+        with pytest.raises(ValueError):
+            create_short_url(huge_url)
+
+    def test_url_just_under_length_limit_is_accepted(self):
+        """長さ上限ギリギリ(実測のIndeed URLの範囲内)は引き続き許可すること。"""
+        import src.main as main_module
+
+        padding = "A" * (main_module.MAX_APPLICATION_URL_LENGTH - len("https://www.indeed.com/?pad="))
+        url = "https://www.indeed.com/?pad=" + padding
+        assert len(url) <= main_module.MAX_APPLICATION_URL_LENGTH
+        assert is_trusted_application_url(url) is True
+
+    def test_entry_count_capped_oldest_evicted_first(self):
+        """2026-09-23 bug-check-lab(3回目) M-1: 登録件数が上限に達したら、作成日時が
+        古い順に削除して無制限な肥大化を防ぐこと。"""
+        import src.main as main_module
+
+        monkeypatch_limit = main_module.MAX_SHORT_URL_ENTRIES
+        try:
+            main_module.MAX_SHORT_URL_ENTRIES = 3
+            first_url = create_short_url("https://indeed.com/apply/1")
+            create_short_url("https://indeed.com/apply/2")
+            create_short_url("https://indeed.com/apply/3")
+            # 4件目の登録で最も古い(1件目)が追い出されること
+            create_short_url("https://indeed.com/apply/4")
+
+            mapping = main_module._load_short_urls()
+            assert len(mapping) <= main_module.MAX_SHORT_URL_ENTRIES
+            first_short_id = first_url.rsplit("/r/", 1)[1]
+            assert first_short_id not in mapping
+        finally:
+            main_module.MAX_SHORT_URL_ENTRIES = monkeypatch_limit
+
+    def test_malformed_entry_type_does_not_raise(self):
+        """2026-09-23 bug-check-lab(3回目) L-1: 保存ファイルのエントリ形式が想定外
+        (created_atが文字列等)でも、resolve_short_urlが例外を出さずNoneを返すこと。"""
+        import src.main as main_module
+
+        mapping = main_module._load_short_urls()
+        mapping["bad-entry-1"] = {"url": "https://indeed.com/x", "created_at": "not-a-number"}
+        mapping["bad-entry-2"] = "not-a-dict"
+        main_module._save_short_urls(mapping)
+
+        assert resolve_short_url("bad-entry-1") is None
+        assert resolve_short_url("bad-entry-2") is None
 
 
 class TestExtractApplicantNameFromHtml:

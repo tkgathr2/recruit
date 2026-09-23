@@ -62,6 +62,11 @@ MAX_PROCESSED_IDS = 5000
 # --- Short URL redirect service (LINE uri actionの1000文字上限対策) ---
 SHORT_URLS_FILE = os.getenv("SHORT_URLS_FILE", os.path.join(LOG_DIR, "short_urls.json"))
 SHORT_URL_MAX_AGE_DAYS = int(os.getenv("SHORT_URL_MAX_AGE_DAYS", "90"))
+# 2026-09-23 bug-check-lab(3回目) M-1: 正規ホスト+巨大クエリのURLを外部から無制限に
+# 登録させ永続ボリュームを埋められる実害を実測(5MBのURLが通過、4件で20MB)。
+# 実測のIndeed/ジモティーURLは800〜1100文字程度のため、十分な余裕を持って上限を設ける。
+MAX_APPLICATION_URL_LENGTH = 2048
+MAX_SHORT_URL_ENTRIES = 5000
 PORT = int(os.getenv("PORT", "8080"))
 # RAILWAY_PUBLIC_DOMAIN はRailwayが自動注入する本番ドメイン(ポート番号無し)。未設定時はローカル確認用。
 SHORT_URL_BASE = os.getenv("SHORT_URL_BASE") or (
@@ -604,8 +609,17 @@ def is_trusted_application_url(url: str) -> bool:
     hostname="www.indeed.com" に見えても、実際の遷移先は evil.example になる
     （実機のLINEアプリ/ブラウザで302リダイレクトが攻撃先に飛ぶことを実測確認）。
     バックスラッシュ・制御文字・非ASCII文字を含むURL、userinfo(@)付きURLは拒否する。
+
+    2026-09-23 bug-check-lab(3回目) M-1: URL長の上限も検証する。正規ホスト名を
+    持つが巨大なクエリ文字列を付けたURL（実測5MB）で永続ボリュームを埋められる
+    実害を確認したため。実測のIndeed/ジモティーURLは1100文字程度に収まる。
     """
-    if not url or not url.isascii() or _URL_FORBIDDEN_CHARS_RE.search(url):
+    if (
+        not url
+        or len(url) > MAX_APPLICATION_URL_LENGTH
+        or not url.isascii()
+        or _URL_FORBIDDEN_CHARS_RE.search(url)
+    ):
         return False
     try:
         parsed = urlparse(url)
@@ -654,14 +668,36 @@ def _save_short_urls(mapping: dict) -> None:
     # 一時ファイル名にPIDを含め、新旧プロセスが並走してもぶつからないようにする
     # （processed_ids.json の教訓と揃える）。書き込み後にatomicに置換する。
     tmp_path = f"{SHORT_URLS_FILE}.{os.getpid()}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(mapping, f)
-    os.replace(tmp_path, SHORT_URLS_FILE)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(mapping, f)
+        os.replace(tmp_path, SHORT_URLS_FILE)
+    except BaseException:
+        # bug-check-lab(3回目) F-1系: 書き込み失敗時に.tmpを残置すると、外部からの
+        # 大量アクセスと組み合わさった際に無駄なディスク消費が積み重なる。
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _purge_expired_short_urls(mapping: dict) -> dict:
     cutoff = time.time() - SHORT_URL_MAX_AGE_DAYS * 86400
     return {sid: entry for sid, entry in mapping.items() if entry.get("created_at", 0) >= cutoff}
+
+
+def _enforce_short_url_capacity(mapping: dict) -> dict:
+    """bug-check-lab(3回目) M-1: 件数上限を超えたら、作成日時が古い順に削除する。
+    URL長を制限していても、正規ホスト名の大量メールを送りつけられれば件数は
+    無制限に増えうるため、件数側でも上限を設ける（DoS対策の二段構え）。"""
+    if len(mapping) < MAX_SHORT_URL_ENTRIES:
+        return mapping
+    ordered = sorted(mapping.items(), key=lambda item: item[1].get("created_at", 0))
+    overflow = len(mapping) - MAX_SHORT_URL_ENTRIES + 1
+    for sid, _entry in ordered[:overflow]:
+        del mapping[sid]
+    return mapping
 
 
 def create_short_url(long_url: str) -> str:
@@ -675,12 +711,31 @@ def create_short_url(long_url: str) -> str:
         raise ValueError("create_short_url: untrusted url")
     with _short_url_lock:
         mapping = _purge_expired_short_urls(_load_short_urls())
+        mapping = _enforce_short_url_capacity(mapping)
         short_id = secrets.token_urlsafe(8)
         while short_id in mapping:  # 衝突は天文学的に稀だが、念のため再抽選する
             short_id = secrets.token_urlsafe(8)
         mapping[short_id] = {"url": long_url, "created_at": time.time()}
         _save_short_urls(mapping)
     return f"{SHORT_URL_BASE}/r/{short_id}"
+
+
+# bug-check-lab(3回目) F-5/西野#4: /r/<id> は公開エンドポイントでHTTPリクエストの
+# たびに呼ばれるため、毎回ファイル全体を読むと負荷の起点になる。ファイルの更新時刻が
+# 変わった時だけ読み直すメモリキャッシュにする（プロセス内のみ・他プロセスの書き込みは
+# 次のGETで検知される）。
+_short_url_read_cache: dict = {"mtime": None, "map": {}}
+
+
+def _load_short_urls_cached() -> dict:
+    try:
+        mtime = os.path.getmtime(SHORT_URLS_FILE)
+    except OSError:
+        mtime = None
+    if mtime != _short_url_read_cache["mtime"]:
+        _short_url_read_cache["map"] = _load_short_urls()
+        _short_url_read_cache["mtime"] = mtime
+    return _short_url_read_cache["map"]
 
 
 def resolve_short_url(short_id: str) -> Optional[str]:
@@ -690,15 +745,17 @@ def resolve_short_url(short_id: str) -> Optional[str]:
     if not SHORT_ID_RE.fullmatch(short_id):
         return None
     try:
-        mapping = _load_short_urls()
+        mapping = _load_short_urls_cached()
     except (json.JSONDecodeError, OSError) as e:
         log(f"ERROR: Failed to load short URLs file while resolving: {e}")
         return None
+    if not isinstance(mapping, dict):
+        return None
     entry = mapping.get(short_id)
-    if not entry:
+    if not isinstance(entry, dict) or not isinstance(entry.get("created_at"), (int, float)):
         return None
     cutoff = time.time() - SHORT_URL_MAX_AGE_DAYS * 86400
-    if entry.get("created_at", 0) < cutoff:
+    if entry["created_at"] < cutoff:
         return None
     return entry.get("url")
 
@@ -852,34 +909,52 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
         log("LINE Token or TO ID missing")
         return False
     title = "Indeedに応募がありました。" if source == "indeed" else "ジモティーで新着があります。"
-    lines = [f"【{name}】 さんから{title}"]
-    if job_title:
-        lines.append(f"求人: {job_title}")
 
+    # bug-check-lab(3回目): textV2のsubstitutionは{mention_all}という文字列をtext全体から
+    # 検索して置換するため、外部入力(氏名・求人名)にその文字列が偶然含まれると意図しない
+    # 位置も置換されうる。{}を全角に置き換え、プレースホルダとして解釈されないようにする。
+    safe_name = name.replace("{", "｛").replace("}", "｝") if name else name
+    safe_job_title = job_title.replace("{", "｛").replace("}", "｝") if job_title else job_title
+
+    lines = [f"【{safe_name}】 さんから{title}"]
+    if safe_job_title:
+        lines.append(f"求人: {safe_job_title}")
+
+    text_only_lines = list(lines)
     external_url = None
     use_flex_button = False
     if url:
-        # LINE uri actionの1000文字上限(実機確認済み)に確実に収まるよう、信頼済み
-        # ドメインのURLは自社リダイレクト短縮を経由させる（2026-09-23: 実際の応募で
-        # 1024文字のIndeed URLがボタン化されず旧来のテキスト表示に戻る事象を確認）。
+        trusted = is_trusted_application_url(url)
+        # Force LINE to open URL in external browser (Chrome/Safari)
+        # to avoid Google OAuth blocking in LINE's in-app browser
+        separator = "&" if "?" in url else "?"
+        raw_external_url = f"{url}{separator}openExternalBrowser=1"
+
+        # bug-check-lab(3回目) F-3: 1000文字以内に収まるURLは短縮せず元URLをそのまま使う。
+        # 短縮は「LINE uri actionの上限を超えるときだけ」に限定し、無駄な永続化を避ける。
         display_url = url
-        if is_trusted_application_url(url):
+        if trusted and len(raw_external_url) > LINE_URI_ACTION_MAX_LENGTH:
             try:
                 display_url = create_short_url(url)
             except Exception as e:
                 log(f"ERROR: create_short_url failed, falling back to original url: {e}")
+                notify_error_to_slack(
+                    f"短縮URL作成に失敗しました: {e}", dedup_key="short_url_create_failed", dedup_seconds=600
+                )
                 display_url = url
-        # Force LINE to open URL in external browser (Chrome/Safari)
-        # to avoid Google OAuth blocking in LINE's in-app browser
+
         separator = "&" if "?" in display_url else "?"
         external_url = f"{display_url}{separator}openExternalBrowser=1"
-        use_flex_button = is_trusted_application_url(url) and len(external_url) <= LINE_URI_ACTION_MAX_LENGTH
+        use_flex_button = trusted and len(external_url) <= LINE_URI_ACTION_MAX_LENGTH
 
-    # Flexを使わない最終形（非信頼ドメイン・uri action最大長超過・Flex自体が拒否された時の最後の砦）
-    # ではテキストへ直接URLを貼る
-    text_only_lines = list(lines)
-    if external_url:
-        text_only_lines.extend(["", "詳細はこちら:", external_url])
+        # bug-check-lab(3回目) F-2: 最後の砦（Flexが使えない/拒否された時のテキスト直貼り）は
+        # 短縮URLではなく必ず元URLを使う。リダイレクトサーバーの状態に依存させないため。
+        if trusted:
+            text_only_lines.extend(["", "詳細はこちら:", raw_external_url])
+        else:
+            # bug-check-lab(3回目) F-6: Slack側と同様、許可リスト外のURLには警告を付ける
+            # （これまでLINE側だけ無警告でリンクが貼られる非対称があった）
+            text_only_lines.extend(["", "⚠️要確認 詳細はこちら:", raw_external_url])
 
     base_message = add_test_prefix("\n".join(lines))
     text_only_message = add_test_prefix("\n".join(text_only_lines))
@@ -1257,11 +1332,13 @@ def process_mail_by_uid(
                 # 脱落し、応募通知が無言で恒久的に消失する）。未分類も「1通=1回」検知できれば
                 # 目的は果たせるため、他の分岐と同様 unique_id を返して即座に処理済みにする。
                 date_header = decode_header_value(msg.get("Date", ""))
+                # bug-check-lab(3回目) M-2: 件名・送信者は応募者/外部が自由に書ける入力のため、
+                # Slack mrkdwn注入(リンク偽装・メンション偽装)を防ぐためエスケープしてから埋め込む。
                 alert_msg = (
                     "⚠️ 件名不一致のIndeedメールを検知\n"
-                    f"件名: {subject}\n"
-                    f"From: {from_header}\n"
-                    f"日時: {date_header}\n"
+                    f"件名: {sanitize_slack_text(subject)}\n"
+                    f"From: {sanitize_slack_text(from_header)}\n"
+                    f"日時: {sanitize_slack_text(date_header)}\n"
                     "Indeedが件名フォーマットを変更した可能性があります。determine_source関数の更新を検討してください。"
                 )
                 log(f"ALERT: Indeed email detected with unrecognized subject: {subject}")
@@ -1309,11 +1386,12 @@ def process_mail_by_uid(
         if not line_ok:
             failed_channels.append("LINE")
         log(f"WARNING: Partial success for id={unique_id}: {', '.join(failed_channels)} failed. Marking as processed to prevent duplicates.")
+        # bug-check-lab(3回目) M-2: 件名・送信者は外部入力のためエスケープしてから埋め込む。
         dm_detail = (
             f"⚠️ 通知一部失敗（処理済みマーク済み・手動確認してください）\n"
             f"失敗チャンネル: {', '.join(failed_channels)}\n"
-            f"メール件名: {subject}\n"
-            f"送信者: {from_header}\n"
+            f"メール件名: {sanitize_slack_text(subject)}\n"
+            f"送信者: {sanitize_slack_text(from_header)}\n"
             f"ソース: {source}\n"
             f"unique_id: {unique_id}"
         )
