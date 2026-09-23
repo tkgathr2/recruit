@@ -4,12 +4,15 @@ import email
 from email.header import decode_header
 from email.utils import parseaddr
 import os
+import secrets
 import socket
 import sys
+import threading
 import time
 import json
 import re
 from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional, Set, Tuple
 from urllib.parse import urlparse
@@ -55,6 +58,16 @@ SLACK_DM_WEBHOOK_URL = os.getenv("SLACK_DM_WEBHOOK_URL")
 # --- Processed IDs file for duplicate prevention ---
 PROCESSED_IDS_FILE = os.getenv("PROCESSED_IDS_FILE", os.path.join(LOG_DIR, "processed_ids.json"))
 MAX_PROCESSED_IDS = 5000
+
+# --- Short URL redirect service (LINE uri actionの1000文字上限対策) ---
+SHORT_URLS_FILE = os.getenv("SHORT_URLS_FILE", os.path.join(LOG_DIR, "short_urls.json"))
+SHORT_URL_MAX_AGE_DAYS = int(os.getenv("SHORT_URL_MAX_AGE_DAYS", "90"))
+PORT = int(os.getenv("PORT", "8080"))
+# RAILWAY_PUBLIC_DOMAIN はRailwayが自動注入する本番ドメイン(ポート番号無し)。未設定時はローカル確認用。
+SHORT_URL_BASE = os.getenv("SHORT_URL_BASE") or (
+    f"https://{os.environ['RAILWAY_PUBLIC_DOMAIN']}" if os.getenv("RAILWAY_PUBLIC_DOMAIN") else f"http://localhost:{PORT}"
+)
+_short_url_lock = threading.Lock()
 
 
 # --- Polling Interval ---
@@ -575,21 +588,35 @@ def sanitize_slack_text(text: str) -> str:
 ALLOWED_APPLICATION_URL_HOSTS = ("indeed.com", "jmty.jp")
 
 
+_URL_FORBIDDEN_CHARS_RE = re.compile(r"[\\\s\x00-\x1f\x7f]")
+_HOSTNAME_CHARS_RE = re.compile(r"[a-z0-9.-]+")
+
+
 def is_trusted_application_url(url: str) -> bool:
     """応募詳細URLが信頼できるドメイン(Indeed/ジモティー)かを検証する。
 
     ホスト名は urlparse().hostname で正確に比較する（"evil-indeed.com.attacker.com"
     のような文字列包含チェックでは容易にバイパスされるため部分一致は使わない）。
+
+    2026-09-23 bug-check-lab H-1: urlparse はバックスラッシュを通常の文字として扱うが、
+    ブラウザ/LINEアプリ(WHATWG URL仕様)は https URL 中の "\\" を "/" として解釈するため、
+    "https://evil.example\\@www.indeed.com/" のようなURLは urlparse 上は
+    hostname="www.indeed.com" に見えても、実際の遷移先は evil.example になる
+    （実機のLINEアプリ/ブラウザで302リダイレクトが攻撃先に飛ぶことを実測確認）。
+    バックスラッシュ・制御文字・非ASCII文字を含むURL、userinfo(@)付きURLは拒否する。
     """
-    if not url or any(c.isspace() for c in url):
+    if not url or not url.isascii() or _URL_FORBIDDEN_CHARS_RE.search(url):
         return False
     try:
         parsed = urlparse(url)
+        _ = parsed.port  # 不正なポート表記はValueErrorを起こす
     except ValueError:
         return False
-    if parsed.scheme != "https":
+    if parsed.scheme != "https" or "@" in parsed.netloc:
         return False
     host = (parsed.hostname or "").lower()
+    if not host or not _HOSTNAME_CHARS_RE.fullmatch(host):
+        return False
     return any(host == domain or host.endswith("." + domain) for domain in ALLOWED_APPLICATION_URL_HOSTS)
 
 
@@ -597,6 +624,148 @@ def _slack_link_safe_url(url: str) -> str:
     """Slack mrkdwnリンク <url|text> の構文を壊す文字を無害化する（is_trusted_application_url
     を通過した正規URL向けの保険。& は必ず先に処理する）。"""
     return url.replace("&", "&amp;").replace("|", "%7C").replace("<", "%3C").replace(">", "%3E")
+
+
+# --- Short URL redirect service ---
+# 2026-09-23: IndeedのURLが1000文字を超えるケースが多く、LINE uri action(0〜1000文字、
+# 実機で400実測済み)にそのままボタン化できない。外部の第三者短縮サービスはPIIリスクで
+# 2026-08-23に撤去済み・復活させないため、自社Railwayインフラ内で完結するリダイレクトを
+# 用意する。アクセスログは外部へ送らず、既存の log() のみに記録する。
+# 2026-09-23 bug-check-lab H-1/M-1/M-2/M-3: 独立セキュリティレビューで確認された
+# オープンリダイレクト・DoS・サイレント故障・保存失敗の握りつぶしを修正済み。
+SHORT_ID_RE = re.compile(r"[A-Za-z0-9_-]{6,16}")  # secrets.token_urlsafe(8) は概ね11文字
+
+
+def _load_short_urls() -> dict:
+    """短縮URLマップを読み込む。ファイル破損時は None を握りつぶさず例外を投げる
+    （M-3: 破損状態のまま create_short_url が空マップへ上書き保存し、既存リンクを
+    全消去してしまうことを防ぐ。呼び出し元が用途に応じて処理する）。"""
+    if not os.path.exists(SHORT_URLS_FILE):
+        return {}
+    with open(SHORT_URLS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _save_short_urls(mapping: dict) -> None:
+    """M-3: 保存失敗を握りつぶさない（呼び出し元 create_short_url の例外として伝播させ、
+    notify_line_with_retry 側の既存フォールバック＝元URL直貼りに委ねる）。"""
+    parent_dir = Path(SHORT_URLS_FILE).parent
+    parent_dir.mkdir(parents=True, exist_ok=True)
+    # 一時ファイル名にPIDを含め、新旧プロセスが並走してもぶつからないようにする
+    # （processed_ids.json の教訓と揃える）。書き込み後にatomicに置換する。
+    tmp_path = f"{SHORT_URLS_FILE}.{os.getpid()}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(mapping, f)
+    os.replace(tmp_path, SHORT_URLS_FILE)
+
+
+def _purge_expired_short_urls(mapping: dict) -> dict:
+    cutoff = time.time() - SHORT_URL_MAX_AGE_DAYS * 86400
+    return {sid: entry for sid, entry in mapping.items() if entry.get("created_at", 0) >= cutoff}
+
+
+def create_short_url(long_url: str) -> str:
+    """長い応募URLを自社リダイレクト短縮URLに変換する。
+
+    H-1: 呼び出し元(notify_line_with_retry)が is_trusted_application_url() を通過した
+    URLのみを渡す設計だが、将来の呼び出し元追加時の検証漏れに備え、ここでも
+    再検証する多層防御にする（呼び出し元だけに依存しない）。
+    """
+    if not is_trusted_application_url(long_url):
+        raise ValueError("create_short_url: untrusted url")
+    with _short_url_lock:
+        mapping = _purge_expired_short_urls(_load_short_urls())
+        short_id = secrets.token_urlsafe(8)
+        while short_id in mapping:  # 衝突は天文学的に稀だが、念のため再抽選する
+            short_id = secrets.token_urlsafe(8)
+        mapping[short_id] = {"url": long_url, "created_at": time.time()}
+        _save_short_urls(mapping)
+    return f"{SHORT_URL_BASE}/r/{short_id}"
+
+
+def resolve_short_url(short_id: str) -> Optional[str]:
+    """短縮IDから元URLを引く。H-1: リダイレクト実行直前の再検証はこの関数の呼び出し元
+    （_RedirectRequestHandler.do_GET）側で行う（過去に登録された悪性エントリが万一
+    残っていても、転送時点でブロックできるようにする多層防御）。"""
+    if not SHORT_ID_RE.fullmatch(short_id):
+        return None
+    try:
+        mapping = _load_short_urls()
+    except (json.JSONDecodeError, OSError) as e:
+        log(f"ERROR: Failed to load short URLs file while resolving: {e}")
+        return None
+    entry = mapping.get(short_id)
+    if not entry:
+        return None
+    cutoff = time.time() - SHORT_URL_MAX_AGE_DAYS * 86400
+    if entry.get("created_at", 0) < cutoff:
+        return None
+    return entry.get("url")
+
+
+class _RedirectRequestHandler(BaseHTTPRequestHandler):
+    """`/r/<short_id>` を元URLへ302リダイレクトする最小限のハンドラ。"""
+
+    timeout = 10  # M-1: slowloris型のソケット占有を防ぐ
+    server_version = "redirect"  # L-4: BaseHTTP/Pythonバージョンを名乗らない
+    sys_version = ""
+
+    def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandlerの規約名)
+        path = self.path.split("?", 1)[0]
+        if path in ("/", "/health", "/healthz"):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+            return
+        if path.startswith("/r/"):
+            short_id = path[len("/r/"):]
+            # M-1: ID形式チェックをファイルI/Oより先に行い、無関係な文字列の
+            # 大量アクセスでディスクI/Oを浪費させない
+            if not SHORT_ID_RE.fullmatch(short_id):
+                self.send_response(404)
+                self.end_headers()
+                return
+            target = resolve_short_url(short_id)
+            # H-1: リダイレクト実行直前にも再検証する（保存済みデータへの信頼を置かない）
+            if target and is_trusted_application_url(target):
+                self.send_response(302)
+                self.send_header("Location", target)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.end_headers()
+                return
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, format: str, *args) -> None:  # noqa: A002 (BaseHTTPRequestHandlerの規約名)
+        # M-1/L-2: アクセスログを /data の log() に流すと外部からの大量アクセスで
+        # 永続ボリュームを埋められる（実測: 1リクエストで数万バイト増加）。
+        # stdoutのみに出し、長さを切り詰め、制御文字を無害化する。
+        msg = (format % args)[:300].encode("ascii", "backslashreplace").decode("ascii")
+        print(f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} HTTP: {msg}", flush=True)
+
+
+def start_redirect_server() -> None:
+    """短縮URLリダイレクト用HTTPサーバーを起動する（呼び出し元がバックグラウンドスレッドで実行）。
+
+    M-2: bind失敗が誰にも気づかれないサイレント故障にならないよう、起動失敗・
+    serve_forever中の例外はSlackへ通知する。
+    """
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", PORT), _RedirectRequestHandler)
+    except OSError as e:
+        log(f"ERROR: redirect server bind failed on port {PORT}: {e}")
+        notify_error_to_slack(f"短縮URLリダイレクトサーバーの起動に失敗しました(port={PORT}): {e}")
+        return
+    log(f"Starting redirect HTTP server on port {PORT} (base={SHORT_URL_BASE})")
+    try:
+        server.serve_forever()
+    except Exception as e:
+        log(f"ERROR: redirect server crashed: {e}")
+        notify_error_to_slack(f"短縮URLリダイレクトサーバーが停止しました: {e}")
 
 
 # --- Notification Functions ---
@@ -690,10 +859,20 @@ def notify_line_with_retry(source: str, name: str, url: str, job_title: Optional
     external_url = None
     use_flex_button = False
     if url:
+        # LINE uri actionの1000文字上限(実機確認済み)に確実に収まるよう、信頼済み
+        # ドメインのURLは自社リダイレクト短縮を経由させる（2026-09-23: 実際の応募で
+        # 1024文字のIndeed URLがボタン化されず旧来のテキスト表示に戻る事象を確認）。
+        display_url = url
+        if is_trusted_application_url(url):
+            try:
+                display_url = create_short_url(url)
+            except Exception as e:
+                log(f"ERROR: create_short_url failed, falling back to original url: {e}")
+                display_url = url
         # Force LINE to open URL in external browser (Chrome/Safari)
         # to avoid Google OAuth blocking in LINE's in-app browser
-        separator = "&" if "?" in url else "?"
-        external_url = f"{url}{separator}openExternalBrowser=1"
+        separator = "&" if "?" in display_url else "?"
+        external_url = f"{display_url}{separator}openExternalBrowser=1"
         use_flex_button = is_trusted_application_url(url) and len(external_url) <= LINE_URI_ACTION_MAX_LENGTH
 
     # Flexを使わない最終形（非信頼ドメイン・uri action最大長超過・Flex自体が拒否された時の最後の砦）
@@ -1423,6 +1602,10 @@ def verify_storage() -> bool:
 # --- Main loop ---
 def main() -> None:
     """Main polling loop with exponential backoff for quota errors."""
+    # 短縮URLリダイレクトサーバーをバックグラウンドスレッドで起動する。
+    # daemon=True: メインのpollingループを止めずに、プロセス終了時は道連れで終わる。
+    threading.Thread(target=start_redirect_server, daemon=True, name="redirect-server").start()
+
     log(f"Starting Gmail polling with POLL_INTERVAL_SECONDS={POLL_INTERVAL_SECONDS}")
     log(f"MODE={MODE}, SEARCH_DAYS={SEARCH_DAYS}, MAX_BACKOFF_SECONDS={MAX_BACKOFF_SECONDS}, MAX_EMAILS_PER_CYCLE={MAX_EMAILS_PER_CYCLE}")
     log(f"Gmail auth method: {'OAuth2 (XOAUTH2 refresh token)' if use_oauth() else 'app-password (IMAP LOGIN)'}")
