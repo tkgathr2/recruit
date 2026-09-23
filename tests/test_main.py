@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+import time
 from unittest.mock import MagicMock, patch
 import email
 from email.mime.text import MIMEText
@@ -35,6 +36,9 @@ from src.main import (
     add_test_prefix,
     notify_slack_with_retry,
     notify_line_with_retry,
+    create_short_url,
+    resolve_short_url,
+    is_trusted_application_url,
     process_mail_by_uid,
     extract_job_title_from_subject,
     extract_job_title_from_html,
@@ -583,6 +587,11 @@ class TestNotifySlackWithRetry:
 
 
 class TestNotifyLineWithRetry:
+    @pytest.fixture(autouse=True)
+    def _short_urls_tmpfile(self, tmp_path, monkeypatch):
+        """短縮URLの永続化ファイルをテストごとに独立した一時ファイルへ向ける。"""
+        monkeypatch.setattr('src.main.SHORT_URLS_FILE', str(tmp_path / "short_urls.json"))
+
     @patch('src.main.time.sleep')
     @patch('src.main._http_session.post')
     @patch('src.main.get_line_to_id')
@@ -647,8 +656,10 @@ class TestNotifyLineWithRetry:
     def test_url_opens_in_external_browser(self, mock_test_mode, mock_get_id, mock_post, mock_sleep):
         """LINE通知のURLに openExternalBrowser=1 を付与すること（LINE内ブラウザのOAuthブロック回避）。
 
-        2026-08-23 bug-check-lab H-4以降、URL短縮は行わず原URLをそのまま使う。
-        2026-09-23以降、URLはテキスト本文ではなくFlexメッセージの詳細ボタン(uri action)に入る。
+        2026-08-23 bug-check-lab H-4以降、外部の第三者短縮サービスは使わず原URLを直接使う。
+        2026-09-23以降、URLはテキスト本文ではなくFlexメッセージの詳細ボタン(uri action)に入り、
+        さらにLINE uri actionの1000文字上限対策として自社リダイレクト短縮URLを経由する。
+        ボタンのuriは短縮URLだが、resolve_short_url()で辿ると元のIndeed URLに一致すること。
         """
         mock_get_id.return_value = "group_id"
         mock_post.return_value = MagicMock(status_code=200)
@@ -658,7 +669,10 @@ class TestNotifyLineWithRetry:
         body = mock_post.call_args[1]['json']
         assert body['messages'][1]['type'] == 'flex'
         button_uri = body['messages'][1]['contents']['footer']['contents'][0]['action']['uri']
-        assert button_uri == "https://indeed.com/apply/123?openExternalBrowser=1"
+        assert button_uri != "https://indeed.com/apply/123?openExternalBrowser=1"
+        assert button_uri.endswith("?openExternalBrowser=1")
+        short_id = button_uri.split("/r/")[1].split("?")[0]
+        assert resolve_short_url(short_id) == "https://indeed.com/apply/123"
 
     @patch('src.main.time.sleep')
     @patch('src.main._http_session.post')
@@ -666,22 +680,24 @@ class TestNotifyLineWithRetry:
     @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
     @patch('src.main.is_test_mode', return_value=False)
     def test_url_external_browser_with_existing_query(self, mock_test_mode, mock_get_id, mock_post, mock_sleep):
-        """URLに既存クエリがある場合は & で openExternalBrowser=1 を連結すること。"""
+        """URLに既存クエリがある場合、短縮URL経由でも元URL(クエリ込み)へ正しく解決されること。"""
         mock_get_id.return_value = "group_id"
         mock_post.return_value = MagicMock(status_code=200)
 
         notify_line_with_retry("indeed", "山田太郎", "https://indeed.com/apply/123?ref=email")
 
         button_uri = mock_post.call_args[1]['json']['messages'][1]['contents']['footer']['contents'][0]['action']['uri']
-        assert button_uri == "https://indeed.com/apply/123?ref=email&openExternalBrowser=1"
+        short_id = button_uri.split("/r/")[1].split("?")[0]
+        assert resolve_short_url(short_id) == "https://indeed.com/apply/123?ref=email"
 
     @patch('src.main.time.sleep')
     @patch('src.main._http_session.post')
     @patch('src.main.get_line_to_id')
     @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
     @patch('src.main.is_test_mode', return_value=False)
-    def test_long_url_falls_back_to_plain_text_no_flex(self, mock_test_mode, mock_get_id, mock_post, mock_sleep):
-        """LINE uri actionの最大長(1000文字)を超えるURLはFlexボタン化せず、従来通りテキストに直接貼ること。"""
+    def test_long_indeed_url_is_shortened_and_uses_flex(self, mock_test_mode, mock_get_id, mock_post, mock_sleep):
+        """2026-09-23: 1000文字を超える長いIndeed URLも自社短縮URL経由でFlexボタン化されること
+        （短縮前は生URLが1000文字超でFlex化されなかった退行の修正）。"""
         mock_get_id.return_value = "group_id"
         mock_post.return_value = MagicMock(status_code=200)
 
@@ -689,9 +705,30 @@ class TestNotifyLineWithRetry:
         notify_line_with_retry("indeed", "山田太郎", long_url)
 
         body = mock_post.call_args[1]['json']
+        assert body['messages'][1]['type'] == 'flex'
+        button_uri = body['messages'][1]['contents']['footer']['contents'][0]['action']['uri']
+        assert len(button_uri) < 200
+        short_id = button_uri.split("/r/")[1].split("?")[0]
+        assert resolve_short_url(short_id) == long_url
+
+    @patch('src.main.SHORT_URL_BASE', 'https://example.com/' + 'x' * 1000)
+    @patch('src.main.time.sleep')
+    @patch('src.main._http_session.post')
+    @patch('src.main.get_line_to_id')
+    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
+    @patch('src.main.is_test_mode', return_value=False)
+    def test_short_url_itself_exceeding_limit_falls_back_to_plain_text(self, mock_test_mode, mock_get_id, mock_post, mock_sleep):
+        """安全網: 自社短縮URL自体が何らかの理由で1000文字を超える異常系でも、
+        Flexボタン化せず従来通りテキストに直接貼ること（LINE_URI_ACTION_MAX_LENGTHチェックは維持）。"""
+        mock_get_id.return_value = "group_id"
+        mock_post.return_value = MagicMock(status_code=200)
+
+        notify_line_with_retry("indeed", "山田太郎", "https://indeed.com/apply/123")
+
+        body = mock_post.call_args[1]['json']
         assert len(body['messages']) == 1
         assert body['messages'][0]['type'] == 'textV2'
-        assert f"{long_url}?openExternalBrowser=1" in body['messages'][0]['text']
+        assert "https://example.com/" in body['messages'][0]['text']
 
     @patch('src.main.time.sleep')
     @patch('src.main._http_session.post')
@@ -756,7 +793,9 @@ class TestNotifyLineWithRetry:
         last_body = mock_post.call_args[1]['json']
         assert len(last_body['messages']) == 1
         assert last_body['messages'][0]['type'] == 'text'
-        assert "https://indeed.com/apply/123?openExternalBrowser=1" in last_body['messages'][0]['text']
+        # 3段目のテキストにも短縮URLが使われる（生URLではない）ことを確認
+        assert "https://indeed.com/apply/123" not in last_body['messages'][0]['text']
+        assert "?openExternalBrowser=1" in last_body['messages'][0]['text']
         # 400を2回(textV2+flex, text+flex)経てからの3段目成功であること
         assert mock_post.call_count == 3
 
@@ -1205,6 +1244,101 @@ class TestExtractJobTitleFromHtml:
     def test_no_job_title_in_html_returns_none(self):
         html = "<html><body><p>○○さんからの応募がありました</p></body></html>"
         assert extract_job_title_from_html(html) is None
+
+
+class TestShortUrlRedirect:
+    """2026-09-23: LINE uri actionの1000文字上限対策として追加した自社リダイレクト短縮の単体テスト。"""
+
+    @pytest.fixture(autouse=True)
+    def _short_urls_tmpfile(self, tmp_path, monkeypatch):
+        monkeypatch.setattr('src.main.SHORT_URLS_FILE', str(tmp_path / "short_urls.json"))
+
+    def test_create_and_resolve_roundtrip(self):
+        long_url = "https://engage.indeed.com/f/a/" + ("A" * 900)
+        short_url = create_short_url(long_url)
+
+        assert short_url.startswith("http")
+        assert len(short_url) < 200
+        short_id = short_url.rsplit("/r/", 1)[1]
+        assert resolve_short_url(short_id) == long_url
+
+    def test_unknown_short_id_returns_none(self):
+        assert resolve_short_url("does-not-exist") is None
+
+    def test_repeated_calls_issue_distinct_ids(self):
+        url = "https://indeed.com/apply/123"
+        first = create_short_url(url)
+        second = create_short_url(url)
+        assert first != second
+        # どちらのIDから引いても同じ元URLに解決できる
+        assert resolve_short_url(first.rsplit("/r/", 1)[1]) == url
+        assert resolve_short_url(second.rsplit("/r/", 1)[1]) == url
+
+    def test_persisted_across_reload(self):
+        """Railway再起動を想定: ファイルに永続化されていれば、別呼び出しでも解決できること。"""
+        long_url = "https://jmty.jp/tokyo/sale-others/article-abc123"
+        short_url = create_short_url(long_url)
+        short_id = short_url.rsplit("/r/", 1)[1]
+
+        # 新たに resolve_short_url を呼ぶたびにファイルから読み直す実装のため、
+        # プロセス再起動相当の検証になる
+        assert resolve_short_url(short_id) == long_url
+
+    def test_expired_entry_is_not_resolved(self, monkeypatch):
+        """SHORT_URL_MAX_AGE_DAYS を超えたエントリは解決されない（無期限に溜め続けない）。"""
+        long_url = "https://indeed.com/apply/999"
+        short_url = create_short_url(long_url)
+        short_id = short_url.rsplit("/r/", 1)[1]
+
+        import src.main as main_module
+        mapping = main_module._load_short_urls()
+        mapping[short_id]["created_at"] = time.time() - (main_module.SHORT_URL_MAX_AGE_DAYS + 1) * 86400
+        main_module._save_short_urls(mapping)
+
+        assert resolve_short_url(short_id) is None
+
+    def test_untrusted_host_url_is_not_shortened(self):
+        """is_trusted_application_url()を通過しないホストは短縮対象にならない
+        （notify_line_with_retry内でcreate_short_urlが呼ばれる前提条件そのものの確認）。"""
+        assert is_trusted_application_url("https://evil.example/apply/123") is False
+
+    def test_create_short_url_rejects_untrusted_url_even_without_caller_check(self):
+        """2026-09-23 bug-check-lab H-1: create_short_url自身も呼び出し元に頼らず再検証する
+        （多層防御。将来別の呼び出し元が検証を忘れても短縮させない）。"""
+        with pytest.raises(ValueError):
+            create_short_url("https://evil.example/phishing")
+
+    @pytest.mark.parametrize("evil_url", [
+        "https://evil.example\\@www.indeed.com/apply",  # WHATWG URL仕様ではバックスラッシュが/として解釈される
+        "https://evil.example\\.indeed.com/",
+        "https://indeed.com@evil.example/",  # userinfo付きURL
+        "https://indeed.com\\evil.example/",
+        "https://jp.indeed.com/\x00null",  # 制御文字混入
+    ])
+    def test_backslash_and_userinfo_bypass_is_rejected(self, evil_url):
+        """2026-09-23 bug-check-lab H-1(実機確認済み): urlparseとブラウザ/LINEアプリの
+        バックスラッシュ解釈の違いを突いたホスト名詐称は拒否されること。"""
+        assert is_trusted_application_url(evil_url) is False
+
+    def test_redirect_rejects_tampered_short_url_entry(self):
+        """H-1多層防御: 短縮マップのエントリが後から不正なURLに書き換えられても
+        （バグ・手動改変等）、do_GET側の転送直前チェックで弾かれること。"""
+        import src.main as main_module
+
+        good_url = "https://indeed.com/apply/123"
+        short_url = create_short_url(good_url)
+        short_id = short_url.rsplit("/r/", 1)[1]
+
+        mapping = main_module._load_short_urls()
+        mapping[short_id]["url"] = "https://evil.example/phishing"
+        main_module._save_short_urls(mapping)
+
+        # resolve_short_url自体はホスト検証をしないため値を返すが、
+        # is_trusted_application_url()による転送直前の再検証で弾かれる想定
+        assert resolve_short_url(short_id) == "https://evil.example/phishing"
+        assert is_trusted_application_url(resolve_short_url(short_id)) is False
+        # 許可外ドメインはnotify_line_with_retry内でcreate_short_urlに渡されないため、
+        # 短縮マップに登録されないことを間接的に保証する（実際の呼び出しはTestNotifyLineWithRetry側で確認済み）。
 
 
 class TestExtractApplicantNameFromHtml:
@@ -2060,6 +2194,9 @@ class TestMainLoopBackoffAndRecovery:
         monkeypatch.setattr(main_module, "load_processed_ids", lambda: (set(), True))
         monkeypatch.setattr(main_module.time, "sleep", lambda *_a, **_kw: None)
         monkeypatch.setattr(main_module.time, "monotonic", lambda: 0.0)
+        # main() が起動する短縮URLリダイレクトサーバーはこのテストの対象外。実ポートを
+        # 掴んでしまう副作用を避けるため no-op に差し替える。
+        monkeypatch.setattr(main_module, "start_redirect_server", lambda: None)
 
         with pytest.raises(SystemExit):
             main_module.main()
@@ -2121,6 +2258,7 @@ class TestMainLoopBackoffAndRecovery:
         monkeypatch.setattr(main_module, "verify_storage", lambda: True)
         monkeypatch.setattr(main_module, "load_processed_ids", lambda: (set(), True))
         monkeypatch.setattr(main_module.time, "sleep", lambda *_a, **_kw: None)
+        monkeypatch.setattr(main_module, "start_redirect_server", lambda: None)
 
         with pytest.raises(SystemExit):
             main_module.main()
