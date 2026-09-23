@@ -510,9 +510,41 @@ class TestNotifySlackWithRetry:
         ]
         
         result = notify_slack_with_retry("indeed", "山田太郎", "https://indeed.com/apply/123")
-        
+
         assert result == True
         assert mock_post.call_count == 2
+
+    @patch('src.main.time.sleep')
+    @patch('src.main._http_session.post')
+    @patch('src.main.get_slack_webhook_url')
+    @patch('src.main.is_test_mode', return_value=False)
+    def test_url_rendered_as_mrkdwn_link(self, mock_test_mode, mock_get_url, mock_post, mock_sleep):
+        """2026-09-23: 応募URLは生貼りではなく <URL|こちら> のmrkdwnリンクにすること（見た目を短くする）。"""
+        mock_get_url.return_value = "https://hooks.slack.com/test"
+        mock_post.return_value = MagicMock(status_code=200)
+
+        notify_slack_with_retry("indeed", "山田太郎", "https://indeed.com/apply/123")
+
+        text = mock_post.call_args[1]['json']['text']
+        assert "<https://indeed.com/apply/123|こちら>" in text
+        # 生URLがそのまま裸で本文に残っていないこと（リンク構文の一部としてのみ出現する）
+        assert "\nhttps://indeed.com/apply/123\n" not in text
+
+    @patch('src.main.time.sleep')
+    @patch('src.main._http_session.post')
+    @patch('src.main.get_slack_webhook_url')
+    @patch('src.main.is_test_mode', return_value=False)
+    def test_url_with_pipe_falls_back_to_plain_url(self, mock_test_mode, mock_get_url, mock_post, mock_sleep):
+        """URLに | や <> が混入している異常系は、mrkdwnリンク構文を壊さないよう生URL表示にフォールバックすること。"""
+        mock_get_url.return_value = "https://hooks.slack.com/test"
+        mock_post.return_value = MagicMock(status_code=200)
+
+        weird_url = "https://indeed.com/apply?x=1|evil"
+        notify_slack_with_retry("indeed", "山田太郎", weird_url)
+
+        text = mock_post.call_args[1]['json']['text']
+        assert weird_url in text
+        assert f"<{weird_url}|" not in text
 
 
 class TestNotifyLineWithRetry:
@@ -581,6 +613,7 @@ class TestNotifyLineWithRetry:
         """LINE通知のURLに openExternalBrowser=1 を付与すること（LINE内ブラウザのOAuthブロック回避）。
 
         2026-08-23 bug-check-lab H-4以降、URL短縮は行わず原URLをそのまま使う。
+        2026-09-23以降、URLはテキスト本文ではなくFlexメッセージの詳細ボタン(uri action)に入る。
         """
         mock_get_id.return_value = "group_id"
         mock_post.return_value = MagicMock(status_code=200)
@@ -588,8 +621,9 @@ class TestNotifyLineWithRetry:
         notify_line_with_retry("indeed", "山田太郎", "https://indeed.com/apply/123")
 
         body = mock_post.call_args[1]['json']
-        text = body['messages'][0]['text']
-        assert "https://indeed.com/apply/123?openExternalBrowser=1" in text
+        assert body['messages'][1]['type'] == 'flex'
+        button_uri = body['messages'][1]['contents']['footer']['contents'][0]['action']['uri']
+        assert button_uri == "https://indeed.com/apply/123?openExternalBrowser=1"
 
     @patch('src.main.time.sleep')
     @patch('src.main._http_session.post')
@@ -603,8 +637,64 @@ class TestNotifyLineWithRetry:
 
         notify_line_with_retry("indeed", "山田太郎", "https://indeed.com/apply/123?ref=email")
 
-        text = mock_post.call_args[1]['json']['messages'][0]['text']
-        assert "https://indeed.com/apply/123?ref=email&openExternalBrowser=1" in text
+        button_uri = mock_post.call_args[1]['json']['messages'][1]['contents']['footer']['contents'][0]['action']['uri']
+        assert button_uri == "https://indeed.com/apply/123?ref=email&openExternalBrowser=1"
+
+    @patch('src.main.time.sleep')
+    @patch('src.main._http_session.post')
+    @patch('src.main.get_line_to_id')
+    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
+    @patch('src.main.is_test_mode', return_value=False)
+    def test_long_url_falls_back_to_plain_text_no_flex(self, mock_test_mode, mock_get_id, mock_post, mock_sleep):
+        """LINE uri actionの最大長(1000文字)を超えるURLはFlexボタン化せず、従来通りテキストに直接貼ること。"""
+        mock_get_id.return_value = "group_id"
+        mock_post.return_value = MagicMock(status_code=200)
+
+        long_url = "https://engage.indeed.com/f/a/" + ("A" * 1000)
+        notify_line_with_retry("indeed", "山田太郎", long_url)
+
+        body = mock_post.call_args[1]['json']
+        assert len(body['messages']) == 1
+        assert body['messages'][0]['type'] == 'textV2'
+        assert f"{long_url}?openExternalBrowser=1" in body['messages'][0]['text']
+
+    @patch('src.main.time.sleep')
+    @patch('src.main._http_session.post')
+    @patch('src.main.get_line_to_id')
+    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
+    @patch('src.main.is_test_mode', return_value=False)
+    def test_flex_button_has_alt_text_and_label(self, mock_test_mode, mock_get_id, mock_post, mock_sleep):
+        """Flexメッセージにはプッシュ通知用のaltTextとボタンラベルが設定されていること。"""
+        mock_get_id.return_value = "group_id"
+        mock_post.return_value = MagicMock(status_code=200)
+
+        notify_line_with_retry("indeed", "山田太郎", "https://indeed.com/apply/123")
+
+        flex = mock_post.call_args[1]['json']['messages'][1]
+        assert flex['altText']
+        button = flex['contents']['footer']['contents'][0]
+        assert button['action']['type'] == 'uri'
+        assert button['action']['label']
+
+    @patch('src.main.time.sleep')
+    @patch('src.main._http_session.post')
+    @patch('src.main.get_line_to_id')
+    @patch('src.main.LINE_CHANNEL_ACCESS_TOKEN', 'test_token')
+    @patch('src.main.is_test_mode', return_value=False)
+    def test_400_fallback_still_includes_flex_button(self, mock_test_mode, mock_get_id, mock_post, mock_sleep):
+        """textV2が400で失敗しplain textにフォールバックしても、Flexボタンは引き続き送られること。"""
+        mock_get_id.return_value = "group_id"
+        mock_post.side_effect = [
+            MagicMock(status_code=400, text="textV2 not supported"),
+            MagicMock(status_code=200),
+        ]
+
+        result = notify_line_with_retry("indeed", "山田太郎", "https://indeed.com/apply/123")
+
+        assert result is True
+        body = mock_post.call_args[1]['json']
+        assert body['messages'][0]['type'] == 'text'
+        assert body['messages'][1]['type'] == 'flex'
 
 
 def test_process_mail_by_uid_both_notifications_fail(tmp_path):
