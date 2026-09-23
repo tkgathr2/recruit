@@ -94,6 +94,13 @@ ERROR_NOTIFICATION_DEDUP_SECONDS = int(os.getenv("ERROR_NOTIFICATION_DEDUP_SECON
 # 認証失敗の通知抑制（既定6時間）。アプリパスワード失効は人手による再発行が必要で
 # すぐには直らないため、10分おきに通知を垂れ流さず長めの間隔に集約する。
 AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS = int(os.getenv("AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS", "21600"))
+# 2026-09-23 bug-check-lab(4回目) C-1: IMAP接続断・未分類Indeedメール検知等、
+# 「同種の障害/事象が短時間に繰り返し起きうる」通知の抑制（既定1時間）。
+# 従来はERROR_NOTIFICATION_DEDUP_SECONDS(10分)のみで、認証エラー以外の長時間障害
+# （ネットワーク不通等）やIndeedの件名フォーマット変更時に@channelメンションが
+# 無期限に連発する実害があった（knowhow chunk_id 27198）。auth同様、人手対応が
+# 必要な種類の障害は長めの窓に集約する。
+REPEATED_ERROR_NOTIFICATION_DEDUP_SECONDS = int(os.getenv("REPEATED_ERROR_NOTIFICATION_DEDUP_SECONDS", "3600"))
 _last_error_notification_ts: dict = {}  # dedup_key -> (last unix timestamp, window_seconds)
 
 # --- Backoff reason tracking ---
@@ -1342,7 +1349,17 @@ def process_mail_by_uid(
                     "Indeedが件名フォーマットを変更した可能性があります。determine_source関数の更新を検討してください。"
                 )
                 log(f"ALERT: Indeed email detected with unrecognized subject: {subject}")
-                notify_error_to_slack(alert_msg, dedup_key=f"indeed_unclassified:{unique_id}")
+                # bug-check-lab(4回目) C-1: dedup_keyにunique_idを含めると、メールごとに
+                # 必ず異なるキーになりdedupが構造的に無効化される（Indeedの件名フォーマット
+                # 変更時、応募メール1通ごとに@channelが個別連発する実害）。固定キー＋長め窓に
+                # することで、エラーチャネルへの@channelは集約しつつ、通常チャネルへの個別
+                # 通知（下のnotify_slack_with_retry/notify_line_with_retry）は従来どおり
+                # 1通ごとに行う（本物の応募を人間が見落とさないため）。
+                notify_error_to_slack(
+                    alert_msg,
+                    dedup_key="indeed_unclassified",
+                    dedup_seconds=REPEATED_ERROR_NOTIFICATION_DEDUP_SECONDS,
+                )
                 html = extract_html(msg)
                 url = extract_indeed_url(html) or ""
                 unclassified_name = "⚠️未分類のIndeedメール（要確認）"
@@ -1606,9 +1623,13 @@ def check_mail_with_status(processed_ids: Optional[Set[str]] = None) -> bool:
                     continue
                 # All retries exhausted
                 log(f"ERROR: IMAP connection failed after {total_attempts} attempts: {last_conn_error}")
+                # bug-check-lab(4回目) C-1: この経路はmain()のbackoff/quota_notifiedガードを
+                # 経由しない（return Trueでbackoffさせない設計）ため、抑制はdedup窓のみに
+                # 依存する。長時間の接続断でも10分おきに@channelが連発しないよう長め窓にする。
                 notify_error_to_slack(
                     f"Gmail IMAP connection error (after {total_attempts} attempts): {last_conn_error}",
                     dedup_key="imap_connection_error",
+                    dedup_seconds=REPEATED_ERROR_NOTIFICATION_DEDUP_SECONDS,
                 )
                 _last_check_degraded = True
                 return True  # Not necessarily a quota error
@@ -1630,7 +1651,13 @@ def check_mail_with_status(processed_ids: Optional[Set[str]] = None) -> bool:
         if is_quota_error(e):
             _last_backoff_reason = f"Gmail quota exceeded ({e})"
             return False  # Quota error, trigger backoff
-        notify_error_to_slack(f"Gmail polling error: {e}", dedup_key="gmail_polling_error")
+        # bug-check-lab(4回目) C-1: imap_connection_error同様、backoffガードを経由しない
+        # 経路のため長め窓で@channel連発を防ぐ。
+        notify_error_to_slack(
+            f"Gmail polling error: {e}",
+            dedup_key="gmail_polling_error",
+            dedup_seconds=REPEATED_ERROR_NOTIFICATION_DEDUP_SECONDS,
+        )
         return True  # Non-quota error, don't backoff excessively
 
 

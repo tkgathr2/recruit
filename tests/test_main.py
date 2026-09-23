@@ -44,6 +44,7 @@ from src.main import (
     extract_job_title_from_html,
     extract_applicant_name_from_html,
     check_mail_with_status,
+    REPEATED_ERROR_NOTIFICATION_DEDUP_SECONDS,
 )
 import imaplib
 
@@ -1019,6 +1020,45 @@ def test_process_mail_by_uid_indeed_login_code_no_false_alert(tmp_path):
     assert result is not None, "非応募メールは処理済みマークして返すべき"
 
 
+def test_process_mail_by_uid_unclassified_indeed_uses_fixed_dedup_key():
+    """2026-09-23 bug-check-lab(4回目) C-1（確定Critical・knowhow chunk_id 27198の再検証で
+    未修正と確認）: 件名不一致（未分類）Indeedメールのアラートで、dedup_keyにunique_id
+    （メールごとに必ず異なる値）を含めていたため、dedupが構造的に無効化されていた。
+    Indeedが件名フォーマットを変更すると、応募メール1通ごとに@channelが個別連発する。
+
+    修正: dedup_keyを固定文字列にし、複数の異なるメール（=異なるunique_id）でも
+    同一キー・同一（長め）窓で抑制されることを確認する。通常チャネル通知
+    （notify_slack_with_retry / notify_line_with_retry）は従来どおり1通ごとに
+    呼ばれる（本物の応募を人間が見落とさないため、意図して据え置き）。
+    """
+    subject = "システムメンテナンスのお知らせ"  # 応募・非応募いずれの既知パターンにも一致しない未知件名
+    from_header = "Indeed <notify@indeed.com>"
+
+    with patch("src.main.notify_error_to_slack") as mock_alert, \
+         patch("src.main.notify_slack_with_retry", return_value=True) as mock_slack, \
+         patch("src.main.notify_line_with_retry", return_value=True) as mock_line:
+        mail1 = _build_mail_mock(subject, from_header, 101, "1111111111111111111")
+        result1 = process_mail_by_uid(mail1, b"101", set())
+        mail2 = _build_mail_mock(subject, from_header, 102, "2222222222222222222")
+        result2 = process_mail_by_uid(mail2, b"102", {result1} if result1 else set())
+
+    assert result1 is not None and result2 is not None, "未分類メールは各々処理済みマークして返すべき"
+    assert result1 != result2, "テスト前提: 2通は異なるunique_idを持つこと"
+
+    # @channel系アラートは固定dedup_keyで、メールごとに変わらないこと
+    assert mock_alert.call_count == 2
+    dedup_keys = [c.kwargs.get("dedup_key") for c in mock_alert.call_args_list]
+    assert dedup_keys == ["indeed_unclassified", "indeed_unclassified"], (
+        f"dedup_keyがunique_id起因で変動している（dedupが無効化される）: {dedup_keys}"
+    )
+    dedup_seconds = [c.kwargs.get("dedup_seconds") for c in mock_alert.call_args_list]
+    assert dedup_seconds == [REPEATED_ERROR_NOTIFICATION_DEDUP_SECONDS] * 2
+
+    # 通常チャネルへの個別通知は従来どおり1通ごとに行われること（据え置き）
+    assert mock_slack.call_count == 2
+    assert mock_line.call_count == 2
+
+
 def _build_mail_mock(subject, from_header, uid_num, gm_msgid):
     """process_mail_by_uid テスト用の IMAP モックを組み立てるヘルパー。"""
     import email
@@ -1628,6 +1668,29 @@ class TestCheckMailWithStatusAuthError:
         mock_notify.assert_called_once()
         call_kwargs = mock_notify.call_args
         assert call_kwargs[1]["dedup_key"] == "imap_connection_error"
+        # 2026-09-23 bug-check-lab(4回目) C-1: この経路はmain()のbackoff/quota_notifiedを
+        # 経由しないため、既定600秒窓のままだと長時間の接続断で@channelが10分おきに連発する。
+        # 長め窓(REPEATED_ERROR_NOTIFICATION_DEDUP_SECONDS)を明示していることを確認する。
+        assert call_kwargs[1]["dedup_seconds"] == REPEATED_ERROR_NOTIFICATION_DEDUP_SECONDS
+
+    @patch("src.main.notify_error_to_slack")
+    @patch("src.main.has_imap_credentials", return_value=True)
+    @patch("src.main.load_processed_ids", return_value=(set(), True))
+    def test_generic_polling_error_uses_long_dedup_window(self, mock_load, mock_creds, mock_notify):
+        """2026-09-23 bug-check-lab(4回目) C-1: quota/認証/IMAP接続エラー以外の未知の例外
+        （gmail_polling_error）も、main()のbackoffを経由しないため長め窓が必要。
+        ValueError はIMAP接続/読み取りエラー用のリトライ対象タプルに含まれないため、
+        check_mail_with_status() の最外周except Exceptionまで素通りしgmail_polling_error
+        経路に到達する。"""
+        with patch("src.main._check_mail_attempt", side_effect=ValueError("unexpected failure")):
+            result = check_mail_with_status()
+
+        assert result is True
+        mock_notify.assert_called_once()
+        call_kwargs = mock_notify.call_args
+        assert call_kwargs[1]["dedup_key"] == "gmail_polling_error"
+        assert call_kwargs[1]["dedup_seconds"] == REPEATED_ERROR_NOTIFICATION_DEDUP_SECONDS
+
 
 class TestIsAuthFailure:
     """`[AUTHENTICATIONFAILED]`/Invalid credentials を一時障害と区別できること。"""
@@ -1981,6 +2044,7 @@ class TestCheckMailAuthHandling:
         assert result is True
         mock_error.assert_called_once()
         assert mock_error.call_args.kwargs.get("dedup_key") == "imap_connection_error"
+        assert mock_error.call_args.kwargs.get("dedup_seconds") == REPEATED_ERROR_NOTIFICATION_DEDUP_SECONDS
 
 
 class TestUseOauthEnablement:
