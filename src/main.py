@@ -55,6 +55,16 @@ LOG_DIR = os.getenv("LOG_DIR", "/tmp")
 SLACK_ERROR_WEBHOOK_URL = os.getenv("SLACK_ERROR_WEBHOOK_URL")
 SLACK_DM_WEBHOOK_URL = os.getenv("SLACK_DM_WEBHOOK_URL")
 
+# --- Ignored recipient addresses ---
+# 2026-09-24 実測: Indeedが退職済み社員(kidokoro@takagi.bz)宛にも応募通知を送り続けており、
+# kidokoro側のGmail自動転送でBot監視先(atsuhiro@takagi.bz)へ二重着信していた（社長指示で恒久除外）。
+# To ヘッダがこの一覧に含まれるメールは、本文を見るまでもなく無視する（atsuhiro宛の本体側で別途処理される）。
+IGNORED_RECIPIENT_ADDRESSES = frozenset(
+    addr.strip().lower()
+    for addr in os.getenv("IGNORED_RECIPIENT_ADDRESSES", "kidokoro@takagi.bz").split(",")
+    if addr.strip()
+)
+
 # --- Processed IDs file for duplicate prevention ---
 PROCESSED_IDS_FILE = os.getenv("PROCESSED_IDS_FILE", os.path.join(LOG_DIR, "processed_ids.json"))
 MAX_PROCESSED_IDS = 5000
@@ -1356,6 +1366,11 @@ def process_mail_by_uid(
 
     subject = decode_header_value(msg.get("Subject", ""))
     from_header = decode_header_value(msg.get("From", ""))
+
+    to_addr = parseaddr(decode_header_value(msg.get("To", "")))[1].lower()
+    if to_addr in IGNORED_RECIPIENT_ADDRESSES:
+        log(f"Skip mail addressed to ignored recipient ({to_addr}): id={unique_id}")
+        return unique_id  # 退職済みアドレス宛の転送コピーを無視（本体は別宛先で処理される）
 
     source, default_url = determine_source(subject)
     if not source:

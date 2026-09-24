@@ -49,6 +49,18 @@ from src.main import (
 import imaplib
 
 
+@pytest.fixture(autouse=True)
+def _reset_application_dedup_state():
+    """_last_application_notification_ts はモジュールグローバルで全テスト間を跨いで残るため、
+    件名に同じ「山田太郎」等を使う複数テストがあると後勝ちのdedupで意図せず通知が間引かれる
+    （2026-09-24 実測で判明・test順依存のflaky化を防ぐ）。全テスト前後で強制クリアする。
+    """
+    import src.main as main_module
+    main_module._last_application_notification_ts.clear()
+    yield
+    main_module._last_application_notification_ts.clear()
+
+
 class TestDecodeHeaderValue:
     def test_empty_value(self):
         assert decode_header_value(None) == ""
@@ -1059,13 +1071,15 @@ def test_process_mail_by_uid_unclassified_indeed_uses_fixed_dedup_key():
     assert mock_line.call_count == 2
 
 
-def _build_mail_mock(subject, from_header, uid_num, gm_msgid):
+def _build_mail_mock(subject, from_header, uid_num, gm_msgid, to_header=None):
     """process_mail_by_uid テスト用の IMAP モックを組み立てるヘルパー。"""
     import email
     from unittest.mock import MagicMock
     msg = email.message.Message()
     msg["Subject"] = subject
     msg["From"] = from_header
+    if to_header is not None:
+        msg["To"] = to_header
     msg.set_payload("body")
     raw_bytes = msg.as_bytes()
     mock_mail = MagicMock()
@@ -1074,6 +1088,54 @@ def _build_mail_mock(subject, from_header, uid_num, gm_msgid):
         [(f"{uid_num} (X-GM-MSGID {gm_msgid} UID {uid_num})".encode(), raw_bytes)],
     )
     return mock_mail
+
+
+def test_process_mail_by_uid_ignored_recipient_is_skipped():
+    """To ヘッダが IGNORED_RECIPIENT_ADDRESSES（既定 kidokoro@takagi.bz）宛のメールは、
+    本文を見るまでもなく無視され、Slack/LINEへ通知されないこと（2026-09-24 社長指示）。
+
+    Indeedが退職済み社員(kidokoro@takagi.bz)宛にも応募通知を送り続けており、kidokoro側の
+    Gmail自動転送でBot監視先(atsuhiro@takagi.bz)へ二重着信していた。転送コピー(Toがkidokoro)
+    を無視すれば、本体(Toがatsuhiro)側だけが正しく通知される。
+    """
+    import src.main as main_module
+    main_module._last_application_notification_ts.clear()
+
+    mail = _build_mail_mock(
+        subject="新しい応募者のお知らせ - 山田太郎",
+        from_header="Indeed <noreply@indeed.com>",
+        uid_num=50,
+        gm_msgid="5050505050505050501",
+        to_header="<kidokoro@takagi.bz>",
+    )
+    with patch("src.main.notify_slack_with_retry", return_value=True) as mock_slack, \
+         patch("src.main.notify_line_with_retry", return_value=True) as mock_line:
+        result = process_mail_by_uid(mail, b"50", set())
+
+    assert result == "gm:5050505050505050501", "無視対象でも処理済みマークは返すべき"
+    mock_slack.assert_not_called()
+    mock_line.assert_not_called()
+
+
+def test_process_mail_by_uid_non_ignored_recipient_is_notified():
+    """To ヘッダが atsuhiro@takagi.bz 宛（無視対象外）の場合は通常どおり通知されること。"""
+    import src.main as main_module
+    main_module._last_application_notification_ts.clear()
+
+    mail = _build_mail_mock(
+        subject="新しい応募者のお知らせ - 山田太郎",
+        from_header="Indeed <noreply@indeed.com>",
+        uid_num=51,
+        gm_msgid="5050505050505050502",
+        to_header="<atsuhiro@takagi.bz>",
+    )
+    with patch("src.main.notify_slack_with_retry", return_value=True) as mock_slack, \
+         patch("src.main.notify_line_with_retry", return_value=True) as mock_line:
+        result = process_mail_by_uid(mail, b"51", set())
+
+    assert result == "gm:5050505050505050502"
+    mock_slack.assert_called_once()
+    mock_line.assert_called_once()
 
 
 def test_process_mail_by_uid_github_notification_no_false_alert():
