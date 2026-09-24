@@ -1289,18 +1289,25 @@ def is_indeed_non_application_email(subject: str) -> bool:
     return any(pattern in subject for pattern in INDEED_NON_APPLICATION_PATTERNS)
 
 
-def _application_dedup_key(source: str, applicant_name: str, job_title: Optional[str]) -> str:
-    return f"{source}:{applicant_name}:{job_title or ''}"
+def _application_dedup_key(source: str, applicant_name: str, job_title: Optional[str], sender_address: str) -> str:
+    # sender_address（Fromの実アドレス）を主キーにする: Indeedは応募1件ごとに一意な
+    # ローカルパート（例: rino730515qqnib_m8r@indeedemail.com）を発番しており、同一応募を
+    # 複数宛先へ複製配信した場合もこの値は同一のまま届く（2026-09-24 実メール15通で確認・
+    # 同一応募のペアは必ずFromも一致）。応募者名+求人名だけのキーだと、job_titleが現行の
+    # Indeed件名フォーマットから抽出できず常に空になる現状では同姓同名の別応募者を
+    # 誤って間引くリスクがあるため、sender_addressで先に絞り込む。
+    return f"{source}:{sender_address}:{applicant_name}:{job_title or ''}"
 
 
-def is_recent_duplicate_application(source: str, applicant_name: str, job_title: Optional[str]) -> bool:
-    """同一応募者名+求人名の通知が直近 APPLICATION_DEDUP_SECONDS 秒以内に送信済みかを判定する。
+def is_recent_duplicate_application(source: str, applicant_name: str, job_title: Optional[str], sender_address: str) -> bool:
+    """同一応募（送信元アドレス+応募者名+求人名）の通知が直近 APPLICATION_DEDUP_SECONDS 秒
+    以内に送信済みかを判定する。
 
     別々のメール（X-GM-MSGID/Message-IDが異なる）でも、Indeed側が同一応募を複数宛先に
     送っていて片方が転送で同じ受信箱に着信するケースがあるため、メール単位ではなく
-    「応募者名+求人名」単位で短時間の重複を弾く（2026-09-24実例）。
+    応募単位で短時間の重複を弾く（2026-09-24実例）。
     """
-    key = _application_dedup_key(source, applicant_name, job_title)
+    key = _application_dedup_key(source, applicant_name, job_title, sender_address)
     now_ts = time.time()
 
     # サイズ上限（古いエントリを自動削除）。notify_error_to_slack の掃除と同じ考え方。
@@ -1316,9 +1323,9 @@ def is_recent_duplicate_application(source: str, applicant_name: str, job_title:
     return last_ts is not None and (now_ts - last_ts) < APPLICATION_DEDUP_SECONDS
 
 
-def record_application_notification(source: str, applicant_name: str, job_title: Optional[str]) -> None:
-    """通知済み（Slack/LINEどちらかに成功）の応募者名+求人名を記録する。"""
-    key = _application_dedup_key(source, applicant_name, job_title)
+def record_application_notification(source: str, applicant_name: str, job_title: Optional[str], sender_address: str) -> None:
+    """通知済み（Slack/LINEどちらかに成功）の応募を記録する。"""
+    key = _application_dedup_key(source, applicant_name, job_title, sender_address)
     _last_application_notification_ts[key] = time.time()
 
 
@@ -1443,8 +1450,9 @@ def process_mail_by_uid(
         applicant_name = extract_name(from_header)
         job_title = None
 
-    if is_recent_duplicate_application(source, applicant_name, job_title):
-        log(f"Skip duplicate application within {APPLICATION_DEDUP_SECONDS}s window: name={applicant_name}, job={job_title}, id={unique_id}")
+    sender_address = parseaddr(from_header)[1].lower()
+    if is_recent_duplicate_application(source, applicant_name, job_title, sender_address):
+        log(f"Skip duplicate application within {APPLICATION_DEDUP_SECONDS}s window: name={applicant_name}, job={job_title}, sender={sender_address}, id={unique_id}")
         return unique_id  # 別メール(別id)だが同一応募のためLINE/Slack再送はせず処理済みマークのみ
 
     log(f"Notify {source}: job={job_title}, id={unique_id}")
@@ -1458,7 +1466,7 @@ def process_mail_by_uid(
 
     # 片方でも成功したら「通知済み」として記録する（記録前に判定するとレース窓が開くため
     # is_recent_duplicate_application の直後、実送信の直後に記録する＝ここが唯一の記録箇所）。
-    record_application_notification(source, applicant_name, job_title)
+    record_application_notification(source, applicant_name, job_title, sender_address)
 
     # 片方成功・片方失敗: 処理済みマークしつつDMで通知（重複送信防止が最優先）
     if not slack_ok or not line_ok:

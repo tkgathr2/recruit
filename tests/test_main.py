@@ -1228,6 +1228,47 @@ def test_process_mail_by_uid_same_applicant_different_email_is_deduped():
     mock_line2.assert_not_called()
 
 
+def test_process_mail_by_uid_same_name_different_sender_not_deduped():
+    """同姓同名の別応募者（Fromの実アドレスが異なる）は、job_titleが取れず(現行Indeed件名
+    フォーマットでは実際に常にNone)応募者名だけが一致する状況でも、誤って間引かれないこと。
+
+    2026-09-24 社長からの指摘（「もう1個に対して2個メールが来ることはないか」）を受けて追加。
+    dedupキーに送信元アドレス（Indeedが応募ごとに発番する一意なFromローカルパート、例:
+    rino730515qqnib_m8r@indeedemail.com）を含めることで、応募者名だけの一致では間引かれない
+    ようにした回帰テスト。
+    """
+    import src.main as main_module
+    main_module._last_application_notification_ts.clear()
+
+    # 実際のIndeed件名フォーマット（job_titleは抽出できずNoneになる）
+    real_subject = "      [新しい応募者のお知らせ] 森岡 梨乃さんが即応募×即面接!!超スピード採用で1日11,500円もらえちゃう警備スタッフ／日払い◎の求人に応募しました "
+
+    mail_1 = _build_mail_mock(
+        subject=real_subject,
+        from_header="森岡 梨乃 <rino730515aaaaaaaa_aaa@indeedemail.com>",
+        uid_num=60,
+        gm_msgid="6060606060606060601",
+    )
+    mail_2 = _build_mail_mock(
+        subject=real_subject,
+        from_header="森岡 梨乃 <rino730515bbbbbbbb_bbb@indeedemail.com>",  # 別応募者・別アドレス
+        uid_num=61,
+        gm_msgid="6060606060606060602",
+    )
+
+    with patch("src.main.notify_slack_with_retry", return_value=True) as mock_slack1, \
+         patch("src.main.notify_line_with_retry", return_value=True) as mock_line1:
+        process_mail_by_uid(mail_1, b"60", set())
+    mock_slack1.assert_called_once()
+    mock_line1.assert_called_once()
+
+    with patch("src.main.notify_slack_with_retry", return_value=True) as mock_slack2, \
+         patch("src.main.notify_line_with_retry", return_value=True) as mock_line2:
+        process_mail_by_uid(mail_2, b"61", set())
+    mock_slack2.assert_called_once()
+    mock_line2.assert_called_once()
+
+
 def test_process_mail_by_uid_different_content_not_deduped():
     """通知内容（応募者名+求人名として抽出される文字列）が異なれば、短時間窓内でも
     それぞれ通知されること（誤って間引かないこと）。
