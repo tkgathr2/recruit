@@ -1080,6 +1080,90 @@ def test_process_mail_by_uid_real_indeed_application_is_processed():
     assert result is not None
 
 
+def test_process_mail_by_uid_same_applicant_different_email_is_deduped():
+    """同一応募者名+求人名の通知は、別メール(別X-GM-MSGID)でも短時間窓内なら1回に間引かれること。
+
+    2026-09-24実例の回帰テスト: Indeedが同一応募を kidokoro@takagi.bz と atsuhiro@takagi.bz の
+    2宛先に個別送信し、kidokoro側の自動転送で両方とも atsuhiro@takagi.bz（Bot監視先）に着信して
+    いた。2通は物理的に別メール（X-GM-MSGID/Message-IDが異なる）のため processed_ids の
+    メール単位dedupでは弾けず、LINE/Slackが応募者ごとに2回飛んでいた。
+    """
+    import src.main as main_module
+    main_module._last_application_notification_ts.clear()
+
+    mail_1 = _build_mail_mock(
+        subject="新しい応募者のお知らせ - 山田太郎",
+        from_header="Indeed <noreply@indeed.com>",
+        uid_num=40,
+        gm_msgid="4040404040404040401",
+    )
+    mail_2 = _build_mail_mock(
+        subject="新しい応募者のお知らせ - 山田太郎",
+        from_header="Indeed <noreply@indeed.com>",
+        uid_num=41,
+        gm_msgid="4040404040404040402",  # 別メール（別ID）だが内容は同一応募者
+    )
+
+    processed_ids = set()
+
+    with patch("src.main.notify_slack_with_retry", return_value=True) as mock_slack1, \
+         patch("src.main.notify_line_with_retry", return_value=True) as mock_line1:
+        result1 = process_mail_by_uid(mail_1, b"40", processed_ids)
+
+    assert result1 == "gm:4040404040404040401"
+    mock_slack1.assert_called_once()
+    mock_line1.assert_called_once()
+    processed_ids.add(result1)
+
+    with patch("src.main.notify_slack_with_retry", return_value=True) as mock_slack2, \
+         patch("src.main.notify_line_with_retry", return_value=True) as mock_line2:
+        result2 = process_mail_by_uid(mail_2, b"41", processed_ids)
+
+    # 別メールなので processed_ids のメール単位dedupには引っかからず unique_id は返る
+    # （＝バッチ枠を占有し続けない）が、LINE/Slackへの再送はされない。
+    assert result2 == "gm:4040404040404040402"
+    mock_slack2.assert_not_called()
+    mock_line2.assert_not_called()
+
+
+def test_process_mail_by_uid_different_content_not_deduped():
+    """通知内容（応募者名+求人名として抽出される文字列）が異なれば、短時間窓内でも
+    それぞれ通知されること（誤って間引かないこと）。
+
+    このモック（本文がHTML化されていないためHTML抽出は空で from_header にフォールバックし、
+    from_header は両メールとも "Indeed <noreply@indeed.com>" で同一）では、件名末尾から
+    extract_job_title_from_subject() が拾う文字列（"山田太郎" / "鈴木花子"）がdedupキーの
+    差分要因になる。実運用ではHTML本文から取れる応募者名が差分要因になる。
+    """
+    import src.main as main_module
+    main_module._last_application_notification_ts.clear()
+
+    mail_1 = _build_mail_mock(
+        subject="新しい応募者のお知らせ - 山田太郎",
+        from_header="Indeed <noreply@indeed.com>",
+        uid_num=42,
+        gm_msgid="4242424242424242421",
+    )
+    mail_2 = _build_mail_mock(
+        subject="新しい応募者のお知らせ - 鈴木花子",
+        from_header="Indeed <noreply@indeed.com>",
+        uid_num=43,
+        gm_msgid="4242424242424242422",
+    )
+
+    with patch("src.main.notify_slack_with_retry", return_value=True) as mock_slack1, \
+         patch("src.main.notify_line_with_retry", return_value=True) as mock_line1:
+        process_mail_by_uid(mail_1, b"42", set())
+    mock_slack1.assert_called_once()
+    mock_line1.assert_called_once()
+
+    with patch("src.main.notify_slack_with_retry", return_value=True) as mock_slack2, \
+         patch("src.main.notify_line_with_retry", return_value=True) as mock_line2:
+        process_mail_by_uid(mail_2, b"43", set())
+    mock_slack2.assert_called_once()
+    mock_line2.assert_called_once()
+
+
 def test_process_mail_by_uid_indeed_unknown_subject_still_alerts():
     """送信者が本物のIndeed(indeed.com)で件名が未知の場合:
     - エラーチャネルにフォーマット変更アラートを出す

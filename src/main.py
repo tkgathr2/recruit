@@ -96,6 +96,15 @@ ERROR_NOTIFICATION_DEDUP_SECONDS = int(os.getenv("ERROR_NOTIFICATION_DEDUP_SECON
 AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS = int(os.getenv("AUTH_ERROR_NOTIFICATION_DEDUP_SECONDS", "21600"))
 _last_error_notification_ts: dict = {}  # dedup_key -> (last unix timestamp, window_seconds)
 
+# --- Application content deduplication ---
+# 2026-09-24 実測: Indeedが同一応募を kidokoro@takagi.bz と atsuhiro@takagi.bz の2宛先に
+# 個別送信し、kidokoro側の自動転送で両方とも atsuhiro@takagi.bz（Bot監視先）に着信していた
+# （Received/Delivered-Toヘッダで確認）。2通は物理的に別メール（X-GM-MSGID/Message-IDが異なる）
+# のため processed_ids のメール単位dedupでは弾けず、応募者ごとにLINE/Slackが2回飛んでいた。
+# 応募者名+求人名が一致する通知を短時間窓で1回に間引く（メール自体は両方とも処理済みマークする）。
+APPLICATION_DEDUP_SECONDS = int(os.getenv("APPLICATION_DEDUP_SECONDS", "900"))
+_last_application_notification_ts: dict = {}  # content_key -> last unix timestamp
+
 # --- Backoff reason tracking ---
 # check_mail_with_status() は「quota超過」以外の IMAP abort でも False を返すため、
 # main() が理由を問わず一律「Gmail quota exceeded」と報告すると誤診断を招く。
@@ -1263,6 +1272,39 @@ def is_indeed_non_application_email(subject: str) -> bool:
     return any(pattern in subject for pattern in INDEED_NON_APPLICATION_PATTERNS)
 
 
+def _application_dedup_key(source: str, applicant_name: str, job_title: Optional[str]) -> str:
+    return f"{source}:{applicant_name}:{job_title or ''}"
+
+
+def is_recent_duplicate_application(source: str, applicant_name: str, job_title: Optional[str]) -> bool:
+    """同一応募者名+求人名の通知が直近 APPLICATION_DEDUP_SECONDS 秒以内に送信済みかを判定する。
+
+    別々のメール（X-GM-MSGID/Message-IDが異なる）でも、Indeed側が同一応募を複数宛先に
+    送っていて片方が転送で同じ受信箱に着信するケースがあるため、メール単位ではなく
+    「応募者名+求人名」単位で短時間の重複を弾く（2026-09-24実例）。
+    """
+    key = _application_dedup_key(source, applicant_name, job_title)
+    now_ts = time.time()
+
+    # サイズ上限（古いエントリを自動削除）。notify_error_to_slack の掃除と同じ考え方。
+    if len(_last_application_notification_ts) > 500:
+        expired = [
+            k for k, ts in _last_application_notification_ts.items()
+            if now_ts - ts >= APPLICATION_DEDUP_SECONDS
+        ]
+        for k in expired:
+            del _last_application_notification_ts[k]
+
+    last_ts = _last_application_notification_ts.get(key)
+    return last_ts is not None and (now_ts - last_ts) < APPLICATION_DEDUP_SECONDS
+
+
+def record_application_notification(source: str, applicant_name: str, job_title: Optional[str]) -> None:
+    """通知済み（Slack/LINEどちらかに成功）の応募者名+求人名を記録する。"""
+    key = _application_dedup_key(source, applicant_name, job_title)
+    _last_application_notification_ts[key] = time.time()
+
+
 def get_unique_id(gm_msgid: Optional[str], msg: email.message.Message) -> Optional[str]:
     """Get unique identifier for email. Prefers X-GM-MSGID, falls back to Message-ID."""
     if gm_msgid:
@@ -1369,6 +1411,10 @@ def process_mail_by_uid(
         applicant_name = extract_name(from_header)
         job_title = None
 
+    if is_recent_duplicate_application(source, applicant_name, job_title):
+        log(f"Skip duplicate application within {APPLICATION_DEDUP_SECONDS}s window: name={applicant_name}, job={job_title}, id={unique_id}")
+        return unique_id  # 別メール(別id)だが同一応募のためLINE/Slack再送はせず処理済みマークのみ
+
     log(f"Notify {source}: job={job_title}, id={unique_id}")
 
     slack_ok = notify_slack_with_retry(source, applicant_name, url, job_title=job_title)
@@ -1377,6 +1423,10 @@ def process_mail_by_uid(
     if not slack_ok and not line_ok:
         log(f"ERROR: All notifications failed for id={unique_id}, will retry next cycle")
         return None
+
+    # 片方でも成功したら「通知済み」として記録する（記録前に判定するとレース窓が開くため
+    # is_recent_duplicate_application の直後、実送信の直後に記録する＝ここが唯一の記録箇所）。
+    record_application_notification(source, applicant_name, job_title)
 
     # 片方成功・片方失敗: 処理済みマークしつつDMで通知（重複送信防止が最優先）
     if not slack_ok or not line_ok:
